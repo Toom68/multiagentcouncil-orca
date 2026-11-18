@@ -41,14 +41,14 @@ receipt-validation note in `src/host/orca.ts`.
 
 Run/Task:
 
-- `orchestration run-create --objective <text> [--from <handle>] [--retry-request <key>] --json` → `{ok:true, result:{...}}` (**verified**; `runId` extraction in the adapter tries `result.run.id` then `result.id` — reconcile via `run-show` if the shape differs).
+- `orchestration run-create --objective <text> [--from <handle>] [--retry-request <orca-id>] [--full] --json` → `{ok:true, result:{...}}` (**verified**; `runId` extraction in the adapter tries `result.run.id` then `result.id` — reconcile via `run-show` if the shape differs).
 - `orchestration run-current --json` → `{result:{runId: <id>|null}}` (**verified**: returns `null` inside an unbound worker).
-- `orchestration task-create --spec-file <path> --task-title <text> --run <run_id> [--deps <json-array>] [--from] [--retry-request] --json` (help-verified; `--spec-file` accepts cwd-relative paths).
+- `orchestration task-create --spec-file <path> --task-title <text> --run <run_id> [--deps <json-array>] [--from] [--retry-request <orca-id>] [--full] --json` (help-verified; `--spec-file` accepts cwd-relative paths).
 - `orchestration task-update`, `task-show`, `task-list` (read/list surfaces).
 
 Workers:
 
-- `orchestration worker-start --task <task_id> [--worktree <sel>] [--agent <name> | --terminal <handle> | --chat] [--model <m>] [--effort <lvl>] [--run <run_id>] [--retry-request <key>] --json` (**verified help**). Agent names observed: `devin`, `claude`, `codex` (+ configured others).
+- `orchestration worker-start --task <task_id> [--worktree <sel>] [--agent <name> | --terminal <handle> | --chat] [--model <m>] [--effort <lvl>] [--run <run_id>] [--retry-request <orca-id>] [--full] --json` (**verified help**). Agent names observed: `devin`, `claude`, `codex` (+ configured others).
 - `orchestration worker-show --dispatch <ctx_...> --json` → dispatch record incl. `dispatchId`, `taskId`, `from`/`to` handles, `requestId`, `state`, timestamps (**verified**).
 - `orchestration worker-list --run <run_id> [--terminal-state <s>] --json` → `{result:{workers:[{dispatchId, taskId, state, outcome, liveness, agent, terminal, terminalState, workspace, host}]}}` (**verified row shape**).
 - `orchestration worker-read --dispatch <ctx_...> [--limit n] [--cursor <c>] [--source auto|transcript|terminal] --json` (**verified help**). Output includes agent name and model as seen by the host (e.g. "SWE-2 Max").
@@ -60,14 +60,14 @@ Workers:
 
 Mail (worker-facing):
 
-- `orchestration send --from <handle> --to <target> --subject <s> --body <b> --type <t> [--task-id] [--dispatch-id] [--phase] [--retry-request]` (**verified**: worker→worker `send --to dispatch:<ctx>` delivered `msg_…` receipts; `--to run:<id>` and `--to term_<h>` exist; terminal-only mailboxes warn *"Delivery is not durable after that terminal closes; prefer run:<id> or dispatch:<id>"*).
+- `orchestration send --from <handle> --to <target> --subject <s> --body <b> --type <t> [--task-id] [--dispatch-id] [--phase] [--retry-request <orca-id>] [--full]` (**verified**: worker→worker `send --to dispatch:<ctx>` delivered `msg_…` receipts; `--to run:<id>` and `--to term_<h>` exist; terminal-only mailboxes warn *"Delivery is not durable after that terminal closes; prefer run:<id> or dispatch:<id>"*).
 - `orchestration inbox [--run <id> | --terminal <h>] [--limit n] --json` — **read-only history** (**verified**). This is the only history surface the adapter uses.
 - `orchestration check` — **consuming** mailbox drain for the *bound* agent. The adapter never calls it (and never `--ack`). Note: `check` has no `--from` flag (**verified**: `invalid_argument: Unknown flag --from`).
 - `orchestration ask / reply --id <msg> --body <b>` — question/answer flows.
 
 Gates / requests:
 
-- `orchestration gate-create --task <id> --question <q> [--from] [--retry-request]`, `gate-resolve --id <gate> --resolution <r>`, `gate-show`, `gate-list` — approval gates (**verified help**; `gate-list` is Run-scoped and errors `run_required` for unbound workers).
+- `orchestration gate-create --task <id> --question <q> [--from] [--retry-request <orca-id>]`, `gate-resolve --id <gate> --resolution <r>`, `gate-show`, `gate-list` — approval gates (**verified help**; `gate-list` is Run-scoped and errors `run_required` for unbound workers).
 - `orchestration request-show --request <req_id> --json` — status of a recorded mutation request (**verified exists**).
 - `orchestration approve` / `deny` — hidden-but-functional permission commands (**verified**: `approve --help` prints usage though it is absent from the top-level list).
 
@@ -87,8 +87,9 @@ Terminals:
   `run_required` — the adapter always passes it.
 - Durable identities the adapter persists in every result: `runId`, `taskId`,
   `dispatchId` (`ctx_…`, addressable as `dispatch:ctx_…`), `terminalHandle`
-  (`term_…`), and the caller-supplied `requestKey` (→ `--retry-request`, which
-  becomes the request's `requestId` for `request-show` reconciliation).
+  (`term_…`), plus the Orca-issued `requestId` from each mutation receipt —
+  the only id `--retry-request` accepts (see §5). A local `requestKey` still
+  correlates intent in receipts/journal but never reaches argv.
 - `worker_done` is the durable completion signal; `worker-list`/`worker-show`
   rows carry `state`, `outcome` (`in_progress|succeeded|failed`), `liveness`,
   `terminalState`. **Silence is not exit** — a quiet worker can be alive;
@@ -110,7 +111,7 @@ The lane the adapter implements (`startPhaseWorker`, lane `argv`):
 ```
 terminal create --worktree <sel> --title <t> --command "devin --model swe-2-max --permission-mode dangerous"
 terminal wait --terminal <term_…> --for tui-idle --timeout-ms <n>
-orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --terminal <term_…> --retry-request <key> --json
+orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --terminal <term_…> --json --full
 ```
 
 - The `--command` string is assembled **only** from allowlisted tokens:
@@ -133,12 +134,39 @@ orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --te
   (`worker-list --run` filtered by terminal + unsettled outcome/state).
   Overlapping active work on one terminal is refused.
 
-## 5. Mutation recovery and uncertainty semantics
+## 5. Mutation recovery and uncertainty semantics — VERIFIED 1.4.261
 
-- Every adapter mutation sends `--retry-request <requestKey>` (a durable,
-  caller-owned id). On `outcome_unknown`, local timeout, or unparsed output,
-  the correct recovery is `request-show --request <key>` / replay with the
-  *same* key — Orca deduplicates by request id — never a fresh launch.
+- **`--retry-request` takes an Orca-issued request id, never a caller key.**
+  `send --help`: *"Reissue an earlier request by its ID; replays its result
+  instead of repeating it."* A live council smoke proved Orca **rejects**
+  caller-chosen keys: `"--retry-request must be the UUID Orca reported for the
+  original request; pass it exactly as printed, or omit the flag to start a
+  new request."` The adapter therefore sends **no retry flag on first
+  attempts** and keeps `requestKey` only as a local intent id for
+  receipts/journal — it never reaches argv.
+- **Request-id receipt locations (verified live on this host):**
+  - Success mutation (`--json --full`, real output):
+    `{"id":"dca32296-…","ok":true,"result":{"message":{…,"id":"msg_…"},
+    "mutation":{"requestId":"a50e6900-…","replayed":false}},"_meta":{…}}`
+    → the recovery handle is `result.mutation.requestId` (UUID). The plain
+    `--json` receipt trims to `{"ok":true,"result":{"messageId":"msg_…"}}`
+    with no request id — mutations therefore always request `--full`.
+  - Failure receipt (verified):
+    `{"ok":false,"error":{"code":"terminal_not_found","message":"…
+    Orchestration mutation request ID: ec262ac1-…","data":
+    {"orchestrationRequestId":"ec262ac1-…","originalCommand":[…]}}}`
+    → `error.data.orchestrationRequestId`.
+- **`request-show --request <id> --json`** reports
+  `{"ok":true,"result":{"requestId":"<id>","state":"absent|pending|completed",
+  "interpretation":"…"}}`. Verified: an absent id returns `state:"absent"`
+  with *"Absent is not proof that nothing happened"*; a real completed send
+  id returns `state:"completed"` (probe: `60c90055-…` → completed).
+- **Recovery flow implemented:** `requestShow(requestId)` →
+  completed/pending ⇒ do not re-issue; absent/unproven ⇒ `retryMutation`
+  re-issues the exact logged argv + `--retry-request <id>` (same process only;
+  it refuses an id it never logged rather than fabricating argv). A mutation
+  that died before any reply (local timeout) yields no Orca id → reconcile by
+  observation (`worker-list --run`), never by blind re-launch.
 - `uncertain` outcomes the adapter surfaces (do not auto-retry):
   `outcome_unknown`, `stop_unknown`, `release_unknown`, `unverifiable`,
   `runtime_unavailable`, `server_mail_unsupported`, `source_changed`, local

@@ -4,8 +4,12 @@
  *
  * Hard rules honored here (docs/design/IMPLEMENTATION.md, ORCA-COMPATIBILITY.md):
  * - Only documented `orca` commands; argv arrays + `shell: false` via process.ts.
- * - Every mutation carries a caller-supplied durable `requestKey` passed as
- *   `--retry-request`, so a lost receipt replays instead of duplicating.
+ * - Mutations carry NO caller-chosen idempotency key: `--retry-request`
+ *   accepts only an Orca-issued request id (verified 1.4.261). First attempts
+ *   go out bare; the Orca requestId captured from the receipt is what makes an
+ *   uncertain outcome re-issuable after request-show. The caller `requestKey`
+ *   remains only as a local durable intent id for receipts/journal — it never
+ *   reaches argv.
  * - Nothing here ever runs `orchestration check` (consuming) or `--ack`;
  *   history is read via `inbox`/`worker-*` read-only commands only.
  * - `terminal create --command` is shell text: agent argv is assembled only
@@ -74,6 +78,12 @@ export interface OrcaCliErrorShape {
 export interface OrcaCommandOk<T> {
   ok: true;
   value: T;
+  /**
+   * Orca-issued orchestration request id for this mutation, when the receipt
+   * carries one (result.mutation.requestId under --full). This is the ONLY id
+   * valid for --retry-request; absent on reads and on pre-`--full` receipts.
+   */
+  requestId?: string;
   /** Exit code of the CLI process (0). */
   exitCode: number;
   /** True when stdout was capped; callers should distrust partial JSON. */
@@ -83,6 +93,12 @@ export interface OrcaCommandOk<T> {
 export interface OrcaCommandFailure {
   ok: false;
   error: OrcaCliErrorShape;
+  /**
+   * Orca-issued orchestration request id when the failure receipt carries one
+   * (error.data.orchestrationRequestId — verified 1.4.261). Needed to retry
+   * or request-show the uncertain mutation.
+   */
+  requestId?: string;
   /**
    * True when the mutation may have landed but its outcome could not be
    * proven: outcome_unknown, local timeout, stop_unknown, unverifiable,
@@ -175,6 +191,33 @@ export interface OrcaEnvelope {
 
 const STDERR_ERROR_RE = /(?:^|\n)\s*error:\s*([a-z_]+):\s*(.+?)\s*$/i;
 
+/**
+ * Orca-issued orchestration request id from a receipt envelope.
+ * Verified locations (1.4.261): success `result.mutation.requestId` (+ a
+ * `replayed` flag) under `--full`; failure `error.data.orchestrationRequestId`.
+ */
+export function extractRequestId(env: OrcaEnvelope): string | undefined {
+  const r = typeof env.result === 'object' && env.result !== null
+    ? (env.result as Record<string, unknown>)
+    : undefined;
+  const mutation = r && typeof r.mutation === 'object' && r.mutation !== null
+    ? (r.mutation as Record<string, unknown>)
+    : undefined;
+  const fromResult =
+    (typeof mutation?.requestId === 'string' && mutation.requestId) ||
+    (typeof mutation?.request_id === 'string' && mutation.request_id) ||
+    (typeof r?.requestId === 'string' && r.requestId) ||
+    undefined;
+  if (fromResult) return fromResult;
+  const err = env.error;
+  const data = err?.data;
+  if (typeof data === 'object' && data !== null) {
+    const v = (data as Record<string, unknown>).orchestrationRequestId;
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return undefined;
+}
+
 /** Extract the JSON envelope or trailing `error: code: message` line from a finished process. */
 export function parseOrcaEnvelope(proc: ProcessResult):
   | { kind: 'json'; envelope: OrcaEnvelope }
@@ -254,7 +297,7 @@ export interface StartPhaseWorkerInput {
   taskId: string;
   worktree: string;
   lane: WorkerLaunchLane;
-  /** Durable intent id → passed as --retry-request on every mutation. */
+  /** Local durable intent id for receipts/journal. NEVER reaches Orca argv. */
   requestKey: string;
   /** Reuse a proven settled worker's terminal for a new phase Task. */
   retainedTerminal?: { handle: string };
@@ -271,6 +314,8 @@ export interface PhaseWorkerStart {
   workerAddress?: string;
   terminalHandle?: string;
   failedStage?: string;
+  /** Orca-issued request id of the worker-start mutation (recovery handle). */
+  requestId?: string;
   error?: OrcaCliErrorShape;
   /** Bounded copy of receipts for evidence; never trusted as proof alone. */
   receipts: Record<string, unknown>;
@@ -309,17 +354,24 @@ export class OrcaHost {
   /**
    * Run one `orca` command and map the process result into a typed result.
    * `args` are appended after baseArgs; `--json` is the caller's choice.
+   *
+   * `mutation: true` appends `--full` so the receipt carries
+   * `result.mutation.requestId` (the Orca-issued request id needed for
+   * recovery). `retryRequestId` appends `--retry-request <id>` — the ONLY
+   * legitimate use, re-issuing an earlier Orca request after request-show.
    */
   async run<T = unknown>(
     args: readonly string[],
-    opts: { timeoutMs?: number } = {},
+    opts: { timeoutMs?: number; mutation?: boolean; retryRequestId?: string } = {},
   ): Promise<OrcaCommandResult<T>> {
     const timeoutMs = opts.timeoutMs ?? this.opts.commandTimeoutMs;
     const runner = this.opts.spawnFn ?? runProcess;
-    const proc = await runner(
-      { file: this.plan.file, args: [...this.plan.args, ...args] },
-      { timeoutMs, cwd: this.opts.cwd },
-    );
+    const argv = [...this.plan.args, ...args];
+    if (opts.mutation) argv.push('--full');
+    if (opts.retryRequestId !== undefined) {
+      argv.push('--retry-request', assertSafeValue('retryRequestId', opts.retryRequestId));
+    }
+    const proc = await runner({ file: this.plan.file, args: argv }, { timeoutMs, cwd: this.opts.cwd });
 
     if (proc.reason === 'timed_out') {
       return {
@@ -340,13 +392,25 @@ export class OrcaHost {
       };
     }
 
+    // Mutations are logged so an uncertain outcome can be re-issued later with
+    // --retry-request <orca-id> once the request id is known (or proven absent).
+    const logged = opts.mutation
+      ? { args: argv.slice(), requestId: undefined as string | undefined }
+      : undefined;
+
     const parsed = parseOrcaEnvelope(proc);
     if (parsed.kind === 'json') {
       const env = parsed.envelope;
+      const requestId = extractRequestId(env);
+      if (logged) {
+        if (requestId !== undefined) logged.requestId = requestId;
+        this.mutationLog.push(logged);
+      }
       if (env.ok) {
         return {
           ok: true,
           value: env.result as T,
+          ...(requestId === undefined ? {} : { requestId }),
           exitCode: proc.exitCode ?? 0,
           truncated: proc.stdoutTruncated,
         };
@@ -360,12 +424,14 @@ export class OrcaHost {
           message: env.error?.message ?? 'orca command failed',
           ...(data === undefined ? {} : { data }),
         },
+        ...(requestId === undefined ? {} : { requestId }),
         uncertain: UNCERTAIN_CODES.has(code),
         exitCode: proc.exitCode,
         timedOut: false,
       };
     }
     if (parsed.kind === 'error_line') {
+      if (logged) this.mutationLog.push(logged);
       return {
         ok: false,
         error: parsed.error,
@@ -374,6 +440,7 @@ export class OrcaHost {
         timedOut: false,
       };
     }
+    if (logged) this.mutationLog.push(logged);
     return {
       ok: false,
       error: {
@@ -392,6 +459,61 @@ export class OrcaHost {
       exitCode: proc.exitCode,
       timedOut: false,
     };
+  }
+
+  /**
+   * Mutations issued by this host instance, in order. `requestId` is filled
+   * when Orca reported one; an empty requestId means the outcome never
+   * produced an id (timeout/unparsable) — reconcile by observation, not retry.
+   */
+  readonly mutationLog: { args: string[]; requestId?: string }[] = [];
+
+  /**
+   * Reconcile + re-issue a logged mutation. Flow: request-show first —
+   * 'completed'/'pending' means do NOT re-issue (return that state); 'absent'
+   * or a refused/lost request means re-issue the exact argv plus
+   * `--retry-request <id>` so Orca replays/executes the recorded request
+   * instead of creating a new one. Never fabricates argv for an unknown id.
+   */
+  async retryMutation(
+    requestId: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<
+    | { state: 'completed' | 'pending'; requestId: string }
+    | { state: 'reissued'; requestId: string; result: OrcaCommandResult<unknown> }
+    | { state: 'refused'; requestId: string; reason: string }
+  > {
+    const id = assertSafeValue('requestId', requestId);
+    const probe = await this.showRequest(id);
+    if (probe.ok) {
+      const rec = asRecord(probe.value) ?? {};
+      const state = firstString(rec.state, rec.status);
+      if (state === 'completed' || state === 'done') {
+        return { state: 'completed', requestId: id };
+      }
+      if (state === 'pending' || state === 'in_progress') {
+        return { state: 'pending', requestId: id };
+      }
+      // 'absent' (or anything else): request-show could not prove it landed —
+      // re-issue the recorded argv with --retry-request.
+    }
+    const logged = this.mutationLog.find((m) => m.requestId === id);
+    if (!logged) {
+      return {
+        state: 'refused',
+        requestId: id,
+        reason:
+          'no recorded argv for this request id in this process; refusing to fabricate a mutation',
+      };
+    }
+    const args = logged.args.filter(
+      (a, i) =>
+        a !== '--full' &&
+        a !== '--retry-request' &&
+        !(i > 0 && logged.args[i - 1] === '--retry-request'),
+    );
+    const result = await this.run(args, { ...opts, mutation: true, retryRequestId: id });
+    return { state: 'reissued', requestId: id, result };
   }
 
   // -- Run / Task lifecycle -------------------------------------------------
@@ -414,10 +536,8 @@ export class OrcaHost {
       'run-create',
       '--objective=' + objective,
       ...this.fromArgs(),
-      '--retry-request',
-      assertSafeValue('requestKey', requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
     if (!res.ok) return res;
     const runId = res.value?.run?.id ?? res.value?.id;
     if (typeof runId !== 'string' || runId.length === 0) {
@@ -429,7 +549,13 @@ export class OrcaHost {
         timedOut: false,
       };
     }
-    return { ok: true, value: { runId }, exitCode: res.exitCode, truncated: res.truncated };
+    return {
+      ok: true,
+      value: { runId },
+      ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+      exitCode: res.exitCode,
+      truncated: res.truncated,
+    };
   }
 
   /** Create a Task inside the council Run from a spec file (never inline spec text). */
@@ -449,15 +575,13 @@ export class OrcaHost {
       '--run',
       assertSafeValue('runId', input.runId),
       ...this.fromArgs(),
-      '--retry-request',
-      assertSafeValue('requestKey', input.requestKey),
       '--json',
     ];
     if (input.deps && input.deps.length > 0) {
       const deps = input.deps.map((d, i) => assertSafeValue(`deps[${i}]`, d));
       args.splice(args.indexOf('--json'), 0, '--deps', JSON.stringify(deps));
     }
-    const res = await this.run<{ task?: { id: string }; id?: string }>(args);
+    const res = await this.run<{ task?: { id: string }; id?: string }>(args, { mutation: true });
     if (!res.ok) return res;
     const taskId = res.value?.task?.id ?? res.value?.id;
     if (typeof taskId !== 'string' || taskId.length === 0) {
@@ -469,7 +593,13 @@ export class OrcaHost {
         timedOut: false,
       };
     }
-    return { ok: true, value: { taskId }, exitCode: res.exitCode, truncated: res.truncated };
+    return {
+      ok: true,
+      value: { taskId },
+      ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+      exitCode: res.exitCode,
+      truncated: res.truncated,
+    };
   }
 
   // -- Worker start lanes ----------------------------------------------------
@@ -526,7 +656,7 @@ export class OrcaHost {
         '--title=' + (input.title ?? `council-${taskId.slice(-8)}`),
         '--command=' + commandText,
         '--json',
-      ]);
+      ], { mutation: true });
       receipts.terminalCreate = created.ok ? created.value : created.error;
       if (!created.ok) {
         return {
@@ -534,6 +664,7 @@ export class OrcaHost {
           runId,
           requestKey,
           outcome: created.uncertain ? 'uncertain' : 'failed',
+          ...(created.requestId === undefined ? {} : { requestId: created.requestId }),
           error: created.error,
           receipts,
         };
@@ -574,6 +705,7 @@ export class OrcaHost {
           requestKey,
           outcome: 'uncertain',
           terminalHandle,
+          requestId: created.requestId,
           error: {
             code: 'readiness_wait_failed',
             message:
@@ -626,9 +758,9 @@ export class OrcaHost {
         }
       }
     }
-    args.push('--retry-request', requestKey, '--json');
+    args.push('--json');
 
-    const started = await this.run<Record<string, unknown>>(args);
+    const started = await this.run<Record<string, unknown>>(args, { mutation: true });
     receipts.workerStart = started.ok ? started.value : started.error;
     if (!started.ok) {
       return {
@@ -637,6 +769,7 @@ export class OrcaHost {
         requestKey,
         outcome: started.uncertain ? 'uncertain' : 'failed',
         terminalHandle,
+        ...(started.requestId === undefined ? {} : { requestId: started.requestId }),
         error: started.error,
         receipts,
       };
@@ -651,6 +784,7 @@ export class OrcaHost {
       dispatchId: extracted.dispatchId,
       workerAddress: extracted.workerAddress,
       terminalHandle: terminalHandle ?? extracted.terminalHandle,
+      ...(started.requestId === undefined ? {} : { requestId: started.requestId }),
       receipts,
     };
   }
@@ -818,11 +952,9 @@ export class OrcaHost {
     }
     args.push(
       ...this.fromArgs(),
-      '--retry-request',
-      assertSafeValue('requestKey', input.requestKey),
       '--json',
     );
-    return this.run(args);
+    return this.run(args, { mutation: true });
   }
 
   /**
@@ -838,10 +970,8 @@ export class OrcaHost {
       'worker-stop',
       '--dispatch',
       assertSafeValue('dispatchId', dispatchId),
-      '--retry-request',
-      assertSafeValue('requestKey', requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
   }
 
   /** Release a settled worker's terminal (archives output first). */
@@ -854,10 +984,8 @@ export class OrcaHost {
       'worker-release',
       '--dispatch',
       assertSafeValue('dispatchId', dispatchId),
-      '--retry-request',
-      assertSafeValue('requestKey', requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
   }
 
   /** Keep a settled worker open for later phases (cancels auto-release). */
@@ -870,10 +998,8 @@ export class OrcaHost {
       'worker-keep-open',
       '--dispatch',
       assertSafeValue('dispatchId', dispatchId),
-      '--retry-request',
-      assertSafeValue('requestKey', requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
   }
 
   /** Read-only reconciliation for a mutation whose response was lost. */
@@ -901,10 +1027,8 @@ export class OrcaHost {
       assertSafeValue('taskId', input.taskId),
       '--question=' + input.question,
       ...this.fromArgs(),
-      '--retry-request',
-      assertSafeValue('requestKey', input.requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
   }
 
   async resolveGate(input: {
@@ -919,10 +1043,8 @@ export class OrcaHost {
       assertSafeValue('gateId', input.gateId),
       '--resolution=' + input.resolution,
       ...this.fromArgs(),
-      '--retry-request',
-      assertSafeValue('requestKey', input.requestKey),
       '--json',
-    ]);
+    ], { mutation: true });
   }
 
   // -- internals ---------------------------------------------------------------
@@ -1241,7 +1363,9 @@ export class OrcaAdapter implements HostAdapter {
     const base: LaunchResult = {
       outcome: 'failed',
       taskId: input.taskId,
-      requestId: key,
+      // The ORCA-issued request id is the recovery handle; the local intent
+      // key only correlates this attempt inside our own receipts/journal.
+      ...(started.requestId === undefined ? {} : { requestId: started.requestId }),
     };
     if (started.terminalHandle !== undefined) base.terminalHandle = started.terminalHandle;
 
@@ -1348,7 +1472,13 @@ export class OrcaAdapter implements HostAdapter {
       });
       if (!res.ok) {
         if (res.uncertain) {
-          return { ok: true, value: { outcome: 'unknown', requestId: key } };
+          return {
+            ok: true,
+            value: {
+              outcome: 'unknown',
+              ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+            },
+          };
         }
         return failure(
           adapterErr(res.error.code, res.error.message, { data: res.error.data }),
@@ -1363,7 +1493,10 @@ export class OrcaAdapter implements HostAdapter {
         outcome: 'sent' | 'unknown';
         requestId?: string;
         messageId?: MessageId;
-      } = { outcome: 'sent', requestId: key };
+      } = {
+        outcome: 'sent',
+        ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+      };
       if (messageId !== undefined) out.messageId = messageId;
       return { ok: true, value: out };
     } catch (e) {
@@ -1404,6 +1537,71 @@ export class OrcaAdapter implements HostAdapter {
         );
       }
       return { ok: true, value: { released: true } };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  /**
+   * Read-only reconciliation: ask Orca whether a mutation request already
+   * took effect. States per request-show --help: completed | pending |
+   * absent. 'absent' is NOT proof the request never landed (pruning).
+   */
+  async requestShow(requestId: string): Promise<
+    Result<{ state: 'completed' | 'pending' | 'absent' | 'unknown'; raw: unknown }>
+  > {
+    try {
+      const res = await this.host.showRequest(requestId);
+      if (!res.ok) {
+        return failure(adapterErr(res.error.code, res.error.message, { data: res.error.data }));
+      }
+      const rec = (res.value ?? {}) as Record<string, unknown>;
+      const state = typeof rec.state === 'string' ? rec.state : 'unknown';
+      const normalized =
+        state === 'completed' || state === 'done'
+          ? 'completed'
+          : state === 'pending' || state === 'in_progress'
+            ? 'pending'
+            : state === 'absent'
+              ? 'absent'
+              : 'unknown';
+      return { ok: true, value: { state: normalized, raw: res.value } };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  /**
+   * Honest recovery for an uncertain mutation: request-show FIRST; only when
+   * Orca cannot prove the request landed (absent) does this re-issue the
+   * recorded argv with `--retry-request <id>`. Refuses when this process
+   * never logged the mutation — never fabricates argv for a foreign id.
+   * Not part of the HostAdapter contract surface; the engine may call it on
+   * the concrete adapter (or a future contract method can forward to it).
+   */
+  async retryMutation(requestId: string): Promise<
+    Result<
+      | { state: 'completed' | 'pending' }
+      | { state: 'reissued'; result: 'ok' | 'failed' | 'uncertain' }
+      | { state: 'refused'; reason: string }
+    >
+  > {
+    try {
+      const out = await this.host.retryMutation(requestId);
+      if (out.state === 'reissued') {
+        const r = out.result;
+        return {
+          ok: true,
+          value: {
+            state: 'reissued',
+            result: r.ok ? 'ok' : r.uncertain ? 'uncertain' : 'failed',
+          },
+        };
+      }
+      if (out.state === 'refused') {
+        return { ok: true, value: { state: 'refused', reason: out.reason } };
+      }
+      return { ok: true, value: { state: out.state } };
     } catch (e) {
       return failure(tokenErr(e));
     }

@@ -55,10 +55,37 @@ function proc(partial: Partial<ProcessResult>): ProcessResult {
 }
 
 const okEnv = (result: unknown) => proc({ stdout: JSON.stringify({ ok: true, result }) });
+/** Success mutation receipt shape verified on 1.4.261 (--full): top-level receipt
+ *  id + result.mutation.{requestId,replayed}. */
+const okMut = (result: unknown, requestId = 'req-uuid-1') =>
+  proc({
+    stdout: JSON.stringify({
+      id: 'receipt-uuid-9',
+      ok: true,
+      result: {
+        ...(typeof result === 'object' && result !== null ? result : { value: result }),
+        mutation: { requestId, replayed: false },
+      },
+      _meta: { runtimeId: 'rt-1' },
+    }),
+  });
 const failEnv = (code: string, message = 'm', data?: unknown) =>
   proc({
     exitCode: 1,
     stdout: JSON.stringify({ ok: false, error: { code, message, ...(data === undefined ? {} : { data }) } }),
+  });
+/** Failure receipt carrying the Orca request id (verified field location). */
+const failMut = (code: string, requestId = 'req-uuid-err', extra?: unknown) =>
+  proc({
+    exitCode: 1,
+    stdout: JSON.stringify({
+      ok: false,
+      error: {
+        code,
+        message: `${code} happened`,
+        data: { orchestrationRequestId: requestId, ...(extra as object) },
+      },
+    }),
   });
 
 /** Recording spawnFn: captures every argv array, replies via handler. */
@@ -238,8 +265,8 @@ describe('token validation', () => {
 // ─── adapter: HostAdapter contract ─────────────────────────────────────────
 
 describe('OrcaAdapter.createRun/createTask', () => {
-  it('creates a run with explicit retry-request and returns the id', async () => {
-    const { adapter, calls } = makeAdapter(() => okEnv({ run: { id: 'run_c1' } }));
+  it('creates a run with NO caller key on argv; captures Orca request id from the receipt', async () => {
+    const { adapter, calls } = makeAdapter(() => okMut({ run: { id: 'run_c1' } }, 'req-run-1'));
     const res = await adapter.createRun({ objective: 'review the thing' });
     assert.ok(res.ok);
     if (res.ok) assert.equal(res.value.runId, 'run_c1');
@@ -247,8 +274,10 @@ describe('OrcaAdapter.createRun/createTask', () => {
     assert.deepEqual(argv.slice(0, 2), ['orchestration', 'run-create']);
     assert.ok(argv.includes('--objective=review the thing'));
     assert.ok(argv.includes('--json'));
-    const k = argv.indexOf('--retry-request');
-    assert.match(argv[k + 1], /^council-run-/);
+    // Verified 1.4.261 semantics: --retry-request takes an ORCA-issued id only.
+    // A caller-chosen council-* key must never appear on first-attempt argv.
+    assert.ok(!argv.includes('--retry-request'), 'first attempt must not carry --retry-request');
+    assert.ok(argv.includes('--full'), 'mutations request --full so the requestId is visible');
   });
 
   it('creates a task under the explicit run with a spec file', async () => {
@@ -280,10 +309,10 @@ describe('OrcaAdapter.createRun/createTask', () => {
 describe('OrcaAdapter.launchWorker', () => {
   const devinLaunchHandler = (): ((args: readonly string[]) => ProcessResult) => (args) => {
     const cmd = args[1];
-    if (cmd === 'create') return okEnv({ terminal: { handle: 'term_new1' } });
+    if (cmd === 'create') return okMut({ terminal: { handle: 'term_new1' } }, 'req-tc-1');
     if (cmd === 'wait') return okEnv({ idle: true });
-    if (cmd === 'worker-start') return okEnv({ dispatchId: 'ctx_d1', terminal: 'term_new1' });
-    if (cmd === 'worker-keep-open') return okEnv({ kept: true });
+    if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+    if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
     return failEnv('unexpected_command', String(cmd));
   };
 
@@ -308,11 +337,14 @@ describe('OrcaAdapter.launchWorker', () => {
 
     const start = calls[2];
     assert.deepEqual(start.slice(0, 2), ['orchestration', 'worker-start']);
-    for (const flag of ['--task', '--run', '--terminal', '--worktree', '--retry-request', '--json']) {
+    for (const flag of ['--task', '--run', '--terminal', '--worktree', '--json']) {
       assert.ok(start.includes(flag), `missing ${flag}`);
     }
+    assert.ok(!start.includes('--retry-request'), 'first-attempt worker-start must not carry --retry-request');
     assert.ok(start.includes('task_aaa'));
     assert.ok(start.includes('term_new1'));
+    // LaunchResult.requestId carries the ORCA-issued request id (recovery handle).
+    assert.equal(res.value.requestId, 'req-ws-1');
   });
 
   it('marks the dispatch for retention when retainTerminal is set', async () => {
@@ -401,17 +433,21 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.ok(!start.includes('--terminal'), 'agent lane must not invent terminals');
   });
 
-  it('reports unknown outcome for an uncertain worker-start reply', async () => {
+  it('reports unknown outcome for an uncertain worker-start reply and surfaces the Orca request id', async () => {
     const { adapter } = makeAdapter((args) =>
-      args[1] === 'worker-start' ? failEnv('outcome_unknown', 'request timed out; effect unknown') :
-      args[1] === 'worker-list' ? okEnv({ workers: [] }) :
-      okEnv({ terminal: { handle: 'term_x' }, idle: true }),
+      args[1] === 'worker-start'
+        ? failMut('outcome_unknown', 'req-orca-77')
+        : args[1] === 'worker-list'
+          ? okEnv({ workers: [] })
+          : okMut({ terminal: { handle: 'term_x' }, idle: true }, 'req-tc-1'),
     );
-    const res = await adapter.launchWorker(launchSpec({ retainTerminal: false }));
+    const res = await adapter.launchWorker(launchSpec());
     assert.ok(res.ok);
     if (!res.ok) return;
     assert.equal(res.value.outcome, 'unknown');
-    assert.match(res.value.requestId ?? '', /^council-launch-/);
+    // Recovery handle = the ORCA id from error.data.orchestrationRequestId,
+    // never a caller-chosen key.
+    assert.equal(res.value.requestId, 'req-orca-77');
   });
 
   it('reports unknown outcome when the launch reply cannot be parsed', async () => {
@@ -425,19 +461,15 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.equal(res.value.outcome, 'unknown');
   });
 
-  it('derives a deterministic requestId so a retry replays the same mutation', async () => {
+  it('repeats of the same launch do NOT reuse an idempotency key — each first attempt is bare', async () => {
     const handler = devinLaunchHandler();
     const { adapter, calls } = makeAdapter(handler);
     const spec = launchSpec();
     await adapter.launchWorker(spec);
     await adapter.launchWorker(spec);
-    const keys = calls
-      .map((argv) => {
-        const i = argv.indexOf('--retry-request');
-        return i >= 0 ? argv[i + 1] : null;
-      })
-      .filter((k): k is string => k !== null && k.startsWith('council-launch-'));
-    assert.equal(new Set(keys).size, 1, 'launch retries must reuse one request key');
+    for (const argv of calls) {
+      assert.ok(!argv.includes('--retry-request'), `unexpected retry flag: ${argv.join(' ')}`);
+    }
   });
 
   it('refuses reuseTerminal while the terminal still owns active work', async () => {
@@ -469,6 +501,83 @@ describe('OrcaAdapter.launchWorker', () => {
     const start = calls.find((a) => a[1] === 'worker-start');
     assert.ok(start?.includes('--terminal') && start.includes('term_keep'));
     assert.ok(calls.every((a) => a[1] !== 'create'), 'reuse lane must not create a terminal');
+  });
+});
+
+describe('OrcaAdapter mutation recovery', () => {
+  it('requestShow maps Orca request states', async () => {
+    const { adapter } = makeAdapter((args) =>
+      args[1] === 'request-show' && args.includes('req-abs')
+        ? okEnv({ requestId: 'req-abs', state: 'absent' })
+        : args[1] === 'request-show' && args.includes('req-done')
+          ? okEnv({ requestId: 'req-done', state: 'completed' })
+          : failEnv('unexpected'),
+    );
+    const a = await adapter.requestShow('req-abs');
+    assert.ok(a.ok);
+    if (a.ok) assert.equal(a.value.state, 'absent');
+    const c = await adapter.requestShow('req-done');
+    assert.ok(c.ok);
+    if (c.ok) assert.equal(c.value.state, 'completed');
+  });
+
+  it('retryMutation re-issues the logged argv with --retry-request only after absent', async () => {
+    const { adapter, calls } = makeAdapter((args) => {
+      if (args[1] === 'request-show') return okEnv({ requestId: 'req-ws-1', state: 'absent' });
+      if (args[1] === 'create') return okMut({ terminal: { handle: 'term_r' } }, 'req-tc-1');
+      if (args[1] === 'wait') return okEnv({ idle: true });
+      if (args[1] === 'worker-start') {
+        return args.includes('--retry-request')
+          ? okMut({ dispatchId: 'ctx_replayed', mutation: undefined }, 'req-ws-1')
+          : okMut({ dispatchId: 'ctx_d1' }, 'req-ws-1');
+      }
+      return failEnv('unexpected_command', String(args[1]));
+    });
+    const launched = await adapter.launchWorker(launchSpec());
+    assert.ok(launched.ok);
+    const before = calls.length;
+    const retry = await adapter.retryMutation('req-ws-1');
+    assert.ok(retry.ok);
+    if (!retry.ok) return;
+    assert.equal(retry.value.state, 'reissued');
+    // Exactly one new mutation: the identical argv + --retry-request <orca id>.
+    const replay = calls[calls.length - 1];
+    assert.equal(calls.length, before + 2, 'request-show probe + one re-issue'); // probe + reissue
+    assert.deepEqual(replay.slice(0, 2), ['orchestration', 'worker-start']);
+    const i = replay.indexOf('--retry-request');
+    assert.equal(replay[i + 1], 'req-ws-1');
+  });
+
+  it('retryMutation does NOT re-issue when request-show proves completed/pending', async () => {
+    for (const state of ['completed', 'pending']) {
+      const { adapter, calls } = makeAdapter((args) =>
+        args[1] === 'request-show'
+          ? okEnv({ requestId: 'req-ws-1', state })
+          : args[1] === 'create'
+            ? okMut({ terminal: { handle: 'term_r' } }, 'req-tc-1')
+            : args[1] === 'wait'
+              ? okEnv({ idle: true })
+              : okMut({ dispatchId: 'ctx_d1' }, 'req-ws-1'),
+      );
+      await adapter.launchWorker(launchSpec());
+      const before = calls.length;
+      const retry = await adapter.retryMutation('req-ws-1');
+      assert.ok(retry.ok);
+      if (!retry.ok) return;
+      assert.equal(retry.value.state, state === 'completed' ? 'completed' : 'pending');
+      assert.equal(calls.length, before + 1, 'only the request-show probe, no re-issue');
+    }
+  });
+
+  it('retryMutation refuses an id this process never logged — no fabricated argv', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'request-show' ? okEnv({ requestId: 'req-x', state: 'absent' }) : okEnv({}),
+    );
+    const res = await adapter.retryMutation('req-foreign');
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.state, 'refused');
+    assert.ok(calls.every((a) => !a.includes('--retry-request')));
   });
 });
 
