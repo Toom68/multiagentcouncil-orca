@@ -119,10 +119,16 @@ the Task on that terminal and persists the supervisor's
 address its wake. The worker command string is built only from fixed
 allowlisted tokens — nothing user-supplied ever becomes shell syntax.
 
+The supervisor Task attaches to the caller's **bound** Orca Run (your existing
+binding is preserved, never rebound). When the caller has no bound Run — e.g.
+a first-time `init` followed directly by `start-supervisor` — the documented
+`worker-start --spec-file` path creates or joins a Run implicitly instead of
+failing. Either way the response reports `callerRun` and `lane` honestly.
+
 ### `council supervise --advance` — one deterministic step
 
 ```text
-council supervise --run <runDir> --advance --json
+council supervise --run <runDir> --advance [--as-supervisor] --json
 ```
 
 The heart of the product. Each call reconciles persisted state against Orca
@@ -135,7 +141,7 @@ The heart of the product. Each call reconciles persisted state against Orca
 | `wait` | nothing to do — end the turn and wait for an Orca wake |
 | `needs_approval` | roster is ready; the supervisor mails the caller the approval summary |
 | `finished` | run reached a terminal outcome; report the printed `outcome`/`reportPaths` |
-| `blocked` | unrecoverable condition needing an orchestrator decision |
+| `blocked` | unrecoverable condition needing an orchestrator decision (a persisted no-task intent is resolved by `council reconcile` — below) |
 
 It is idempotent and safe to re-run — including after a crash — because it always
 reconciles before acting. There is no daemon: deadlines are evaluated inside
@@ -143,6 +149,46 @@ reconciles before acting. There is no daemon: deadlines are evaluated inside
 right now; the calling agent must keep advancing until a non-`progress` action,
 because no external event will arrive to wake a purely local transition.
 `--advance` is required; bare `supervise` is a usage error.
+
+**`--as-supervisor` — the dedicated supervisor's mode.** The generated
+`advanceCommand` in `prompts/supervisor.md` includes it. In this mode the CLI
+requires an Orca terminal identity (`ORCA_TERMINAL_HANDLE`), refuses to run if
+a *different* supervisor terminal is recorded in `state.json`, and binds the
+caller to the persisted council child Run before advancing: `run-current` →
+`run-use --id <run> --from <handle>` → verified `run-current`. This repairs the
+crash case where the child Run stayed bound to a vanished terminal — Orca
+refuses task-create for any caller not bound to that Run. The flag exists only
+for the dedicated supervisor; manual `supervise --advance` never touches your
+Run binding and never displaces a recorded supervisor's identity.
+
+### `council reconcile` — resolve a persisted no-task launch intent
+
+```text
+council reconcile --run <runDir> --attempt <attemptId> \
+  --confirm-no-effects <requestId> [--as-supervisor] --json
+```
+
+When a worker's task-create was **definitively refused** (Orca's refusal
+carries an `Orchestration mutation request ID` and states "Nothing changed"),
+the engine persists `intent_recorded` with `taskId/dispatchId/terminalHandle`
+all null and refuses to retry on its own — the durable guard against
+double-launch. `reconcile` is the explicit, evidence-based way through:
+
+1. `--confirm-no-effects` must name the **exact request id** journaled on the
+   recorded `task-create` failure for that attempt (see `council tail`).
+2. With `--as-supervisor` the caller is bound to the child Run first (same
+   rules as `supervise --advance --as-supervisor`); otherwise your current
+   binding is used as-is.
+3. `task-list --full` is inspected for a task carrying this attempt's exact
+   spec (`specs/<attemptId>.md`): a unique match is **adopted**, zero matches
+   permits **exactly one** fresh task-create.
+4. The resolved `taskId` plus a journaled `task.created` event are persisted
+   before any launch; the next `supervise --advance` launches the worker on it.
+
+Any ambiguity refuses rather than guesses: multiple matching tasks, a pending
+or completed-but-absent request, a missing spec artifact, a missing/mismatched
+request id, or an attempt that is not a null-task intent. Nothing is ever
+reset, erased, or retried blindly.
 
 ### `council approve` — the enforceable gate
 

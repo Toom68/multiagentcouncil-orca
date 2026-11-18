@@ -82,7 +82,8 @@ prevention.
 ## Step 2 — launch the dedicated supervisor
 
 The supervisor is a Devin `swe-2-max` worker that exists to carry a Dispatch
-identity and receive wakes; it runs only `council supervise --advance`.
+identity and receive wakes; it runs only `council supervise --advance
+--as-supervisor` (the dedicated mode embedded in its generated spec).
 
 **Default — the CLI does it:**
 
@@ -124,7 +125,7 @@ The supervisor spec instructs its agent to advance deterministically on each
 wake:
 
 ```text
-COUNCIL supervise --run <runDir> --advance --json
+COUNCIL supervise --run <runDir> --advance --as-supervisor --json
 ```
 
 `--advance` reconciles persisted state against Orca and prints one action:
@@ -135,11 +136,21 @@ the turn only when it prints `wait`** (nothing left to do), `needs_approval`
 (mail the caller), `finished` (send `worker_done` with the printed outcome and
 `--report-path`), or `blocked`. This matters: a chain of purely local progress
 steps emits no external event, so stopping after a single `progress` would
-stall the run forever. Inside `advance` the CLI performs the child-Run binding,
-organiser launch, reviewer fan-out with the concurrency window, per-recipient
-challenge envelopes, scribe synthesis, deadline checks, and journal writes. The
+stall the run forever. Inside `advance` the CLI performs the organiser launch,
+reviewer fan-out with the concurrency window, per-recipient challenge
+envelopes, scribe synthesis, deadline checks, and journal writes. The
 supervisor agent makes no protocol decisions and never runs orchestration
 mutations itself — the CLI does that through the host adapter.
+
+`--as-supervisor` is the dedicated supervisor's mode: the CLI requires the
+worker's Orca terminal identity, refuses when a *different* supervisor is
+recorded, and rebinds the caller to the persisted council child Run
+(`run-use --id <run> --from <handle>`, then verifies) before advancing — the
+repair path for a restarted supervisor whose child Run stayed bound to a
+crashed terminal (Orca refuses task-create for any unbound caller). The
+generated spec's command is fixed: the worker must run it verbatim, never
+edit, append to, or interpolate it. Manual `advance` (Step "Manual driving")
+never rebinds and never displaces the recorded supervisor.
 
 ## Step 4 — approval gate (the only gate that matters)
 
@@ -231,6 +242,31 @@ settled workers.
   exit.
 - After any crash or doubt, just run `advance` again: `events.jsonl` is the
   source of truth and every call reconciles persisted state before acting.
+
+**Supervisor restart on a saved run.** A restarted supervisor whose child Run
+stayed bound to a crashed terminal is repaired by the product: its generated
+advance command already carries `--as-supervisor`, which rebinds the caller to
+`state.json`'s `orcaRunId` (verified, idempotent) before stepping. Do not
+run `run-use` by hand as a workaround — the CLI performs and verifies it.
+
+**Persisted no-task intent (`blocked` after a refused task-create).** When a
+worker's task-create was definitively refused (journal `error` with
+`op:"task-create"` carrying an `Orchestration mutation request ID`), the
+engine keeps `intent_recorded` with null `taskId/dispatchId/terminalHandle`
+and refuses to retry — the double-launch guard. The explicit recovery is:
+
+```text
+COUNCIL reconcile --run <runDir> --attempt <attemptId> \
+  --confirm-no-effects <requestId> [--as-supervisor] --json
+```
+
+It verifies the journaled refusal carries that exact request id, scans
+`task-list --full` for a task carrying this attempt's exact spec (adopt a
+unique match; create exactly one task when none exists under confirmed
+no-effects), then persists `taskId` + `task.created` — the next `advance`
+launches on it. Multiple matches, a pending request, a missing/mismatched
+request id, or a non-null-task attempt all refuse with actionable errors.
+Find `attemptId`/`requestId` via `COUNCIL tail --run <runDir>` or `status`.
 
 ## Manual driving (no supervisor worker)
 

@@ -30,13 +30,17 @@ import {
   type CouncilConfig,
   type CouncilError,
   type CouncilErrorCode,
+  type CouncilState,
   type HostAdapter,
+  type Participant,
+  type PhaseAttempt,
   type Result,
   type Store,
 } from './contracts.js';
 import { createEngine } from './engine.js';
 import {
   extractDispatchInfo,
+  extractRequestId,
   createOrcaAdapter,
   parseOrcaEnvelope,
 } from './host/orca.js';
@@ -178,12 +182,25 @@ async function readJsonFile(path: string, what: string): Promise<unknown> {
   }
 }
 
-/** Quote one token for a verbatim spec command line; refuses unusable chars. */
+/**
+ * Quote one token for a verbatim spec command line. Paths are normalized to
+ * forward slashes — Node accepts them on every OS and they are literal in
+ * both POSIX shells and cmd.exe double-quoted strings. Bare tokens use a
+ * shell-safe charset only; anything else is double-quoted unless it contains
+ * a character that stays dangerous inside double quotes (`"` `$` `` ` `` `!`
+ * `%` `^` `\` or a control char) — those fail loudly instead of ever
+ * becoming shell syntax.
+ */
+const BARE_TOKEN_RE = /^[A-Za-z0-9_./:@-]+$/;
+const DQUOTE_UNSAFE_RE = /["$`!%^\\\x00-\x1f]/;
+
 function cmdToken(path: string): string {
-  if (path.includes('"')) {
-    fail('config_invalid', `path cannot be embedded in the supervisor command (contains a double quote): ${path}`);
+  const normalized = path.replace(/\\/g, '/');
+  if (BARE_TOKEN_RE.test(normalized)) return normalized;
+  if (DQUOTE_UNSAFE_RE.test(normalized)) {
+    fail('config_invalid', `path cannot be embedded safely in the supervisor command: ${path}`);
   }
-  return /\s/.test(path) ? `"${path}"` : path;
+  return `"${normalized}"`;
 }
 
 // ─── Host wiring (real adapter, lazily resolved) ─────────────────────────────
@@ -292,8 +309,13 @@ async function orcaCli(args: readonly string[], timeoutMs = 60_000): Promise<unk
   if (parsed.kind === 'json') {
     if (parsed.envelope.ok) return parsed.envelope.result;
     const e = parsed.envelope.error;
+    const requestId = extractRequestId(parsed.envelope);
     fail('adapter_error', `orca ${args[0]} ${args[1] ?? ''} failed: ${e?.message ?? 'unknown'}`, {
-      details: { adapterCode: e?.code ?? 'unknown', data: e?.data },
+      details: {
+        adapterCode: e?.code ?? 'unknown',
+        data: e?.data,
+        ...(requestId !== undefined ? { requestId } : {}),
+      },
     });
   }
   if (parsed.kind === 'error_line') {
@@ -310,7 +332,100 @@ async function orcaCli(args: readonly string[], timeoutMs = 60_000): Promise<unk
   });
 }
 
-// ─── Output ──────────────────────────────────────────────────────────────────
+/** Non-throwing variant of orcaCli for reads whose failure is itself data. */
+async function tryOrcaCli(args: readonly string[], timeoutMs = 60_000): Promise<Result<unknown>> {
+  try {
+    return { ok: true, value: await orcaCli(args, timeoutMs) };
+  } catch (e) {
+    if (e instanceof CliError) return { ok: false, error: e.error };
+    return {
+      ok: false,
+      error: err('io_error', `unexpected failure: ${e instanceof Error ? e.message : String(e)}`),
+    };
+  }
+}
+
+/** Pull a run id from a run-current / run-use receipt (tolerant of shapes). */
+function extractRunId(receipt: unknown): string | null {
+  const r = receipt as Record<string, unknown> | null;
+  if (r === null || typeof r !== 'object') return null;
+  const run = r.run as Record<string, unknown> | undefined;
+  const candidates = [r.runId, r.run_id, run?.id, run?.runId, r.id];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.length > 0) return c;
+  }
+  return null;
+}
+
+/**
+ * Dedicated-supervisor binding: ensure the CALLER terminal coordinates the
+ * persisted council child Run. Idempotent — an already-correct binding is
+ * left untouched; a missing or stale one is repaired through the documented
+ * `orca orchestration run-use --id <run> --from <handle>` under the
+ * supervisor's own identity (a coordinator resumes a run it supervises; a
+ * worker could never bind its own/ancestor Run and we never target those —
+ * only the persisted child Run). Manual driving never calls this: it must
+ * not silently steal a live unrelated Run or displace another supervisor.
+ * The caller's own prior binding is reported, never overwritten by us — and
+ * start-supervisor keeps the primary caller's binding untouched entirely.
+ */
+async function ensureBoundToRun(
+  orcaRunId: string,
+  handle: string,
+): Promise<{ prior: string | null; rebound: boolean }> {
+  // Reads use the verified bare forms under the caller's own injected
+  // identity (the handle IS this terminal); --from is only for the mutation.
+  const before = await tryOrcaCli(['orchestration', 'run-current', '--json']);
+  const prior = before.ok ? extractRunId(before.value) : null;
+  if (prior === orcaRunId) return { prior, rebound: false };
+  const used = await tryOrcaCli([
+    'orchestration',
+    'run-use',
+    '--id',
+    orcaRunId,
+    '--from',
+    handle,
+    '--json',
+    '--full',
+  ]);
+  if (!used.ok) throw new CliError(used.error);
+  // run-use is a mutation: verify the intended end state actually took hold.
+  const after = await tryOrcaCli(['orchestration', 'run-current', '--json']);
+  const nowId = after.ok ? extractRunId(after.value) : null;
+  if (nowId !== orcaRunId) {
+    fail(
+      'adapter_error',
+      `run-use returned but this terminal is not verifiably bound to ${orcaRunId} (current: ${nowId ?? 'unverifiable'}) — reconcile the Orca binding before advancing`,
+      { details: { adapterCode: 'bind_unverified', orcaRunId } },
+    );
+  }
+  return { prior, rebound: true };
+}
+
+/**
+ * Gate for --as-supervisor invocations: the caller must carry an Orca
+ * terminal identity and must BE the recorded supervisor (or claim the role
+ * when none is recorded). Refusing here prevents a second supervisor — or
+ * the primary driving manually — from silently displacing the live one.
+ */
+function requireDedicatedSupervisor(state: CouncilState, handle: string | undefined): string {
+  if (handle === undefined || handle.length === 0) {
+    fail(
+      'config_invalid',
+      '--as-supervisor requires an Orca terminal identity (ORCA_TERMINAL_HANDLE); the dedicated supervisor always runs inside Orca',
+      { details: { reason: 'missing_terminal_handle' } },
+    );
+  }
+  const recorded = state.supervisor;
+  if (recorded !== null && recorded.terminalHandle !== handle) {
+    fail(
+      'invalid_transition',
+      `this run's recorded supervisor is ${recorded.terminalHandle} — refusing to take over another supervisor's run; launch a fresh supervisor via \`council start-supervisor\` or run from the recorded terminal`,
+      { details: { recordedSupervisor: recorded } },
+    );
+  }
+  return handle;
+}
 
 function emit(payload: Record<string, unknown>, json: boolean, human: string): void {
   if (json) {
@@ -386,7 +501,7 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
   );
 
   const cliPath = fileURLToPath(import.meta.url);
-  const advanceCommand = `node ${cmdToken(cliPath)} supervise --run ${cmdToken(runDir)} --advance --json`;
+  const advanceCommand = `node ${cmdToken(cliPath)} supervise --run ${cmdToken(runDir)} --advance --as-supervisor --json`;
   const prompts = createPromptBuilder();
   const spec = prompts.supervisor(
     {
@@ -564,13 +679,14 @@ const NEXT_HINT: Record<AdvanceResult['action'], string> = {
   needs_approval:
     'review <runDir>/roster.proposed.json, write roster.approved.json, run `council approve --run <runDir> --roster <file>`, then nudge the supervisor via `orca orchestration send --to dispatch:<supervisorDispatchId>`',
   finished: 'run is terminal — report the printed outcome (and reportPaths) to the coordinator',
-  blocked: 'unrecoverable condition — inspect <runDir>/events.jsonl and decide (fix the cause or `council cancel`)',
+  blocked: 'unrecoverable condition — inspect <runDir>/events.jsonl and decide (fix the cause, `council reconcile` a persisted no-task intent, or `council cancel`)',
 };
 
 async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
   const v = parseFlags('supervise', argv, {
     run: { type: 'string' },
     advance: { type: 'boolean', default: false },
+    'as-supervisor': { type: 'boolean', default: false },
   });
   const runDir = reqStr(v, 'run', '--run <runDir>');
   if (v.advance !== true) {
@@ -578,23 +694,42 @@ async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<
   }
 
   const { store, engine } = makeEngine(runDir);
+  const state = await loadRun(store);
+  const handle = process.env.ORCA_TERMINAL_HANDLE;
+  const dedicated = v['as-supervisor'] === true;
+  let binding: { prior: string | null; rebound: boolean } | null = null;
+
+  if (dedicated) {
+    // Dedicated supervision: this terminal IS the run's supervisor. Bind it
+    // to the persisted council child Run when a restart left that Run bound
+    // to a vanished terminal — a mutation the host requires before any
+    // task-create/worker-start can land. Never attempted in manual mode.
+    const h = requireDedicatedSupervisor(state, handle);
+    if (state.orcaRunId !== null) {
+      binding = await ensureBoundToRun(state.orcaRunId, h);
+    }
+  }
 
   // Record the supervisor's durable identity so `council approve` can address
   // its wake exactly (writing approval files alone never wakes the agent).
-  const handle = process.env.ORCA_TERMINAL_HANDLE;
-  if (handle !== undefined) {
+  // A manual advance may record itself only when no DIFFERENT supervisor is
+  // recorded — it must never overwrite a live supervisor's identity.
+  if (
+    handle !== undefined &&
+    (dedicated || state.supervisor === null || state.supervisor.terminalHandle === handle)
+  ) {
     const identified = await store.withLock(async () => {
       const st = await store.loadState();
       if (!st.ok) return st;
-      const state = st.value;
-      if (state.supervisor?.terminalHandle === handle && state.supervisor.dispatchId !== null) {
+      const s = st.value;
+      if (s.supervisor?.terminalHandle === handle && s.supervisor.dispatchId !== null) {
         return { ok: true as const, value: false };
       }
-      state.supervisor = {
+      s.supervisor = {
         terminalHandle: handle,
-        dispatchId: state.supervisor?.dispatchId ?? process.env.ORCA_DISPATCH_ID ?? null,
+        dispatchId: s.supervisor?.dispatchId ?? process.env.ORCA_DISPATCH_ID ?? null,
       };
-      const w = await store.saveState(state);
+      const w = await store.saveState(s);
       if (!w.ok) return w;
       return { ok: true as const, value: true };
     });
@@ -610,6 +745,7 @@ async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<
       action: res.action,
       note: res.note ?? null,
       nextHint: NEXT_HINT[res.action],
+      ...(binding !== null ? { binding } : {}),
       ...(res.artifacts !== undefined ? { artifacts: res.artifacts } : {}),
       ...(res.outcome !== undefined ? { outcome: res.outcome } : {}),
       ...(res.reportPaths !== undefined ? { reportPaths: res.reportPaths } : {}),
@@ -618,7 +754,344 @@ async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<
     human: [
       `state: ${res.status}   action: ${res.action}`,
       ...(res.note !== undefined ? [`note:  ${res.note}`] : []),
+      ...(binding !== null && binding.rebound
+        ? [`bound: this terminal now coordinates ${state.orcaRunId} (was ${binding.prior ?? 'unbound'})`]
+        : []),
       `next:  ${NEXT_HINT[res.action]}`,
+    ].join('\n'),
+  };
+}
+
+// ─── council reconcile ───────────────────────────────────────────────────────
+
+/** Orca-issued request id shape (uuid form used in refusal receipts). */
+const REQUEST_ID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+const REQUEST_ID_TEST = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
+
+function firstStr(...vals: unknown[]): string | undefined {
+  for (const v of vals) {
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+function asRec(v: unknown): Record<string, unknown> | undefined {
+  return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : undefined;
+}
+
+const normWs = (s: string): string => s.replace(/\s+/g, ' ').trim();
+const normPath = (s: string): string => s.replace(/\\/g, '/');
+
+/** Engine-identical worker task title (engine.ts launchAttempt). */
+function attemptTaskTitle(p: Participant, attempt: PhaseAttempt): string {
+  return `council ${attempt.phase}${attempt.round !== null ? ` r${attempt.round}` : ''} ${p.participantId}`;
+}
+
+/** Every request id a journaled task-create failure carries (message + payload). */
+function journaledRequestIds(event: { payload?: Record<string, unknown> }): string[] {
+  const out = new Set<string>();
+  const p = event.payload ?? {};
+  for (const v of [p.requestId, p.request_id, asRec(p.data)?.orchestrationRequestId]) {
+    const m = typeof v === 'string' ? v.match(REQUEST_ID_TEST) : null;
+    if (m !== null) out.add(m[0]);
+  }
+  if (typeof p.message === 'string') {
+    for (const m of p.message.matchAll(REQUEST_ID_RE)) out.add(m[0]);
+  }
+  return [...out];
+}
+
+function taskRows(receipt: unknown): Record<string, unknown>[] {
+  const r = asRec(receipt);
+  const list = r?.tasks ?? r?.items ?? (Array.isArray(receipt) ? receipt : undefined);
+  return Array.isArray(list) ? list.filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null) : [];
+}
+
+/**
+ * Does a task-list row belong to this exact attempt? Match by the spec-file
+ * path the task was created from (tolerant of relocated run dirs), by the
+ * full spec text, or by the deterministic task title plus run/participant
+ * markers inside the spec text. Anything ambiguous is the caller's problem —
+ * never a coin flip.
+ */
+function taskMatchesAttempt(
+  row: Record<string, unknown>,
+  ctx: {
+    specRel: string;
+    specAbsNorm: string;
+    expectedSpecNorm: string;
+    expectedTitle: string;
+    runId: string;
+    participantId: string;
+  },
+): boolean {
+  const specRef = firstStr(
+    row.specFile, row.spec_file, row.specPath, row.spec_path, row.specfile,
+    asRec(row.task)?.specFile, row.file, row.path,
+  );
+  if (specRef !== undefined) {
+    const n = normPath(specRef);
+    if (n === ctx.specAbsNorm || n.endsWith(`/${ctx.specRel}`)) return true;
+  }
+  const specText = firstStr(row.spec, asRec(row.task)?.spec, asRec(row.result)?.spec);
+  if (specText !== undefined) {
+    if (normWs(specText) === ctx.expectedSpecNorm) return true;
+    const title = firstStr(row.title, row.taskTitle, asRec(row.task)?.title);
+    if (
+      title === ctx.expectedTitle &&
+      specText.includes(ctx.runId) &&
+      specText.includes(ctx.participantId)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Reconcile a persisted launch intent whose task-create was definitively
+ * refused (the "no-task intent" case: intent_recorded, every host id null,
+ * engine refusing to retry on its own). Explicit operator confirmation
+ * names the Orca request id of the recorded refusal; the host task list is
+ * then inspected for a task carrying this attempt's exact spec — a unique
+ * match is adopted, no match permits exactly one fresh task-create. Any
+ * ambiguity, unresolved operation, or present dispatch refuses: never
+ * launch twice, never blind-retry.
+ */
+async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
+  const v = parseFlags('reconcile', argv, {
+    run: { type: 'string' },
+    attempt: { type: 'string' },
+    'confirm-no-effects': { type: 'string' },
+    'as-supervisor': { type: 'boolean', default: false },
+  });
+  const runDir = reqStr(v, 'run', '--run <runDir>');
+  const attemptId = reqStr(v, 'attempt', '--attempt <attemptId>');
+  const confirm = reqStr(v, 'confirm-no-effects', '--confirm-no-effects <requestId>');
+  const dedicated = v['as-supervisor'] === true;
+
+  const { store } = makeEngine(runDir);
+  const state = await loadRun(store);
+  if (state.orcaRunId === null) {
+    fail('invalid_transition', 'no Orca Run is recorded for this council run — there is nothing to reconcile against');
+  }
+  const orcaRunId = state.orcaRunId;
+
+  const located = state.participants
+    .flatMap((p) => p.attempts.map((a) => ({ p, a })))
+    .find(({ a }) => a.attemptId === attemptId);
+  if (located === undefined) {
+    fail('config_invalid', `no attempt ${attemptId} in this run`, {
+      details: { attempts: state.participants.flatMap((p) => p.attempts.map((a) => a.attemptId)) },
+    });
+  }
+  const { p, a: attempt } = located;
+
+  if (attempt.status !== 'intent_recorded') {
+    fail(
+      'invalid_transition',
+      `attempt ${attemptId} is '${attempt.status}' — reconcile applies only to a persisted no-task launch intent (intent_recorded)`,
+      { details: { attemptId, status: attempt.status } },
+    );
+  }
+  if (attempt.taskId !== null || attempt.dispatchId !== null || attempt.terminalHandle !== null) {
+    fail(
+      'invalid_transition',
+      `attempt ${attemptId} already carries task/dispatch/terminal ids — a launch may exist; reconcile through worker observation, never relaunch`,
+      { details: { attemptId, taskId: attempt.taskId, dispatchId: attempt.dispatchId, terminalHandle: attempt.terminalHandle } },
+    );
+  }
+
+  const journal = unwrap(await store.readJournal());
+  const failureEvent = [...journal].reverse().find(
+    (e) => e.type === 'error' && e.payload?.op === 'task-create' && e.payload.attemptId === attemptId,
+  );
+  if (failureEvent === undefined) {
+    fail(
+      'invalid_transition',
+      `no failed task-create is journaled for ${attemptId} — the engine guard does not apply; run \`council supervise --advance\` instead`,
+    );
+  }
+  const recordedIds = journaledRequestIds(failureEvent);
+  if (recordedIds.length === 0) {
+    fail(
+      'launch_unknown',
+      `the recorded task-create failure for ${attemptId} carries no Orca request id — its outcome cannot be confirmed a definitive no-effect refusal; inspect events.jsonl seq ${failureEvent.seq} and reconcile manually before any retry`,
+      { details: { attemptId, journalSeq: failureEvent.seq } },
+    );
+  }
+  if (!recordedIds.includes(confirm)) {
+    fail('config_invalid', `--confirm-no-effects ${confirm} does not match the recorded task-create failure request id(s): ${recordedIds.join(', ')}`, {
+      details: { attemptId, recordedRequestIds: recordedIds },
+    });
+  }
+
+  const handle = process.env.ORCA_TERMINAL_HANDLE;
+  let binding: { prior: string | null; rebound: boolean } | null = null;
+  if (dedicated) {
+    const h = requireDedicatedSupervisor(state, handle);
+    binding = await ensureBoundToRun(orcaRunId, h);
+  }
+
+  // Advisory request ledger: 'completed' forces the adopt-only path, 'pending'
+  // refuses outright; every other answer (or an unreadable one) defers to the
+  // authoritative task-list scan below.
+  let requestState = 'unread';
+  const probe = await tryOrcaCli([
+    'orchestration', 'request-show', '--request', confirm, '--json',
+  ]);
+  if (probe.ok) {
+    requestState = firstStr(asRec(probe.value)?.state, asRec(probe.value)?.status) ?? 'unknown';
+    if (requestState === 'pending' || requestState === 'in_progress') {
+      fail(
+        'launch_unknown',
+        `request ${confirm} is still ${requestState} — the task-create may yet land; resolve it before any retry`,
+        { details: { attemptId, requestId: confirm } },
+      );
+    }
+  }
+  const completed = requestState === 'completed' || requestState === 'done';
+
+  const specRel = `specs/${attemptId}.md`;
+  const specRead = await store.readArtifact(specRel);
+  if (!specRead.ok) {
+    fail('io_error', `expected spec artifact ${specRel} is missing — cannot verify a matching host task; reconcile manually`, {
+      details: { attemptId },
+    });
+  }
+  const expectedSpecNorm = normWs(specRead.value);
+  const expectedTitle = attemptTaskTitle(p, attempt);
+  const specAbsNorm = normPath(resolve(runDir, specRel));
+
+  const listed = await tryOrcaCli([
+    'orchestration', 'task-list', '--run', orcaRunId, '--full', '--json',
+  ]);
+  if (!listed.ok) {
+    // An unreadable task ledger means the attempt's host state is unknown —
+    // refuse rather than risk a second task for the same intent.
+    throw new CliError(listed.error);
+  }
+  const matches = taskRows(listed.value).filter((row) =>
+    taskMatchesAttempt(row, {
+      specRel,
+      specAbsNorm,
+      expectedSpecNorm,
+      expectedTitle,
+      runId: state.runId,
+      participantId: p.participantId,
+    }),
+  );
+  const matchIds = matches
+    .map((row) => firstStr(row.id, row.taskId, asRec(row.task)?.id))
+    .filter((x): x is string => typeof x === 'string');
+
+  let taskId: string;
+  let resolution: 'adopted' | 'created';
+  if (matches.length > 1) {
+    fail(
+      'launch_unknown',
+      `${matches.length} host tasks match attempt ${attemptId} (${matchIds.join(', ')}) — refusing to pick; inspect \`orca orchestration task-list --run ${orcaRunId} --full\` and reconcile manually`,
+      { details: { attemptId, matches: matchIds } },
+    );
+  } else if (matches.length === 1) {
+    const found = matchIds[0];
+    if (found === undefined) {
+      fail('launch_unknown', `the matching host task for ${attemptId} exposes no task id — reconcile manually`, {
+        details: { attemptId },
+      });
+    }
+    taskId = found;
+    resolution = 'adopted';
+  } else if (completed) {
+    fail(
+      'launch_unknown',
+      `request ${confirm} is recorded completed but no host task matches ${attemptId} — investigate before any retry`,
+      { details: { attemptId, requestId: confirm } },
+    );
+  } else {
+    // Confirmed no-effects + zero matching tasks: exactly one fresh task.
+    const created = await lazyHost().createTask({
+      runId: orcaRunId,
+      specFilePath: resolve(runDir, specRel),
+      title: expectedTitle,
+    });
+    if (!created.ok) {
+      // Keep the engine guard armed for this attempt — the failed retry is
+      // journaled exactly like the original failure.
+      unwrap(
+        await store.appendJournal([
+          {
+            ts: new Date().toISOString(),
+            type: 'error',
+            actor: 'engine',
+            phase: attempt.phase,
+            participantId: p.participantId,
+            payload: {
+              op: 'task-create',
+              attemptId,
+              code: created.error.code,
+              message: created.error.message,
+            },
+          },
+        ]),
+      );
+      throw new CliError(created.error);
+    }
+    taskId = created.value.taskId;
+    resolution = 'created';
+  }
+
+  // Persist the real task id before any launch: the engine's null-task guard
+  // is bypassed only by this journaled reconciliation, never erased.
+  unwrap(
+    await store.withLock(async () => {
+      const st = await store.loadState();
+      if (!st.ok) return st;
+      const cur = st.value.participants
+        .find((pp) => pp.participantId === p.participantId)
+        ?.attempts.find((a) => a.attemptId === attemptId);
+      if (cur === undefined || cur.status !== 'intent_recorded' || cur.taskId !== null) {
+        return {
+          ok: false as const,
+          error: err('invalid_transition', `attempt ${attemptId} changed during reconciliation — aborting; re-inspect before retry`),
+        };
+      }
+      cur.taskId = taskId;
+      const w = await store.saveState(st.value);
+      if (!w.ok) return w;
+      return store.appendJournal([
+        {
+          ts: new Date().toISOString(),
+          type: 'task.created',
+          actor: 'engine',
+          phase: attempt.phase,
+          participantId: p.participantId,
+          payload: { attemptId, taskId, scope: 'task', reconciled: resolution, confirmedRequestId: confirm },
+        },
+      ]);
+    }),
+  );
+
+  const advance = `council supervise --run ${cmdToken(runDir)} --advance --as-supervisor --json`;
+  return {
+    payload: {
+      attemptId,
+      participantId: p.participantId,
+      resolution,
+      taskId,
+      orcaRunId,
+      requestState,
+      confirmedRequestId: confirm,
+      ...(binding !== null ? { binding } : {}),
+      next: advance,
+      note: `attempt reconciled (${resolution}); run the advance command to launch the worker on this task — do not relaunch`,
+    },
+    human: [
+      `reconciled ${attemptId}: ${resolution} task ${taskId}`,
+      ...(binding !== null && binding.rebound
+        ? [`  bound this terminal to ${orcaRunId} (was ${binding.prior ?? 'unbound'})`]
+        : []),
+      `  next: ${advance}`,
     ].join('\n'),
   };
 }
@@ -655,7 +1128,11 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
 
   const baseApprover =
     process.env.ORCA_TERMINAL_HANDLE ?? process.env.USER ?? process.env.USERNAME ?? 'cli';
-  const approver = (note === undefined ? baseApprover : `${baseApprover} — ${note}`).slice(0, 200);
+  // The contract caps approval.approver at 128 chars (validation.ts
+  // parseApprovalRecord) — a longer note must be truncated here, not at 200,
+  // or the persisted record fails schema validation. The approver identity
+  // stays intact: truncation can only ever eat into the note tail.
+  const approver = (note === undefined ? baseApprover : `${baseApprover} — ${note}`).slice(0, 128);
 
   const res = unwrap(await engine.approve({ roster, approver }));
 
@@ -886,28 +1363,42 @@ async function cmdStartSupervisor(argv: readonly string[]): Promise<{ payload: R
   const fromArgs =
     process.env.ORCA_TERMINAL_HANDLE !== undefined ? ['--from', process.env.ORCA_TERMINAL_HANDLE] : [];
 
-  // 1) Task for the supervisor under the CALLER's binding (not the council run).
-  const taskReceipt = await orcaCli([
-    'orchestration',
-    'task-create',
-    '--spec-file',
-    specPath,
-    `--task-title=Council supervisor ${state.runId}`,
-    ...fromArgs,
-    '--json',
-  ]);
-  const tr = taskReceipt as Record<string, unknown> | undefined;
-  const taskId =
-    (tr?.task as Record<string, unknown> | undefined)?.id ??
-    (tr?.id as string | undefined) ??
-    (tr?.taskId as string | undefined);
-  if (typeof taskId !== 'string' || taskId.length === 0) {
-    fail('adapter_error', 'task-create returned no task id — reconcile before retry', {
-      details: { adapterCode: 'missing_task_id', receipt: taskReceipt },
-    });
+  // The supervisor Task belongs under the caller's bound Run when one exists
+  // (the caller's binding is preserved — we never run-use here). With no
+  // bound Run, task-create has nothing to attach to; the documented
+  // `worker-start --spec-file` path creates or joins a Run implicitly, so a
+  // first-time invocation still works. An unreadable binding takes the same
+  // path — it covers both cases.
+  const current = await tryOrcaCli(['orchestration', 'run-current', ...fromArgs, '--json']);
+  const boundRunId = current.ok ? extractRunId(current.value) : null;
+
+  let taskId: string | null = null;
+  let taskReceipt: unknown = null;
+  if (boundRunId !== null) {
+    // Task for the supervisor under the CALLER's binding (not the council run).
+    taskReceipt = await orcaCli([
+      'orchestration',
+      'task-create',
+      '--spec-file',
+      specPath,
+      `--task-title=Council supervisor ${state.runId}`,
+      ...fromArgs,
+      '--json',
+    ]);
+    const tr = taskReceipt as Record<string, unknown> | undefined;
+    const tid =
+      (tr?.task as Record<string, unknown> | undefined)?.id ??
+      (tr?.id as string | undefined) ??
+      (tr?.taskId as string | undefined);
+    if (typeof tid !== 'string' || tid.length === 0) {
+      fail('adapter_error', 'task-create returned no task id — reconcile before retry', {
+        details: { adapterCode: 'missing_task_id', receipt: taskReceipt },
+      });
+    }
+    taskId = tid;
   }
 
-  // 2) Terminal running the pinned Devin lane (fixed allowlisted tokens only).
+  // Terminal running the pinned Devin lane (fixed allowlisted tokens only).
   const termReceipt = await orcaCli([
     'terminal',
     'create',
@@ -927,25 +1418,51 @@ async function cmdStartSupervisor(argv: readonly string[]): Promise<{ payload: R
     });
   }
 
-  // 3) Wait for the agent CLI to reach its prompt before injecting the Task.
+  // Wait for the agent CLI to reach its prompt before injecting the Task.
   await orcaCli(
     ['terminal', 'wait', '--terminal', terminalHandle, '--for', 'tui-idle', '--timeout-ms', String(waitMs), '--json'],
     waitMs + 15_000,
   );
 
-  // 4) Bind the Task to the waiting terminal.
-  const startReceipt = await orcaCli([
-    'orchestration',
-    'worker-start',
-    '--task',
-    taskId,
-    '--terminal',
-    terminalHandle,
-    '--worktree',
-    'current',
-    ...fromArgs,
-    '--json',
-  ]);
+  // Bind the Task to the waiting terminal — an explicit pre-created Task when
+  // the caller has a bound Run, otherwise the documented spec-file form that
+  // creates/joins a Run implicitly.
+  const startReceipt = await orcaCli(
+    taskId !== null
+      ? [
+          'orchestration',
+          'worker-start',
+          '--task',
+          taskId,
+          '--terminal',
+          terminalHandle,
+          '--worktree',
+          'current',
+          ...fromArgs,
+          '--json',
+        ]
+      : [
+          'orchestration',
+          'worker-start',
+          '--spec-file',
+          specPath,
+          `--task-title=Council supervisor ${state.runId}`,
+          '--terminal',
+          terminalHandle,
+          '--worktree',
+          'current',
+          ...fromArgs,
+          '--json',
+          '--full',
+        ],
+  );
+  if (taskId === null) {
+    const sr = startReceipt as Record<string, unknown> | undefined;
+    taskId =
+      ((sr?.task as Record<string, unknown> | undefined)?.id as string | undefined) ??
+      (sr?.taskId as string | undefined) ??
+      ((sr?.id as string | undefined) ?? null);
+  }
   const { dispatchId } = extractDispatchInfo(startReceipt);
 
   // Persist the durable supervisor identity for `council approve` wakes.
@@ -966,17 +1483,23 @@ async function cmdStartSupervisor(argv: readonly string[]): Promise<{ payload: R
       terminalHandle,
       dispatchId: dispatchId ?? null,
       command: SUPERVISOR_COMMAND,
+      callerRun: boundRunId,
+      lane:
+        boundRunId !== null
+          ? 'task-under-caller-run'
+          : 'implicit-run (worker-start --spec-file — no bound Run on the caller)',
       receipts: { taskCreate: taskReceipt, workerStart: startReceipt },
       note:
         dispatchId === undefined
           ? 'worker-start returned no dispatch id in its receipt — reconcile via `orca orchestration worker-list` before retrying; the terminal is live'
-          : 'supervisor launched — it will drive `council supervise --advance` on each wake',
+          : 'supervisor launched — it will drive `council supervise --advance --as-supervisor` on each wake',
     },
     human: [
       `supervisor launched for ${state.runId}`,
-      `  task:     ${taskId}`,
+      `  task:     ${taskId ?? 'created implicitly by worker-start (id not in receipt)'}`,
       `  terminal: ${terminalHandle} (${SUPERVISOR_COMMAND})`,
       `  dispatch: ${dispatchId ?? 'NOT RETURNED — reconcile via orca orchestration worker-list'}`,
+      `  caller Run: ${boundRunId ?? 'none — implicit Run created/joined by worker-start'}`,
     ].join('\n'),
   };
 }
@@ -990,6 +1513,7 @@ const COMMANDS: Record<
   init: cmdInit,
   doctor: cmdDoctor,
   supervise: cmdSupervise,
+  reconcile: cmdReconcile,
   approve: cmdApprove,
   status: cmdStatus,
   cancel: cmdCancel,
@@ -1008,8 +1532,15 @@ commands:
             snapshot the target, write the supervisor spec
   start-supervisor --run <runDir>
             launch the dedicated supervisor worker (Orca task + Devin terminal)
-  supervise --run <runDir> --advance
-            one bounded, idempotent engine step; prints {state, action, note}
+  supervise --run <runDir> --advance [--as-supervisor]
+            one bounded, idempotent engine step; prints {state, action, note}.
+            --as-supervisor is the dedicated supervisor's own mode: it binds
+            this terminal to the persisted child Run (run-use) when a restart
+            orphaned the binding — never used for manual driving
+  reconcile --run <runDir> --attempt <attemptId> --confirm-no-effects <requestId> [--as-supervisor]
+            resolve a persisted no-task launch intent: adopt the unique host
+            task carrying this attempt's spec, or create exactly one task
+            after a confirmed no-effect refusal; refuses on any ambiguity
   approve   --run <runDir> --roster <file> [--note <text>]
             record the hash-bound roster approval (does not wake the supervisor)
   status    --run <runDir>          phase, per-seat health, budgets, quorum

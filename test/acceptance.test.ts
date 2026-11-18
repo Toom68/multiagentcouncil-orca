@@ -643,3 +643,97 @@ test('independence check rejects peer leakage on POSIX and Windows separators', 
     );
   }
 });
+
+// ─── Null-task intent recovery (the live-smoke crash shape) ─────────────────
+// The real saved run: supervisor restart → reviewer task-create refused with
+// "Nothing changed" → attempt stuck intent_recorded with null ids. The engine
+// must (1) refuse to blind-retry that task-create on the next advance and
+// (2) resume cleanly once `council reconcile` has persisted a verified taskId.
+
+test('engine guards a failed task-create and resumes through a reconciled taskId', async () => {
+  const ctx = await initRun();
+  unwrap(await ctx.engine.advance());
+  const gate = await pump(ctx);
+  assert.equal(gate.action, 'needs_approval');
+  const rosterFile = path.join(ctx.target, 'roster.approved.json');
+  writeFileSync(rosterFile, JSON.stringify(approvedRoster(ctx.runId)));
+  assert.equal((await cli(['approve', '--run', ctx.runDir, '--roster', rosterFile, '--json'], ctx.env)).code, 0);
+
+  // Sabotage the host exactly once: the next task-create is definitively
+  // refused (the crashed-supervisor binding failure), then heals.
+  const realCreateTask = ctx.host.createTask.bind(ctx.host);
+  let refuseTaskCreate = true;
+  let createCalls = 0;
+  ctx.host.createTask = async (input: { runId: string; specFilePath: string; title: string }) => {
+    createCalls += 1;
+    if (refuseTaskCreate) {
+      return {
+        ok: false as const,
+        error: {
+          code: 'adapter_error',
+          message:
+            'This caller is not bound to Run fake-orca-run-1, which is bound to term_deadbeef. Nothing changed. Orchestration mutation request ID: 74a45889-c510-491e-9598-26264fc8f5c7.',
+        },
+      };
+    }
+    return realCreateTask(input);
+  };
+
+  // 1) First reviewer task-create fails → blocked, null-task intent persisted.
+  const r1 = unwrap(await ctx.engine.advance());
+  assert.equal(r1.action, 'blocked');
+  assert.match(r1.note ?? '', /reconcile|intent/i);
+  const st1 = unwrap(await ctx.store.loadState());
+  const victim = st1.participants
+    .flatMap((p) => p.attempts)
+    .find((a) => a.phase === 'independent_review' && a.status === 'intent_recorded')!;
+  assert.equal(victim.taskId, null);
+  assert.equal(victim.dispatchId, null);
+  const callsAfterFailure = createCalls;
+
+  // 2) The journal-derived guard refuses a blind retry — no second createTask.
+  const r2 = unwrap(await ctx.engine.advance());
+  assert.equal(r2.action, 'blocked');
+  assert.equal(createCalls, callsAfterFailure, 'engine must not retry a definitively refused task-create');
+  assert.equal(ctx.host.launches.filter((l) => l.spec.phase === 'independent_review').length, 0);
+
+  // 3) `council reconcile` persists the verified taskId + task.created event.
+  const reconciledTaskId = 'task_reconciled_1';
+  unwrap(
+    await ctx.store.withLock(async () => {
+      const st = await ctx.store.loadState();
+      if (!st.ok) return st;
+      const att = st.value.participants
+        .flatMap((p) => p.attempts)
+        .find((a) => a.attemptId === victim.attemptId)!;
+      att.taskId = reconciledTaskId;
+      const w = await ctx.store.saveState(st.value);
+      if (!w.ok) return w;
+      return ctx.store.appendJournal([
+        {
+          ts: new Date().toISOString(),
+          type: 'task.created',
+          actor: 'engine',
+          phase: 'independent_review',
+          participantId: victim.participantId,
+          payload: { attemptId: victim.attemptId, taskId: reconciledTaskId, scope: 'task', reconciled: 'created' },
+        },
+      ]);
+    }),
+  );
+
+  // 4) The reconciled attempt launches on the persisted taskId — the null-task
+  //    guard is bypassed ONLY by the journaled reconciliation, and the peer
+  //    reviewer still takes the normal createTask path.
+  refuseTaskCreate = false;
+  const r3 = unwrap(await ctx.engine.advance());
+  assert.equal(r3.action, 'progress');
+  const recovered = ctx.host.launches.find((l) => l.spec.participantId === victim.participantId)!;
+  assert.equal(recovered.spec.taskId, reconciledTaskId, 'launch must use the reconciled task id, never a relaunched task');
+  const state3 = unwrap(await ctx.store.loadState());
+  const healed = state3.participants
+    .flatMap((p) => p.attempts)
+    .find((a) => a.attemptId === victim.attemptId)!;
+  assert.equal(healed.status, 'dispatched');
+  assert.equal(healed.taskId, reconciledTaskId);
+});

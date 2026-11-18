@@ -16,7 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -223,7 +223,7 @@ test('init creates the documented run-dir layout', async () => {
   assert.equal(path.dirname(runDir), path.join(councilHome, 'runs'));
   assert.equal(typeof r.body.snapshotId, 'string');
   assert.equal(typeof r.body.launchBudgetFloor, 'number');
-  assert.match(r.body.advanceCommand as string, /supervise --run .* --advance --json/);
+  assert.match(r.body.advanceCommand as string, /supervise --run .* --advance --as-supervisor --json/);
 
   for (const rel of [
     'council.json',
@@ -258,7 +258,7 @@ test('init creates the documented run-dir layout', async () => {
 
   const spec = readFileSync(path.join(runDir, 'prompts', 'supervisor.md'), 'utf8');
   assert.match(spec, new RegExp(runId));
-  assert.match(spec, /supervise --run .* --advance --json/);
+  assert.match(spec, /supervise --run .* --advance --as-supervisor --json/);
 });
 
 test('init default (no COUNCIL_HOME) puts the run under <target>/.council', async () => {
@@ -536,4 +536,555 @@ test('cancel marks a non-terminal run cancelled and reports honestly', async () 
 
   const again = await cliJson(['cancel', '--run', runDir, '--json'], env);
   assert.equal(again.code, 4); // invalid_transition — already terminal
+});
+
+// ─── supervisor recovery: rebinding + reconcile ──────────────────────────────
+//
+// A fake `orca` stands in for the host: ORCA_CLI_COMMAND points at the Node
+// executable and NODE_OPTIONS --require's test/fixtures/orca-recovery.cjs into
+// every spawned child. `node orchestration <verb>` has argv[1]==='orchestration'
+// so the fixture emits a canned JSON envelope; in the council CLI itself it is
+// a no-op. Scenario queues are FIFO per command family; every invocation is
+// logged so tests prove exactly what ran (or never ran). No real host is
+// touched and no agent ever launches — only CLI-level commands.
+
+const FAKE_ORCA_SRC = path.join(REPO_ROOT, 'test', 'fixtures', 'orca-recovery.cjs');
+
+/** Wire a fake orca host into the env for one test; returns the call log path. */
+function fakeOrca(
+  dir: string,
+  scenario: Record<string, unknown[]>,
+  handle?: string,
+): { env: NodeJS.ProcessEnv; log: string } {
+  const fixture = path.join(dir, 'orca-fake.cjs');
+  copyFileSync(FAKE_ORCA_SRC, fixture);
+  const scenarioPath = path.join(dir, 'orca-scenario.json');
+  writeFileSync(scenarioPath, JSON.stringify(scenario));
+  const log = path.join(dir, 'orca.log');
+  return {
+    log,
+    env: {
+      ORCA_CLI_COMMAND: process.execPath, // `node orchestration ...`
+      NODE_OPTIONS: `--require ${fixture}`,
+      FAKE_ORCA_SCENARIO: scenarioPath,
+      FAKE_ORCA_LOG: log,
+      ...(handle !== undefined ? { ORCA_TERMINAL_HANDLE: handle } : {}),
+    },
+  };
+}
+
+/**
+ * Every fake-orca invocation, oldest first. The logged argv[0] is the resolved
+ * entry path ('.../orchestration'), so it is normalized to its basename to
+ * yield [['orchestration','run-current',...], ...].
+ */
+function orcaCalls(log: string): string[][] {
+  if (!existsSync(log)) return [];
+  return readFileSync(log, 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => {
+      const argv = (JSON.parse(l) as { argv: string[] }).argv;
+      return [path.basename(argv[0] ?? ''), ...argv.slice(1)];
+    });
+}
+
+const hasCall = (log: string, head: string): boolean =>
+  orcaCalls(log).some((a) => a.slice(0, 2).join(' ') === head);
+
+interface RecoveryFixture extends InitFixture {
+  attemptId: string;
+  requestId: string;
+  specRel: string;
+  specText: string;
+}
+
+/**
+ * Persist the live-smoke crash shape: a run in independent_review whose
+ * reviewer task-create was definitively refused (journaled request id,
+ * "Nothing changed"), leaving a null-task intent_recorded attempt that the
+ * engine's launch guard refuses to retry on its own.
+ */
+async function recoveryRun(
+  opts: { supervisorHandle?: string; specText?: string; attemptExtras?: Record<string, unknown> } = {},
+): Promise<RecoveryFixture> {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  const store = createStore({ runDir: f.runDir });
+  const attemptId = 'att_rev-1_independent_review_r0_0';
+  const requestId = '74a45889-c510-491e-9598-26264fc8f5c7';
+  const specRel = `specs/${attemptId}.md`;
+  const specText =
+    opts.specText ??
+    `# worker spec\nrun ${f.runId}\nparticipant rev-1\nphase independent_review\n`;
+  assert.ok((await store.writeArtifact(specRel, specText)).ok);
+
+  const w = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    const s = st.value;
+    s.status = 'independent_review';
+    s.orcaRunId = 'run_child';
+    s.supervisor = {
+      terminalHandle: opts.supervisorHandle ?? 'term_sup',
+      dispatchId: 'ctx_sup',
+    };
+    s.participants = [
+      {
+        participantId: 'rev-1',
+        role: 'reviewer',
+        seatId: 'seat-1',
+        perspectiveId: 'p1',
+        agent: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' },
+        retainedTerminal: null,
+        status: 'active',
+        attempts: [
+          {
+            attemptId,
+            participantId: 'rev-1',
+            phase: 'independent_review',
+            round: null,
+            taskId: null,
+            dispatchId: null,
+            terminalHandle: null,
+            launchIntentId: 'li_test',
+            status: 'intent_recorded',
+            createdAt: new Date().toISOString(),
+            artifacts: [],
+            ...(opts.attemptExtras ?? {}),
+          },
+        ],
+      },
+    ];
+    const wres = await store.saveState(s);
+    if (!wres.ok) return wres;
+    return store.appendJournal([
+      {
+        ts: new Date().toISOString(),
+        type: 'error',
+        actor: 'engine',
+        phase: 'independent_review',
+        participantId: 'rev-1',
+        payload: {
+          op: 'task-create',
+          attemptId,
+          code: 'adapter_error',
+          message: `This caller is not bound to Run run_child, which is bound to term_deadbeef. Nothing changed. Orchestration mutation request ID: ${requestId}.`,
+        },
+      },
+    ]);
+  });
+  assert.ok(w.ok, `fixture setup failed: ${JSON.stringify(w)}`);
+  return { ...f, attemptId, requestId, specRel, specText };
+}
+
+function readState(runDir: string) {
+  return JSON.parse(readFileSync(path.join(runDir, 'state.json'), 'utf8')) as {
+    orcaRunId: string | null;
+    supervisor: { terminalHandle: string; dispatchId: string | null } | null;
+    status: string;
+    participants: {
+      participantId: string;
+      attempts: { attemptId: string; taskId: string | null; status: string }[];
+    }[];
+  };
+}
+
+function journalTail(runDir: string, n = 3): { type: string; payload?: Record<string, unknown> }[] {
+  const lines = readFileSync(path.join(runDir, 'events.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0);
+  return lines.slice(-n).map((l) => JSON.parse(l));
+}
+
+test('supervise --advance --as-supervisor rebinds an orphaned council child Run', async () => {
+  const { runDir } = await recoveryRun();
+  const dir = tmp('rebind');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [
+        { ok: true, result: { runId: 'run_unrelated' } }, // before
+        { ok: true, result: { runId: 'run_child' } }, // verification after run-use
+      ],
+      'orchestration run-use': [{ ok: true, result: { runId: 'run_child' } }],
+    },
+    'term_sup',
+  );
+
+  const r = await cliJson(['supervise', '--run', runDir, '--advance', '--as-supervisor', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.ok, true);
+  const binding = r.body.binding as { prior: string | null; rebound: boolean };
+  assert.equal(binding.prior, 'run_unrelated');
+  assert.equal(binding.rebound, true);
+
+  const use = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'orchestration run-use')!;
+  assert.ok(use.includes('--id'));
+  assert.ok(use.includes('run_child'));
+  assert.ok(use.includes('term_sup'));
+});
+
+test('supervise --advance --as-supervisor leaves a correct binding untouched', async () => {
+  const { runDir } = await recoveryRun();
+  const dir = tmp('bound');
+  const { env, log } = fakeOrca(
+    dir,
+    { 'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }] },
+    'term_sup',
+  );
+
+  const r = await cliJson(['supervise', '--run', runDir, '--advance', '--as-supervisor', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal((r.body.binding as { rebound: boolean }).rebound, false);
+  assert.equal(hasCall(log, 'orchestration run-use'), false); // already bound → no mutation
+});
+
+test('supervise --advance --as-supervisor refuses a different recorded supervisor and verifies the binding', async () => {
+  // Different supervisor: refuses BEFORE touching the host.
+  const { runDir } = await recoveryRun({ supervisorHandle: 'term_other' });
+  const d1 = tmp('takeover');
+  const f1 = fakeOrca(d1, {}, 'term_sup');
+  const r1 = await cliJson(['supervise', '--run', runDir, '--advance', '--as-supervisor', '--json'], f1.env);
+  assert.equal(r1.code, 4); // invalid_transition
+  assert.match((r1.body.error as Record<string, unknown>).message as string, /term_other/);
+  assert.equal(orcaCalls(f1.log).length, 0); // no run-current, no run-use
+
+  // Binding that does not verify: run-use "succeeded" but the terminal is
+  // still bound elsewhere → adapter_error, never a silent advance.
+  const { runDir: runDir2 } = await recoveryRun();
+  const d2 = tmp('bindfail');
+  const f2 = fakeOrca(
+    d2,
+    {
+      'orchestration run-current': [
+        { ok: true, result: { runId: 'run_unrelated' } },
+        { ok: true, result: { runId: 'run_still_wrong' } },
+      ],
+      'orchestration run-use': [{ ok: true, result: { runId: 'run_child' } }],
+    },
+    'term_sup',
+  );
+  const r2 = await cliJson(['supervise', '--run', runDir2, '--advance', '--as-supervisor', '--json'], f2.env);
+  assert.equal(r2.code, 10); // adapter_error — bind_unverified
+  assert.match((r2.body.error as Record<string, unknown>).message as string, /not verifiably bound/);
+});
+
+test('manual supervise --advance never rebinds and never overwrites another supervisor identity', async () => {
+  const { runDir } = await recoveryRun({ supervisorHandle: 'term_other' });
+  const dir = tmp('manual');
+  const { env, log } = fakeOrca(dir, {}, 'term_manual');
+
+  const r = await cliJson(['supervise', '--run', runDir, '--advance', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal('binding' in r.body, false); // manual mode reports no binding
+  assert.equal(hasCall(log, 'orchestration run-current'), false);
+  assert.equal(hasCall(log, 'orchestration run-use'), false);
+  // The recorded supervisor was NOT displaced by the manual driver's handle.
+  assert.equal(readState(runDir).supervisor?.terminalHandle, 'term_other');
+});
+
+test('reconcile creates exactly one task under a confirmed no-effects refusal', async () => {
+  const f = await recoveryRun();
+  const dir = tmp('recon-create');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [
+        { ok: true, result: { tasks: [{ id: 'task_unrelated', spec: 'DIFFERENT SPEC entirely' }] } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new1' } } }],
+    },
+    'term_sup',
+  );
+
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.resolution, 'created');
+  assert.equal(r.body.taskId, 'task_new1');
+
+  const st = readState(f.runDir);
+  assert.equal(st.participants[0].attempts[0].taskId, 'task_new1');
+  assert.equal(st.participants[0].attempts[0].status, 'intent_recorded'); // guard still holds until launch
+
+  const tail = journalTail(f.runDir);
+  const created = tail.find((e) => e.type === 'task.created')!;
+  assert.equal(created.payload?.taskId, 'task_new1');
+  assert.equal(created.payload?.reconciled, 'created');
+  assert.equal(created.payload?.confirmedRequestId, f.requestId);
+
+  const create = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'orchestration task-create')!;
+  assert.ok(create.includes('--spec-file'));
+  assert.ok(create.some((a) => a.endsWith(f.attemptId + '.md')));
+  assert.equal(
+    orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create').length,
+    1,
+    'exactly one task-create',
+  );
+
+  // Recovery is exactly-once: the attempt now carries a taskId, so a second
+  // reconcile refuses without touching the host again.
+  const again = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(again.code, 4); // invalid_transition — already carries a task id
+  assert.equal(
+    orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create').length,
+    1,
+    'still exactly one task-create',
+  );
+});
+
+test('reconcile adopts the unique host task carrying this attempt spec', async () => {
+  const f = await recoveryRun();
+  const dir = tmp('recon-adopt');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [
+        {
+          ok: true,
+          result: {
+            tasks: [
+              { id: 'task_mine', title: 'council independent_review r0 rev-1', spec: f.specText },
+              { id: 'task_other', spec: 'some other spec' },
+            ],
+          },
+        },
+      ],
+    },
+    'term_sup',
+  );
+
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.resolution, 'adopted');
+  assert.equal(r.body.taskId, 'task_mine');
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, 'task_mine');
+  assert.equal(hasCall(log, 'orchestration task-create'), false); // adopted — never created
+});
+
+test('reconcile refuses ambiguous and mismatched evidence without touching the host', async () => {
+  // Two matching tasks → launch_unknown, no task-create.
+  const f = await recoveryRun();
+  const d1 = tmp('recon-ambig');
+  const f1 = fakeOrca(
+    d1,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [
+        { ok: true, result: { tasks: [{ id: 'task_a', spec: f.specText }, { id: 'task_b', spec: f.specText }] } },
+      ],
+    },
+    'term_sup',
+  );
+  const r1 = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    f1.env,
+  );
+  assert.equal(r1.code, 11); // launch_unknown
+  assert.equal(hasCall(f1.log, 'orchestration task-create'), false);
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null);
+
+  // Wrong confirmation id → config_invalid before any host read.
+  const f2x = await recoveryRun();
+  const d2 = tmp('recon-wrongid');
+  const f2 = fakeOrca(d2, {}, 'term_sup');
+  const r2 = await cliJson(
+    ['reconcile', '--run', f2x.runDir, '--attempt', f2x.attemptId, '--confirm-no-effects', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', '--as-supervisor', '--json'],
+    f2.env,
+  );
+  assert.equal(r2.code, 2); // config_invalid
+  assert.match((r2.body.error as Record<string, unknown>).message as string, new RegExp(f2x.requestId));
+  assert.equal(orcaCalls(f2.log).length, 0);
+
+  // Pending request → the mutation may still land; refuse.
+  const f3 = await recoveryRun();
+  const d3 = tmp('recon-pending');
+  const f3o = fakeOrca(
+    d3,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'pending' } }],
+    },
+    'term_sup',
+  );
+  const r3 = await cliJson(
+    ['reconcile', '--run', f3.runDir, '--attempt', f3.attemptId, '--confirm-no-effects', f3.requestId, '--as-supervisor', '--json'],
+    f3o.env,
+  );
+  assert.equal(r3.code, 11); // launch_unknown
+  assert.equal(hasCall(f3o.log, 'orchestration task-create'), false);
+  assert.equal(readState(f3.runDir).participants[0].attempts[0].taskId, null);
+});
+
+test('reconcile keeps the engine guard armed when the retried task-create also fails', async () => {
+  const f = await recoveryRun();
+  const dir = tmp('recon-refail');
+  const { env } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [{ ok: true, result: { tasks: [] } }],
+      'orchestration task-create': [
+        { ok: false, error: { code: 'refused', message: 'still not bound. Nothing changed. Orchestration mutation request ID: 11111111-2222-3333-4444-555555555555.' } },
+      ],
+    },
+    'term_sup',
+  );
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 10); // adapter_error
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null); // still null-task
+  const errs = journalTail(f.runDir, 2).filter((e) => e.type === 'error');
+  assert.equal(errs.length >= 1, true);
+  assert.equal(errs[errs.length - 1].payload?.op, 'task-create'); // failure journaled, guard stays armed
+});
+
+test('reconcile refuses non-null-task attempts and missing evidence', async () => {
+  // Attempt already carrying a task id → invalid_transition.
+  const f = await recoveryRun({ attemptExtras: { taskId: 'task_already' } });
+  const dir = tmp('recon-carried');
+  const { env } = fakeOrca(dir, {}, 'term_sup');
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--json'],
+    env,
+  );
+  assert.equal(r.code, 4); // invalid_transition
+
+  // Unknown attempt id → config_invalid.
+  const f2 = await recoveryRun();
+  const r2 = await cliJson(
+    ['reconcile', '--run', f2.runDir, '--attempt', 'att_nope', '--confirm-no-effects', f2.requestId, '--json'],
+    env,
+  );
+  assert.equal(r2.code, 2);
+});
+
+test('start-supervisor preserves an existing caller Run binding', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-bound');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_newsup' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_newsup' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.callerRun, 'run_caller');
+  assert.equal(r.body.taskId, 'task_sup');
+  // No run-use: the caller's binding is preserved, never overwritten.
+  assert.equal(hasCall(log, 'orchestration run-use'), false);
+  const ws = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start')!;
+  assert.ok(ws.includes('--task'));
+  assert.equal(hasCall(log, 'orchestration run-current'), true);
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_newsup');
+});
+
+test('start-supervisor with no bound Run uses worker-start --spec-file implicit Run', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-unbound');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: null } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_newsup2' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [
+        { ok: true, result: { dispatch: { id: 'ctx_newsup2' }, task: { id: 'task_implicit' } } },
+      ],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.callerRun, null);
+  // No pre-created task: task-create is skipped entirely.
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+  const ws = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start')!;
+  assert.ok(ws.includes('--spec-file'));
+  assert.ok(!ws.includes('--task') || ws.indexOf('--spec-file') < (ws.indexOf('--task') === -1 ? Infinity : ws.indexOf('--task')));
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_newsup2');
+});
+
+test('init quotes spaced supervisor command paths and refuses dangerous shell chars', async () => {
+  // A target path containing spaces: the generated supervisor advance command
+  // must quote that token — never emit a bare path that the agent could split.
+  const dir = tmp('quote');
+  const spacedTarget = path.join(dir, 'tar get dir');
+  writeTree(spacedTarget, { 'a.js': 'const a = 1;\n' });
+  const objective = path.join(dir, 'objective.md');
+  writeFileSync(objective, 'Quote me.\n');
+  // No COUNCIL_HOME: the run dir lands under the spaced target itself.
+  const env: NodeJS.ProcessEnv = { ...process.env, ORCA_CLI_COMMAND: NO_ORCA };
+  delete env.COUNCIL_HOME;
+  const ok = await cliJson(['init', '--objective', objective, '--target', spacedTarget, '--json'], env);
+  assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+  const cmd = ok.body.advanceCommand as string;
+  // The run dir lives under the spaced target → its token is double-quoted.
+  assert.match(cmd, /supervise --run "[^"]*" --advance --as-supervisor --json/);
+  // No unquoted bare-space run dir leaked into the command.
+  assert.doesNotMatch(cmd, /supervise --run \S+ \S+ --advance/);
+  const spec = readFileSync(path.join(ok.body.runDir as string, 'prompts', 'supervisor.md'), 'utf8');
+  assert.match(spec, /--advance --as-supervisor --json/);
+
+  // Shell-dangerous characters in the path (e.g. `$`, backtick, `!`) are
+  // refused outright — quoting them inside a fixed command would still
+  // interpolate under the agent's shell.
+  const dir2 = tmp('danger');
+  const evilTarget = path.join(dir2, 'tar$get');
+  writeTree(evilTarget, { 'a.js': 'const a = 1;\n' });
+  const objective2 = path.join(dir2, 'objective.md');
+  writeFileSync(objective2, 'Danger.\n');
+  const env2: NodeJS.ProcessEnv = { ...process.env, ORCA_CLI_COMMAND: NO_ORCA };
+  delete env2.COUNCIL_HOME;
+  const evil = await cliJson(['init', '--objective', objective2, '--target', evilTarget, '--json'], env2);
+  assert.equal(evil.code, 2); // config_invalid — cannot embed safely
+  assert.equal((evil.body.error as Record<string, unknown>).code, 'config_invalid');
+  assert.match((evil.body.error as Record<string, unknown>).message as string, /cannot be embedded safely/);
+});
+
+test('approve truncates an over-long note at the contract cap without failing', async () => {
+  const { runId, runDir, target, env } = await initRun({ perspectives: 10, participants: 2 });
+  const store = createStore({ runDir });
+  assert.ok((await store.writeProposedRoster(proposedRoster(runId, 10))).ok);
+  const rosterPath = path.join(target, 'roster.approved.json');
+  writeFileSync(rosterPath, JSON.stringify(approvedRoster(runId, 2)));
+  const locked = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    st.value.status = 'awaiting_approval';
+    return store.saveState(st.value);
+  });
+  assert.ok(locked.ok);
+
+  const longNote = 'n'.repeat(500); // far beyond the 128-char approver cap
+  const r = await cliJson(['approve', '--run', runDir, '--roster', rosterPath, '--note', longNote, '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const approval = JSON.parse(readFileSync(path.join(runDir, 'approval.json'), 'utf8')) as {
+    record: { approver: string };
+  };
+  // Contract cap is 128 chars; the base approver identity stays the prefix.
+  assert.ok(approval.record.approver.length <= 128);
+  assert.match(approval.record.approver, /^cli|^[^ ]+ — /);
 });
