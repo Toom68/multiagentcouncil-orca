@@ -221,3 +221,25 @@ Honest limits of this evidence:
 - The disposable fixture, its installed skill copies, and the initialized
   run remain under `.council-dev/` (ignored) as evidence; no real user
   install was performed.
+
+**Codex live-lane smoke (user-authorized, 2026-11-19).** On disposable
+fixture `.council-dev/live-codex-target/` a run `crun_01M7RFXHW0YCBKDK41NAVDYGZ5`
+was initialized with staff `devin+devin+codex` (supervisor `gpt-6.1-sol`,
+`bypass` → `--sandbox danger-full-access --ask-for-approval never`).
+`start-supervisor` launched `terminal create --command` with exactly that
+argv (`term_2a5a158f`, task `task_601ba09ed33f`, dispatch `ctx_230c57b14d8c`,
+Orca-observed `provider: codex`, TUI pinned `GPT-6.1-Sol`). The codex agent
+consumed the supervisor spec, ran the prescribed
+`supervise --advance --as-supervisor` verbatim, parsed the JSON action, and
+reported a protocol-correct `worker_done` (`msg_653c3c28177c`) when the run
+was found cancelled; `cancel` confirmed every live participant stopped.
+Codex lane verification is upgraded to `live-verified` for this scope:
+bring-up, model pin, spec intake, one advance, clean cancel — no full
+council seat run yet. `claude` remains help-verified.
+
+Found during the smoke and fixed in the same change: the
+`start-supervisor` success payload reported the legacy `SUPERVISOR_COMMAND`
+(`devin --model swe-2-max ...`) as `command` even on a codex lane — a
+cosmetic misreport (the persisted `supervisor/startup.json`, emitted argv,
+and host calls were always correct). The payload now echoes the recorded
+lane command; a test pins it.

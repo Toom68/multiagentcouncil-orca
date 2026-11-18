@@ -163,9 +163,10 @@ export const AGENT_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.free
       'read-only': Object.freeze(['--sandbox', 'read-only', '--ask-for-approval', 'never']),
       bypass: Object.freeze(['--sandbox', 'danger-full-access', '--ask-for-approval', 'never']),
     }),
-    verification: 'help-verified',
+    verification: 'live-verified',
     summary: 'Codex CLI — documented --model/--profile/--sandbox argv lane',
     notes: Object.freeze([
+      'Live-verified as a supervisor on a bounded run (launch, model pin, spec intake, one advance, clean cancel); no full council seat run yet.',
       'Posture maps to a fixed --sandbox + --ask-for-approval pair; there is no single permission flag.',
       'No verified effort selector — an effort request is refused explicitly, not ignored.',
       '--profile <name> is the documented named-profile selector; without it the ambient sign-in applies and is not asserted.',

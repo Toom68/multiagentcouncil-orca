@@ -1843,6 +1843,8 @@ test('start-supervisor uses the SELECTED staff supervisor lane exactly', async (
   assert.equal(rec.supervisor.choice.agent, 'claude');
   assert.equal(rec.execution.policyHash, LAUNCH_POLICY_HASH);
   assert.equal(rec.status, 'attached');
+  // The emitted payload reports the selected lane, never the legacy Devin pin.
+  assert.equal(r.body.command, 'claude --model sonnet-1 --permission-mode acceptEdits --effort high');
 });
 
 test('start-supervisor on a codex staff supervisor emits the multi-token posture + named profile', async () => {

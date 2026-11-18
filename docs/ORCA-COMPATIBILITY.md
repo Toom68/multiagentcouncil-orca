@@ -124,10 +124,12 @@ Verified facts:
 - `worker-start --model <m>` is honored for Claude/Codex-class agents but is
   **not** a reliable Devin selector — so the catalog's Devin lane emits the
   model on `terminal create --command` argv instead.
-- `claude --model/--effort/--permission-mode`, `codex
-  --model/--profile/--sandbox/--ask-for-approval`, and Devin
-  `--permission-mode` are **help-verified** on this host; only the Devin
-  `swe-2-max` lane has run a live council.
+- `claude --model/--effort/--permission-mode` and Devin
+  `--permission-mode` are **help-verified** on this host; `codex
+  --model/--profile/--sandbox/--ask-for-approval` is **live-verified** as a
+  bounded supervisor launch (bring-up, model pin, spec intake, one
+  `supervise --advance`, clean cancel) — no full council seat run yet. Only
+  the Devin `swe-2-max` lane has run a live council.
 
 The launch policy is the shipped catalog (`src/catalog.ts`,
 `resolveAgentLaunch`): each AgentChoice `{agent, model, permissionMode,
@@ -239,7 +241,8 @@ are evidence-only and are never retry-requested.
    original dispatch mailbox is **unverified** (testing risks deafening the
    caller's own mail). The adapter sidesteps this by never calling `check`.
 3. `terminal wait --for tui-idle` succeeded for the pinned Devin lane in the
-   live smoke. Other CLIs and readiness under load remain unverified; a
+   live smoke and once for the codex argv lane. Other CLIs and readiness
+   under load remain unverified; a
    failed wait is treated as `uncertain`.
 4. `--effort` values are enumerated in the shipped catalog only for Claude
    (`low|medium|high|max`, help-verified); other lanes refuse effort

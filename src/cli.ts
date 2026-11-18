@@ -2410,7 +2410,7 @@ async function startSupervisorUnderLock(
       taskId: rec2.taskId,
       terminalHandle: rec2.terminalHandle,
       dispatchId,
-      command: SUPERVISOR_COMMAND,
+      command: rec2.supervisor.command,
       callerRun: rec2.boundRunId,
       lane:
         rec2.lane === 'task-under-caller-run'
@@ -2425,7 +2425,7 @@ async function startSupervisorUnderLock(
     human: [
       `supervisor launched for ${state.runId}${fresh ? '' : ' (resumed recorded resources)'}`,
       `  task:     ${rec2.taskId ?? 'created implicitly by worker-start (id not in receipt)'}`,
-      `  terminal: ${rec2.terminalHandle} (${SUPERVISOR_COMMAND})`,
+      `  terminal: ${rec2.terminalHandle} (${rec2.supervisor.command})`,
       `  dispatch: ${dispatchId}`,
       `  caller Run: ${rec2.boundRunId ?? 'none — implicit Run created/joined by worker-start'}`,
     ].join('\n'),

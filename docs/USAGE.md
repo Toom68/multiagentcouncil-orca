@@ -23,8 +23,9 @@ and is covered by `test/cli.test.ts` / `test/acceptance.test.ts`.
 - Agent CLIs only for the lanes you actually select. The shipped launch
   catalog (`src/catalog.ts`, `council catalog --json`) documents `devin`,
   `claude`, and `codex` argv lanes with fixed permission/effort/profile
-  mappings; `devin` + `swe-2-max` is the only lane exercised live so far —
-  `claude` and `codex` are help-verified only. Paid `*-lightning` variants
+  mappings; `devin`/`swe-2-max` has run live councils and `codex` is
+  live-verified as a bounded supervisor launch — `claude` remains
+  help-verified only. Paid `*-lightning` variants
   and automatic model fallbacks are never selected, and an unavailable
   choice fails visibly — never a substitute.
 - No MCP server, no native Orca plugin, no global config or permission changes
@@ -463,9 +464,9 @@ outcome recovery.
   separately approved product posture, not a silent default.
 - Does not silently fall back to other or paid models; every seat's and
   staff role's agent/model/permission/effort/profile is an explicit,
-  approved, catalog-validated choice — and only `devin`/`swe-2-max` is
-  validated live. `claude` and `codex` lanes are help-verified; treat their
-  first real launches as unproven.
+  approved, catalog-validated choice — `devin`/`swe-2-max` has run live
+  councils and `codex` is live-verified as a bounded supervisor launch;
+  `claude` is help-verified — treat its first real launch as unproven.
 - Does not produce automatic fixes or rerun-diff reports in this release.
 
 ## Validation status — honest ledger
