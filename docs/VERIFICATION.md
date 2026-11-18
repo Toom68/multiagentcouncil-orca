@@ -8,17 +8,19 @@ a complete 15-seat lifecycle. These are different levels of evidence.
 
 On 2026-11-19, Windows Node 26.7.0:
 
-- `npm test`: clean TypeScript build and 282 passing tests, zero failures
+- `npm test`: clean TypeScript build and 285 passing tests, zero failures
   after the guarded-cleanup repair.
 - `npm run typecheck`: passed.
 - `node test/fixtures/review-target-check.mjs`: passed; all four deliberately
   seeded defects still reproduce and the hostile-document note remains.
   This confirms fixture integrity, not correctness of the fixture product.
-- Linux CI on Node 22/24 passed for
+- Linux CI on Node 22/24 passed for the final source repair,
+  [commit e431bda](https://github.com/Toom68/multiagentcouncil-orca/actions/runs/44399699955),
   [the evidence-format prompt repair, commit 0b2bbb7](https://github.com/Toom68/multiagentcouncil-orca/actions/runs/44397310228),
   and the earlier
   [reconciliation hardening, commit d2fe7e7](https://github.com/Toom68/multiagentcouncil-orca/actions/runs/44394430137).
-  Final cleanup-source CI is recorded after integration.
+- `doctor --json` reported `ready:true` for Node, Orca, live Orca status,
+  and Devin. Optional Claude/Codex binary detection does not validate those lanes.
 
 The tests cover approval refusal/invalidation, independent input separation,
 strict output schemas, claim provenance and dissent, citation rejection,
@@ -68,6 +70,9 @@ to its original build Run `run_9e0098940d02` after dedicated supervision.
 Reviewers reused their own settled sessions for discussion; the scribe used
 a distinct session. Canonical `claims.json`, `report.json`, `report.md`,
 `summary.md`, phase outputs, envelopes, and the 81-event journal were inspected.
+The store validated the journal's sequence/hash chain; approval is event 13
+and the first reviewer launch is event 22. The final report passed
+`parseReportFile`, with seven claims, `partial:true`, and one dissent entry.
 
 ## Result and limits
 

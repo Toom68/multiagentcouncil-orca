@@ -10,7 +10,7 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 | 3 | Implement durable council core and approval enforcement | Complete |
 | 4 | Implement Orca execution, agent messaging, organiser, and scribe | Complete: real reduced council finished every phase, with partial coverage explicitly reported |
 | 5 | Implement invocation surfaces, installation, and user documentation | Complete |
-| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: final guarded-cleanup edge-case review and CI for its integration; 282 tests pass and live evidence is recorded |
+| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Complete: 285 tests pass, final source CI is green on Node 22/24, and the completed partial live council is documented |
 
 ## Design assignments
 
@@ -26,4 +26,6 @@ The shared TypeScript interfaces, validation, storage/snapshots, protocol/claims
 
 After the Orca crash, the primary recovered the saved council through dedicated-supervisor rebinding and exact no-effect task reconciliation. Linux Node 22/24 CI passes after repairing a cross-platform independence-test assumption. Real Orca receipts drove fixes for mutation retry IDs, terminal flags, explicit settlement outcomes, and cleanup truthfulness.
 
-The reduced live council completed organiser, approval, independent reviews, peer challenge/response, and separate-scribe synthesis. Its report contains seven canonical claims covering all four fixture seeds and preserving dissent. Coverage is explicitly partial: one independent output failed strict schema admission, two invalid evidence snippets were excluded, and discussion bounds omitted assignments. The 15-seat lifecycle is covered by a deterministic fake-host test, not a live load test. See `docs/VERIFICATION.md` for concrete receipts, checks, and limits. Final cleanup-source integration and CI remain before stage 6 closes.
+The reduced live council completed organiser, approval, independent reviews, peer challenge/response, and separate-scribe synthesis. Its report contains seven canonical claims covering all four fixture seeds and preserving dissent. Coverage is explicitly partial: one independent output failed strict schema admission, two invalid evidence snippets were excluded, and discussion bounds omitted assignments. The 15-seat lifecycle is covered by a deterministic fake-host test, not a live load test. See `docs/VERIFICATION.md` for concrete receipts, checks, and limits.
+
+Final integration requires unambiguous host proof before confirming stop, release, or retention. The exact live retained-session receipt and conflicting/unknown receipt cases have regression coverage. Source commit `e431bda` passes all 285 tests and Linux Node 22/24 CI. Final checks validated the live report schema, the complete 81-event journal chain, unchanged source snapshot and approval hash, and preserved primary Run binding. All first-release stages are complete; live scale and future host integrations remain explicitly outside the validated scope.
