@@ -1,0 +1,26 @@
+{
+  "name": "multiagent-council",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A council of independent reviewers that challenges a project and returns an evidence-backed report to its primary orchestrator.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "council": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

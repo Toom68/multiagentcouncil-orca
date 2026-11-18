@@ -1,0 +1,1013 @@
+/**
+ * Shared contracts for Multiagent Council.
+ *
+ * Single source of truth for every module boundary: config, roster, approval,
+ * snapshot, findings, challenges, responses, scribe output, claim ledger,
+ * participants/attempts, state, journal, report, and the HostAdapter / Store /
+ * Engine / PromptBuilder callable surfaces.
+ *
+ * Everything here must be JSON-serializable (no functions on data types).
+ * Parse untrusted input only through src/validation.ts parsers.
+ */
+
+// ─── Result and structured errors ────────────────────────────────────────────
+
+export interface ValidationIssue {
+  /** JSON-pointer-ish path of the offending field, e.g. "seats[2].agent.model". */
+  path: string;
+  /** Stable machine-readable reason, e.g. "too_long", "bad_enum", "unsafe_path". */
+  code: string;
+  message: string;
+}
+
+/** Parse result for untrusted (worker- or user-produced) JSON. */
+export type ParseResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; issues: ValidationIssue[] };
+
+export type CouncilErrorCode =
+  | 'schema_invalid'
+  | 'config_invalid'
+  | 'roster_invalid'
+  | 'approval_required'
+  | 'approval_stale'
+  | 'invalid_transition'
+  | 'barrier_refused'
+  | 'budget_exceeded'
+  | 'deadline_exceeded'
+  | 'untrusted_output'
+  | 'snapshot_drift'
+  | 'adapter_error'
+  | 'launch_unknown'
+  | 'io_error'
+  | 'cancelled'
+  | 'unsupported';
+
+export interface CouncilError {
+  code: CouncilErrorCode;
+  message: string;
+  /** Optional field-level issues when code is a validation failure. */
+  issues?: ValidationIssue[];
+  /** Extra machine-readable context (ids, paths, counts). */
+  details?: Record<string, unknown>;
+}
+
+/** Async/operation result for host, store and engine calls. */
+export type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: CouncilError };
+
+// ─── Identifiers ─────────────────────────────────────────────────────────────
+
+export type CouncilRunId = string; // "crun_<ulid>"
+export type OrcaRunId = string; // orca orchestration run id
+export type TaskId = string;
+export type DispatchId = string;
+export type TerminalHandle = string; // "term_…"
+export type MessageId = string;
+export type PerspectiveId = string;
+export type ParticipantId = string;
+export type SeatId = string;
+export type FindingId = string;
+export type ClaimId = string;
+export type ChallengeId = string;
+export type AttemptId = string;
+export type SnapshotId = string;
+export type ApprovalId = string;
+
+export const SCHEMA_VERSION = 1 as const;
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+/**
+ * Council configuration. This is the *resolved* shape (all defaults applied);
+ * validation.ts resolves a raw partial object into this.
+ *
+ * Approved defaults: requestedPerspectives 15, participants 15, concurrency 5,
+ * rounds 1 (max 3), maxFindingsPerSeat 7, maxChallengesPerSeatPerRound 3,
+ * envelopeBytes 8192, quorumRatio 0.67, maxLaunches 56 (= minViableLaunches
+ * for the default 15 seats/1 round, 48, plus 8 retry slack).
+ */
+export interface CouncilConfig {
+  schemaVersion: typeof SCHEMA_VERSION;
+  /** Number of perspectives the organiser must propose. Range 10–25. */
+  requestedPerspectives: number;
+  /** Number of reviewer seats selected from the proposal. 1..requestedPerspectives. */
+  participants: number;
+  /** Max workers live at once. */
+  concurrency: number;
+  /** Bounded discussion rounds (challenge+response cycles). Range 1–3. */
+  rounds: number;
+  /** Fraction of seats that must settle for a phase to close with partial coverage. (0,1]. */
+  quorumRatio: number;
+  /**
+   * Hard cap on total worker launches for the whole run. Charged per fresh
+   * orchestration Task — a full default workflow is organiser(1) +
+   * independent(participants) + scribeNotes(1) + challenges +
+   * authorResponses (participants each per round) + scribeSynthesis(1), i.e.
+   * participants + 2*participants*rounds + 3 launches before retries.
+   * resolveConfig defaults this to that minimum plus slack and refuses an
+   * explicit value below the minimum (see minViableLaunches).
+   */
+  maxLaunches: number;
+  /** Max findings a reviewer may emit. */
+  maxFindingsPerSeat: number;
+  /** Max challenges a reviewer may be assigned / emit per round. */
+  maxChallengesPerSeatPerRound: number;
+  /** Max author responses per seat per round. */
+  maxResponsesPerSeatPerRound: number;
+  /** Byte cap for a single per-recipient work envelope. */
+  envelopeBytes: number;
+  /** Max runner-originated mails per participant. */
+  maxMailPerParticipant: number;
+  /** Max chars for any single free-text field in worker output. */
+  maxTextChars: number;
+  /** Per-phase wall-clock deadlines (ms). Checked on advance, not in real time. */
+  deadlines: PhaseDeadlines;
+}
+
+export interface PhaseDeadlines {
+  organiserMs: number;
+  independentMs: number;
+  scribeNotesMs: number;
+  /** Per round-stage deadline inside discussion. */
+  challengeMs: number;
+  responseMs: number;
+  synthesisMs: number;
+  /** Whole-run cap from launch to report. */
+  runMs: number;
+  /** Extra grace after a soft deadline before the hard rule applies. */
+  graceMs: number;
+}
+
+/**
+ * Explicit agent/model/permission selection for one seat. Every field is
+ * approval-bound. `permissionMode` is a token the host adapter validates
+ * (e.g. "bypass"); the product never picks a paid model or a looser
+ * permission posture silently.
+ */
+export interface AgentChoice {
+  /** Orca agent id, e.g. "devin", "claude", "codex". Token charset only. */
+  agent: string;
+  /** Explicit provider/CLI model id, e.g. "swe-2-max". No fallback allowed. */
+  model: string;
+  /** Optional reasoning-effort token for agents that support it. */
+  effort?: string;
+  /** Approved permission posture token, e.g. "bypass". */
+  permissionMode: string;
+}
+
+// ─── Perspectives and roster ─────────────────────────────────────────────────
+
+export interface Perspective {
+  perspectiveId: PerspectiveId;
+  name: string;
+  /** Structural diversity: incentives/expertise/method/blind spots, not adjectives. */
+  charter: {
+    incentives: string;
+    expertise: string;
+    method: string;
+    blindSpots: string;
+    reviewQuestions: string[];
+  };
+  tags: string[];
+}
+
+/** roster.proposed.json — organiser output. */
+export interface ProposedRoster {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  /** Exactly config.requestedPerspectives entries (validated 10–25), unique ids. */
+  perspectives: Perspective[];
+  /** Dispatch/attempt that produced this, for provenance. */
+  producedBy?: { participantId: ParticipantId; dispatchId?: DispatchId };
+}
+
+/** One approved seat: one perspective, one explicit agent choice. */
+export interface SeatAssignment {
+  seatId: SeatId;
+  perspectiveId: PerspectiveId; // must exist in the proposed roster
+  participantId: ParticipantId; // stable worker identity for the seat
+  agent: AgentChoice;
+}
+
+/** roster.approved.json — the primary orchestrator's selection. */
+export interface ApprovedRoster {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  /** Exactly config.participants seats; unique seat and perspective ids. */
+  seats: SeatAssignment[];
+}
+
+// ─── Source snapshot ─────────────────────────────────────────────────────────
+
+/** snapshot.json — pins the reviewed tree so citations and drift are checkable. */
+export interface SourceSnapshot {
+  schemaVersion: typeof SCHEMA_VERSION;
+  snapshotId: SnapshotId;
+  targetRoot: string;
+  /** Git HEAD at snapshot time, null when the target is not a git checkout. */
+  gitHead: string | null;
+  takenAt: string; // ISO-8601
+  /** sha256 over the sorted "path:sha256" lines — the approval/drift key. */
+  headHash: string;
+  /** path (posix, relative to targetRoot) → content hash. */
+  files: Record<string, { sha256: string; size: number }>;
+}
+
+export interface SnapshotDrift {
+  drift: boolean;
+  changed: string[]; // paths that differ from the snapshot (added/removed/modified)
+}
+
+// ─── Approval ────────────────────────────────────────────────────────────────
+
+/**
+ * The canonical payload that is SHA-256 hashed into approval.hash. Any change
+ * to a member invalidates the approval. This is a workflow gate/drift check,
+ * not a defense against a hostile local process.
+ */
+export interface ApprovalBinding {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  objective: string;
+  seats: SeatAssignment[];
+  /**
+   * Canonical sha256 of the entire ProposedRoster (see canonicalRosterHash).
+   * Binds the approved charters — mandates, methods, blind spots, questions —
+   * and the proposal itself: editing either invalidates the approval.
+   */
+  proposedRosterHash: string;
+  config: CouncilConfig;
+  snapshotId: SnapshotId;
+  snapshotHeadHash: string;
+}
+
+/** approval.json — persisted approval record. */
+export interface ApprovalRecord {
+  schemaVersion: typeof SCHEMA_VERSION;
+  approvalId: ApprovalId;
+  /** sha256 hex of canonicalJSON(ApprovalBinding). */
+  hash: string;
+  /** Who approved (e.g. "primary-orchestrator", a terminal handle, or user label). */
+  approver: string;
+  createdAt: string; // ISO-8601
+}
+
+// ─── Findings and evidence (worker outputs) ──────────────────────────────────
+
+export type EvidenceKind =
+  | 'code_location'
+  | 'repro'
+  | 'scenario'
+  | 'reasoned'
+  | 'speculative';
+
+export interface Evidence {
+  kind: EvidenceKind;
+  /** Short explanation of what the evidence shows. */
+  note: string;
+  /** Safe relative path inside the target (required for code_location). */
+  path?: string;
+  /** 1-based inclusive line range (code_location requires startLine). */
+  startLine?: number;
+  endLine?: number;
+  /** Optional quoted snippet, bounded length. */
+  snippet?: string;
+  /** kind "repro": captured reproduction steps and observed result. */
+  steps?: string;
+  observed?: string;
+}
+
+export type FindingKind = 'defect' | 'risk' | 'suggestion' | 'question';
+export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+/** Canonical evidence grade — computed by claim validation, never trusted from a reviewer. */
+export type EvidenceGrade =
+  | 'verified_defect'
+  | 'plausible_risk'
+  | 'speculative'
+  | 'unsupported';
+
+export interface Finding {
+  findingId: FindingId;
+  title: string;
+  kind: FindingKind;
+  severity: Severity;
+  /** 0..1 reviewer self-assessed confidence. */
+  confidence: number;
+  /**
+   * Reviewer-asserted grade. UNTRUSTED INPUT: downstream claim validation
+   * must re-derive `Claim.grade` via maxClaimGrade(); an asserted
+   * "verified_defect" alone must never surface as an independently verified defect.
+   */
+  assertedGrade?: EvidenceGrade;
+  evidence: Evidence[];
+  counterEvidence?: Evidence[];
+  remedies?: string[];
+  openQuestions?: string[];
+}
+
+/** findings/<participantId>.json — independent-phase reviewer output. */
+export interface FindingsFile {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  participantId: ParticipantId;
+  perspectiveId: PerspectiveId;
+  findings: Finding[]; // <= config.maxFindingsPerSeat
+  notes?: string;
+}
+
+// ─── Discussion: typed challenges and author responses ───────────────────────
+
+/** Phase a worker attempt belongs to. */
+export type PhaseKind =
+  | 'organiser'
+  | 'independent_review'
+  | 'scribe_notes'
+  | 'challenge'
+  | 'author_response'
+  | 'scribe_synthesis';
+
+export type ChallengeKind =
+  | 'missing_evidence'
+  | 'counterexample'
+  | 'overstated'
+  | 'duplicate'
+  | 'scope'
+  | 'other';
+
+/** A challenge written by a reviewer about exactly one claim. */
+export interface Challenge {
+  challengeId: ChallengeId;
+  claimId: ClaimId;
+  kind: ChallengeKind;
+  argument: string;
+  evidence: Evidence[];
+}
+
+/** rounds/<n>/challenges/<participantId>.json — challenger output. */
+export interface ChallengesFile {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  round: number;
+  participantId: ParticipantId;
+  challenges: Challenge[]; // <= config.maxChallengesPerSeatPerRound
+}
+
+export type ResponseDisposition = 'defend' | 'revise' | 'withdraw' | 'escalate';
+
+/** The finding author's response to one admitted challenge. */
+export interface AuthorResponse {
+  claimId: ClaimId;
+  challengeId: ChallengeId;
+  disposition: ResponseDisposition;
+  argument: string;
+  evidence: Evidence[];
+  /** Required when disposition === "revise": the amended finding. */
+  revisedFinding?: Finding;
+}
+
+/** rounds/<n>/responses/<participantId>.json — author output. */
+export interface ResponsesFile {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  round: number;
+  participantId: ParticipantId;
+  responses: AuthorResponse[]; // <= config.maxResponsesPerSeatPerRound
+}
+
+// ─── Work envelopes (single-recipient worker inputs) ────────────────────────
+
+/**
+ * The only channel by which a reviewer ever sees peer output: an envelope
+ * built by the runner for exactly one recipient, carrying only the assigned
+ * items — never the transcript, never other reviewers' envelopes.
+ */
+export interface WorkEnvelope<TAssignment> {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  phase: PhaseKind;
+  round: number | null;
+  recipientId: ParticipantId;
+  /** Bounded by the matching config cap. */
+  assignments: TAssignment[];
+  /** Exact file the worker must write (safe relative path inside the run dir). */
+  outputPath: string;
+  /** Name of the file contract to write: "ChallengesFile" | "ResponsesFile" | "FindingsFile" | "ScribeNotesFile" | "ReportFile". */
+  outputContract: string;
+  /** Total serialized size must be <= config.envelopeBytes at dispatch. */
+}
+
+/** One challenge assignment: challenge this claim, from this question. */
+export interface ChallengeAssignment {
+  assignmentId: string;
+  claimId: ClaimId;
+  /** Sanitized claim projection — no ledger, no other claims, no transcript. */
+  claim: ClaimView;
+  question: string;
+}
+
+/** One author-response assignment: answer these admitted challenges to your claim. */
+export interface ResponseAssignment {
+  claimId: ClaimId;
+  findingId: FindingId;
+  claim: ClaimView;
+  challenges: Challenge[];
+}
+
+export type ChallengeEnvelope = WorkEnvelope<ChallengeAssignment>;
+export type ResponseEnvelope = WorkEnvelope<ResponseAssignment>;
+
+// ─── Canonical claim ledger ──────────────────────────────────────────────────
+
+/** Canonical claim process status (methodology-frozen enum). */
+export type ClaimStatus =
+  | 'proposed'
+  | 'challenged'
+  | 'defended'
+  | 'revised'
+  | 'escalated'
+  | 'confirmed'
+  | 'resolved'
+  | 'withdrawn';
+
+/** What a challenge envelope exposes about a claim — no history, no transcript. */
+export interface ClaimView {
+  claimId: ClaimId;
+  title: string;
+  kind: FindingKind;
+  severity: Severity;
+  evidence: Evidence[];
+  counterEvidence: Evidence[];
+}
+
+export interface ClaimEvent {
+  ts: string; // ISO-8601
+  round: number | null;
+  actor: ParticipantId | 'runner' | 'scribe';
+  type:
+    | 'admitted'
+    | 'challenged'
+    | 'defended'
+    | 'revised'
+    | 'withdrawn'
+    | 'escalated'
+    | 'confirmed'
+    | 'resolved'
+    | 'regraded'
+    | 'merged';
+  detail?: string;
+  refId?: string; // challengeId / responseId / merged claimId
+}
+
+/** A minority position preserved against the ledger's current disposition. */
+export interface DissentRecord {
+  participantId: ParticipantId;
+  round: number | null;
+  position: string; // bounded text
+  ts: string;
+}
+
+export interface Claim {
+  claimId: ClaimId;
+  title: string;
+  kind: FindingKind;
+  /** Derived grade — see maxClaimGrade; never taken from a reviewer assertion. */
+  grade: EvidenceGrade;
+  status: ClaimStatus;
+  severity: Severity;
+  confidence: number;
+  evidence: Evidence[];
+  counterEvidence: Evidence[];
+  /** Provenance: every reviewer finding merged into this claim. */
+  sourceFindings: { participantId: ParticipantId; findingId: FindingId }[];
+  history: ClaimEvent[];
+  dissent: DissentRecord[];
+}
+
+/** claims.json — the ledger artifact. */
+export interface ClaimLedger {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  claims: Claim[];
+  /** claimId → participantIds who authored a source finding (dedupe key support). */
+  provenance: Record<ClaimId, ParticipantId[]>;
+}
+
+// ─── Scribe artifacts ────────────────────────────────────────────────────────
+
+/** scribe-notes.json — initial scribe pass over admitted independent findings. */
+export interface ScribeNotesFile {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  participantId: ParticipantId;
+  claimSummaries: {
+    claimId: ClaimId;
+    summary: string;
+    possibleDuplicates: ClaimId[];
+    openQuestions: string[];
+  }[];
+  observations?: string;
+}
+
+// ─── Final report ────────────────────────────────────────────────────────────
+
+export interface SeatOutcome {
+  participantId: ParticipantId;
+  perspectiveId: PerspectiveId;
+  seatId: SeatId;
+  outcome: 'completed' | 'partial' | 'failed' | 'timed_out' | 'not_launched';
+  phasesCompleted: PhaseKind[];
+  detail?: string;
+}
+
+export interface ReportCoverage {
+  requestedPerspectives: number;
+  proposedPerspectives: number;
+  selectedSeats: number;
+  seats: SeatOutcome[];
+  /** Proposed perspectives that received no completed review. */
+  uncoveredPerspectiveIds: PerspectiveId[];
+  /** True when any selected seat did not complete — must be visibly marked. */
+  partial: boolean;
+}
+
+/** report.json — scribe synthesis validated by the runner. */
+export interface CouncilReport {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  generatedAt: string;
+  summary: string;
+  coverage: ReportCoverage;
+  claims: Claim[];
+  limitations: string[];
+  /**
+   * A wholly failed review must not produce a successful signal: engine emits
+   * no report.json at all on hard failure; any report with coverage.partial
+   * is visibly partial.
+   */
+}
+
+// ─── Participants, attempts, state ───────────────────────────────────────────
+
+export type AttemptStatus =
+  | 'planned'
+  | 'intent_recorded' // launch intent persisted before mutation
+  | 'dispatched'
+  | 'working'
+  | 'settled_ok'
+  | 'settled_failed'
+  | 'unknown' // launch/observation outcome uncertain — reconcile, never relaunch
+  | 'timed_out'
+  | 'stopped';
+
+/** One supervised worker attempt for one (participant, phase, round). */
+export interface PhaseAttempt {
+  attemptId: AttemptId;
+  participantId: ParticipantId;
+  phase: PhaseKind;
+  /** Discussion round for challenge/author_response, else null. */
+  round: number | null;
+  /** Fresh orchestration Task for EVERY phase, even on a retained session. */
+  taskId: TaskId | null;
+  dispatchId: DispatchId | null;
+  terminalHandle: TerminalHandle | null;
+  /** Persisted intent id + host request id for uncertain-outcome recovery. */
+  launchIntentId: string;
+  requestId?: string;
+  status: AttemptStatus;
+  createdAt: string;
+  settledAt?: string;
+  /** Artifact paths the attempt produced (validated before admission). */
+  artifacts: string[];
+}
+
+export type ParticipantStatus =
+  | 'planned'
+  | 'active'
+  | 'settled'
+  | 'failed'
+  | 'timed_out'
+  | 'stopped';
+
+export type ParticipantRole = 'organiser' | 'reviewer' | 'scribe';
+
+export interface Participant {
+  participantId: ParticipantId;
+  role: ParticipantRole;
+  /** Reviewer seats bind a perspective; organiser/scribe use fixed role ids. */
+  seatId: SeatId | null;
+  perspectiveId: PerspectiveId | null;
+  agent: AgentChoice;
+  /**
+   * Terminal kept open across phases so a later phase launches a FRESH Task on
+   * the same agent session (documented retained-session reuse). Null until the
+   * first launch with retainTerminal.
+   */
+  retainedTerminal: TerminalHandle | null;
+  attempts: PhaseAttempt[];
+  status: ParticipantStatus;
+}
+
+export type DiscussionStage = 'challenges' | 'responses';
+
+export interface DiscussionCursor {
+  round: number; // 1..config.rounds
+  stage: DiscussionStage;
+}
+
+/** Run lifecycle status. Engine owns all transitions; illegal ones are refused. */
+export type RunStatus =
+  | 'initialized'
+  | 'organising'
+  | 'awaiting_approval'
+  | 'independent_review'
+  | 'scribe_notes'
+  | 'discussing'
+  | 'synthesising'
+  | 'reported'
+  | 'failed'
+  | 'cancelled';
+
+/** state.json — durable run state. */
+export interface CouncilState {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  orcaRunId: OrcaRunId | null;
+  status: RunStatus;
+  targetRoot: string;
+  objective: string;
+  config: CouncilConfig;
+  snapshotId: SnapshotId | null;
+  approvalHash: string | null;
+  participants: Participant[];
+  discussion: DiscussionCursor | null;
+  /**
+   * The council supervisor worker's durable identity, so an external
+   * `council approve` (run by the primary orchestrator) can send it an exact
+   * wake notification — writing approval files alone does not wake the agent.
+   */
+  supervisor: {
+    terminalHandle: TerminalHandle;
+    dispatchId: DispatchId | null;
+  } | null;
+  consumption: {
+    launches: number;
+    mailSent: number;
+  };
+  phaseEnteredAt: string; // ISO-8601 — deadline checks are evaluated on advance
+  createdAt: string;
+}
+
+// ─── Journal ─────────────────────────────────────────────────────────────────
+
+export type JournalEventType =
+  | 'run.initialized'
+  | 'phase.entered'
+  | 'barrier.refused'
+  | 'task.created'
+  | 'launch.intent'
+  | 'worker.started'
+  | 'worker.settled'
+  | 'worker.unknown'
+  | 'worker.timed_out'
+  | 'worker.stop_requested'
+  | 'worker.stopped'
+  | 'worker.released'
+  | 'mail.sent'
+  | 'mail.observed'
+  | 'roster.proposed'
+  | 'approval.granted'
+  | 'approval.invalidated'
+  | 'artifact.written'
+  | 'artifact.admitted'
+  | 'artifact.rejected'
+  | 'envelope.built'
+  | 'deadline.hit'
+  | 'snapshot.drift'
+  | 'claim.updated'
+  | 'report.written'
+  | 'error'
+  | 'run.finished';
+
+export interface JournalEvent {
+  seq: number;
+  ts: string; // ISO-8601
+  type: JournalEventType;
+  actor: string; // participantId | 'engine' | 'orchestrator' | 'store'
+  phase?: PhaseKind;
+  round?: number;
+  participantId?: ParticipantId;
+  payload?: Record<string, unknown>;
+  /** sha256 of the previous event's canonical form — cheap tamper evidence. */
+  prevHash?: string;
+}
+
+// ─── HostAdapter (implemented by src/host/orca.ts) ──────────────────────────
+
+/**
+ * Boundary to the host execution environment (Orca on v1). Implementations use
+ * documented CLI commands only and must NEVER run a consuming `check`/`--ack` —
+ * the caller agent owns its own mail. Observation is by worker records and
+ * bounded `inbox`/artifact reads.
+ *
+ * Every mutation returns durable ids and honest outcomes: an uncertain result
+ * is `outcome: "unknown"` with the retained request/operation id, never a
+ * silent duplicate launch.
+ */
+export interface WorkerLaunchSpec {
+  participantId: ParticipantId;
+  phase: PhaseKind;
+  round: number | null;
+  /** Council child Run the worker is launched under — explicit, never inferred
+   *  from the caller's current binding (which may be lost on resume). */
+  runId: OrcaRunId;
+  /** orchestration Task id this attempt launches under (fresh per phase). */
+  taskId: TaskId;
+  /** Absolute path to the generated spec file for --spec-file. */
+  specFilePath: string;
+  taskTitle: string;
+  worktree: string; // selector, e.g. "current"
+  agent: AgentChoice;
+  /** Keep the terminal open so later phases reuse the session (fresh Task each). */
+  retainTerminal: boolean;
+  /** Reuse this retained terminal for the new Task instead of a new agent launch. */
+  reuseTerminal?: TerminalHandle;
+}
+
+export type LaunchOutcome = 'started' | 'failed' | 'unknown';
+
+export interface LaunchResult {
+  outcome: LaunchOutcome;
+  taskId?: TaskId;
+  dispatchId?: DispatchId;
+  terminalHandle?: TerminalHandle;
+  /** Retry-request / operation id retained for uncertain-outcome recovery. */
+  requestId?: string;
+  detail?: string;
+}
+
+export type WorkerLiveness =
+  | 'working'
+  | 'waiting_human' // parked on a prompt only a human can answer — healthy, not failed
+  | 'idle'
+  | 'finished'
+  | 'unverifiable';
+
+export interface WorkerObservation {
+  dispatchId: DispatchId;
+  taskStatus?: string;
+  terminalState?:
+    | 'active'
+    | 'reclaimable'
+    | 'retained'
+    | 'release_pending'
+    | 'release_unknown'
+    | 'released';
+  liveness: WorkerLiveness;
+  detail?: string;
+}
+
+export type StopOutcome = 'stopped' | 'unknown' | 'refused';
+
+export interface HostAdapter {
+  /** Create and bind the council child Run under the caller's identity. */
+  createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId }>>;
+  /** Create one orchestration Task in the council Run (fresh Task per phase). */
+  createTask(input: {
+    runId: OrcaRunId;
+    specFilePath: string;
+    title: string;
+    deps?: TaskId[];
+  }): Promise<Result<{ taskId: TaskId }>>;
+  /** Start one supervised worker attempt. See WorkerLaunchSpec docs. */
+  launchWorker(input: WorkerLaunchSpec): Promise<Result<LaunchResult>>;
+  /** Observe one dispatch without consuming mail. */
+  observeWorker(input: { dispatchId: DispatchId }): Promise<Result<WorkerObservation>>;
+  /** Send one bounded notification (doorbell only — content lives in artifacts). */
+  sendNotification(input: {
+    to: string; // "dispatch:<id>" | "run:<id>" | explicit handle
+    subject: string;
+    body: string;
+    taskId?: TaskId;
+    dispatchId?: DispatchId;
+  }): Promise<Result<{ outcome: 'sent' | 'unknown'; requestId?: string; messageId?: MessageId }>>;
+  /** Guarded stop — only for explicit cancellation per the recovery reference. */
+  requestStop(input: { dispatchId: DispatchId; reason: string }): Promise<Result<{ outcome: StopOutcome }>>;
+  /** Release a settled/reclaimable worker terminal (e.g. end of retained session). */
+  releaseWorker(input: { dispatchId: DispatchId }): Promise<Result<{ released: boolean }>>;
+}
+
+// ─── Store (implemented by src/store.ts, backed by src/snapshot.ts) ─────────
+
+/** Options for openRun/createRun — the run directory is the unit of durability. */
+export interface StoreOpenOptions {
+  /** Directory holding the run (…/.council/runs/<crun_id>). */
+  runDir: string;
+}
+
+/**
+ * Durable artifact + state store for one council run. All writes are atomic;
+ * journal is append-only; mutations go through withLock. Errors are
+ * machine-readable Result values, not throws.
+ */
+export interface Store {
+  readonly runDir: string;
+
+  /** Create the run directory with council.json, state.json, empty journal. */
+  initialize(input: {
+    runId: CouncilRunId;
+    targetRoot: string;
+    objective: string;
+    config: CouncilConfig;
+    snapshot: SourceSnapshot;
+  }): Promise<Result<void>>;
+
+  loadState(): Promise<Result<CouncilState>>;
+  saveState(state: CouncilState): Promise<Result<void>>;
+
+  /** Serialize a state mutation against other advance calls. */
+  withLock<T>(fn: () => Promise<Result<T>>): Promise<Result<T>>;
+
+  /** Atomic artifact IO. Paths are safe-relative inside the run dir. */
+  writeArtifact(relPath: string, data: string | Uint8Array): Promise<Result<void>>;
+  readArtifact(relPath: string): Promise<Result<string>>;
+  artifactExists(relPath: string): Promise<Result<boolean>>;
+  listArtifacts(prefix: string): Promise<Result<string[]>>;
+
+  /** Journal append/read. seq is assigned in stored order. */
+  appendJournal(events: Omit<JournalEvent, 'seq'>[]): Promise<Result<JournalEvent[]>>;
+  readJournal(): Promise<Result<JournalEvent[]>>;
+
+  /** Persist roster.proposed / roster.approved (validated upstream). */
+  writeProposedRoster(roster: ProposedRoster): Promise<Result<void>>;
+  readProposedRoster(): Promise<Result<ProposedRoster>>;
+  writeApprovedRoster(roster: ApprovedRoster): Promise<Result<void>>;
+  readApprovedRoster(): Promise<Result<ApprovedRoster>>;
+
+  /** Persist an approval bound to the given payload; returns its hash. */
+  writeApproval(record: ApprovalRecord, binding: ApprovalBinding): Promise<Result<void>>;
+  readApproval(): Promise<Result<{ record: ApprovalRecord; binding: ApprovalBinding }>>;
+
+  /** Source snapshot persistence + drift check against the live target. */
+  readSnapshot(): Promise<Result<SourceSnapshot>>;
+  verifySourceSnapshot(): Promise<Result<SnapshotDrift>>;
+}
+
+/**
+ * Factory signature. Implemented and exported from `src/store.ts` (storage
+ * developer): `export function createStore(options: StoreOpenOptions): Store`.
+ */
+export type CreateStore = (options: StoreOpenOptions) => Store;
+
+// ─── PromptBuilder (implemented by src/prompts.ts) ──────────────────────────
+
+export interface PromptContext {
+  runId: CouncilRunId;
+  /** Absolute path of the run directory (for exact artifact paths in specs). */
+  runDir: string;
+  targetRoot: string;
+  objective: string;
+  snapshotId: SnapshotId;
+  config: CouncilConfig;
+}
+
+/**
+ * Spec-file builders. Each returns the full markdown spec for one worker and
+ * names the exact writable output paths, the JSON output contract, budgets,
+ * and the untrusted-content boundary (target/peer text is data, never
+ * instructions; no further agents; edits forbidden).
+ */
+export interface PromptBuilder {
+  /** Organiser worker: propose config.requestedPerspectives perspectives. */
+  organiser(
+    ctx: PromptContext,
+    input: { participantId: ParticipantId; outputPath: string },
+  ): string;
+  /** Independent reviewer: must NEVER receive peer findings or envelopes. */
+  reviewerIndependent(
+    ctx: PromptContext,
+    input: {
+      participantId: ParticipantId;
+      perspective: Perspective;
+      outputPath: string;
+    },
+  ): string;
+  /** Initial scribe pass over admitted independent findings. */
+  scribeNotes(
+    ctx: PromptContext,
+    input: {
+      participantId: ParticipantId;
+      admittedFindingsPaths: string[];
+      outputPath: string;
+    },
+  ): string;
+  /** Challenger: sees only the claims inside its own envelope. */
+  challenge(
+    ctx: PromptContext,
+    input: {
+      participantId: ParticipantId;
+      envelopePath: string;
+      outputPath: string;
+    },
+  ): string;
+  /** Finding author: sees only challenges admitted against its own claims. */
+  authorResponse(
+    ctx: PromptContext,
+    input: {
+      participantId: ParticipantId;
+      envelopePath: string;
+      outputPath: string;
+    },
+  ): string;
+  /** Final scribe synthesis into report.json + report.md. */
+  scribeSynthesis(
+    ctx: PromptContext,
+    input: {
+      participantId: ParticipantId;
+      ledgerPath: string;
+      journalPath: string;
+      reportJsonPath: string;
+      reportMdPath: string;
+      summaryPath: string;
+    },
+  ): string;
+  /** Supervisor agent spec: drive `council supervise --advance`, end turn on wait. */
+  supervisor(ctx: PromptContext, input: { advanceCommand: string }): string;
+}
+
+/**
+ * Factory signature. Implemented and exported from `src/prompts.ts` (prompt
+ * developer): `export function createPromptBuilder(): PromptBuilder`.
+ */
+export type CreatePromptBuilder = () => PromptBuilder;
+
+// ─── Engine (implemented by src/engine.ts) ──────────────────────────────────
+
+/**
+ * Machine-readable result of one advance step — the supervisor prints this.
+ *
+ * `progress` means the step completed internal work and there may be more to
+ * do without any external event: the caller MAY invoke advance() again in the
+ * same turn (bounded — e.g. cap consecutive progress calls and stop on the
+ * first non-progress action). A caller that only advances once per wake can
+ * deadlock purely internal transitions.
+ */
+export interface AdvanceResult {
+  action: 'wait' | 'needs_approval' | 'progress' | 'finished' | 'blocked';
+  status: RunStatus;
+  /** Human/agent-facing note, e.g. what to do next or why it is blocked. */
+  note?: string;
+  /** Newly relevant artifact paths produced/admitted this step. */
+  artifacts?: string[];
+  /** Terminal outcome when action === "finished". */
+  outcome?: 'succeeded' | 'failed' | 'cancelled';
+  /** Report artifact paths when finished successfully. */
+  reportPaths?: string[];
+}
+
+export interface EngineStatus {
+  status: RunStatus;
+  discussion: DiscussionCursor | null;
+  participants: {
+    participantId: ParticipantId;
+    role: ParticipantRole;
+    status: ParticipantStatus;
+    activeAttempt: AttemptId | null;
+  }[];
+  consumption: { launches: number; mailSent: number };
+  approvalHash: string | null;
+  pendingDecisions: string[]; // e.g. "approve roster via: council approve --run <dir>"
+}
+
+export interface Engine {
+  /**
+   * One bounded reconciliation step: ingest observed worker outcomes, validate
+   * and admit new artifacts, enforce barriers/budgets/deadlines, launch due
+   * work, and persist everything. Idempotent — safe to call on every wake and
+   * to re-run after a crash.
+   */
+  advance(): Promise<Result<AdvanceResult>>;
+  /** Record the orchestrator's approval of an exact approved roster + config. */
+  approve(input: {
+    roster: ApprovedRoster;
+    approver: string;
+  }): Promise<Result<{ approvalId: ApprovalId; hash: string }>>;
+  status(): Promise<Result<EngineStatus>>;
+  /** Explicit cancellation: guarded stop of live workers, then mark cancelled. */
+  cancel(input: { reason: string }): Promise<Result<void>>;
+}
+
+export interface EngineDeps {
+  store: Store;
+  host: HostAdapter;
+  prompts: PromptBuilder;
+  now?: () => Date;
+}
+
+/**
+ * Factory signature. Implemented and exported from `src/engine.ts` (protocol
+ * developer): `export function createEngine(deps: EngineDeps): Engine`.
+ */
+export type CreateEngine = (deps: EngineDeps) => Engine;
