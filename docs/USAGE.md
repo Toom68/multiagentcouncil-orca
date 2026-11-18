@@ -110,6 +110,11 @@ manifest), resolves and validates the config, writes `meta.json` (including
 `launchBudgetFloor`, the minimum launches this config needs), and emits
 `prompts/supervisor.md` plus the exact `advanceCommand` the supervisor runs.
 
+The full brief is preserved in council artifacts, prompts and the approval
+binding. Only a bounded descriptive label is sent to Orca's shorter Run
+objective field; a multi-kilobyte review brief does not need to be shortened
+to fit that host metadata limit.
+
 ### `council doctor` — environment check
 
 ```text
@@ -136,6 +141,21 @@ the Task on that terminal and persists the supervisor's
 `{terminalHandle, dispatchId}` into `state.json` so `council approve` can
 address its wake. The worker command string is built only from fixed
 allowlisted tokens — nothing user-supplied ever becomes shell syntax.
+
+The idle wait is followed by a `terminal show` check of the exact terminal,
+connection, expected agent identity and explicit absence of an agent prompt.
+A trust or permission screen pauses setup; it is never accepted automatically.
+JSON callers must check `outcome`/`supervisorStarted`: a successful command can
+report `outcome:"paused"`, `supervisorStarted:false`, `needsAttention:true`,
+the existing Task/terminal IDs, and recovery instructions. It has not launched
+a supervisor in that case.
+
+`supervisor/startup.json` records startup intent, spec hash, caller binding,
+resource IDs and known request IDs under the run lock. After resolving a
+readiness prompt, rerun the same `start-supervisor --run` command to reuse the
+recorded resources. An unconfirmed issued attach blocks reruns until reconciled;
+it never creates a replacement on a missing receipt. Changed binding, malformed
+custody records or an already recorded supervisor also refuse a second launch.
 
 The supervisor Task attaches to the caller's **bound** Orca Run (your existing
 binding is preserved, never rebound). When the caller has no bound Run — e.g.

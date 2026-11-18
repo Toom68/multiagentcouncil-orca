@@ -55,6 +55,15 @@ function proc(partial: Partial<ProcessResult>): ProcessResult {
 }
 
 const okEnv = (result: unknown) => proc({ stdout: JSON.stringify({ ok: true, result }) });
+/** Ready `terminal show` receipt (shape observed on 1.4.261): connected
+ *  terminal, recognized agent, no pending prompt/menu decision. */
+const readyTerm = (handle: string, agent = 'devin') => ({
+  terminal: { handle, connected: true, agentIdentity: agent, agentWait: null },
+});
+/** readyTerm with field overrides — for not-ready variants. */
+const readyTermWith = (handle: string, over: Record<string, unknown>) => ({
+  terminal: { handle, connected: true, agentIdentity: 'devin', agentWait: null, ...over },
+});
 /** `orca terminal` success receipt shape verified on 1.4.261: the top-level
  *  envelope `id` is the only request evidence — there is no result.mutation
  *  and no --full flag on terminal commands. */
@@ -277,12 +286,51 @@ describe('OrcaAdapter.createRun/createTask', () => {
     if (res.ok) assert.equal(res.value.runId, 'run_c1');
     const argv = calls[0];
     assert.deepEqual(argv.slice(0, 2), ['orchestration', 'run-create']);
-    assert.ok(argv.includes('--objective=review the thing'));
+    // The host receives the bounded descriptive label, not the raw brief.
+    assert.ok(argv.includes('--objective=Council review — review the thing'));
     assert.ok(argv.includes('--json'));
     // Verified 1.4.261 semantics: --retry-request takes an ORCA-issued id only.
     // A caller-chosen council-* key must never appear on first-attempt argv.
     assert.ok(!argv.includes('--retry-request'), 'first attempt must not carry --retry-request');
     assert.ok(argv.includes('--full'), 'mutations request --full so the requestId is visible');
+  });
+
+  it('sends a bounded Run label for a multi-kilobyte brief, preserving UTF-8', async () => {
+    const { adapter, calls } = makeAdapter(() => okMut({ run: { id: 'run_big' } }, 'req-run-2'));
+    // >1024 bytes including multi-byte chars — the full brief must still be
+    // accepted locally; only the Run metadata label is bounded.
+    const brief = `。${'é🙂'.repeat(400)}`;
+    assert.ok(Buffer.byteLength(brief, 'utf8') > 1024);
+    const res = await adapter.createRun({ objective: brief });
+    assert.ok(res.ok);
+    const argv = calls[0];
+    const obj = argv.find((a) => a.startsWith('--objective='))!;
+    const label = obj.slice('--objective='.length);
+    assert.ok(Buffer.byteLength(label, 'utf8') <= 1024, `label ${Buffer.byteLength(label)}B exceeds cap`);
+    assert.ok(label.startsWith('Council review — '), 'descriptive prefix kept');
+    assert.ok(label.endsWith('…'), 'truncation marked');
+    // The emitted label is valid UTF-8 — replacement chars prove a mid-codepoint cut.
+    assert.ok(!label.includes('\uFFFD'), 'must not cut inside a code point');
+    // The adapter's returned input is untouched — the caller's objective stays verbatim.
+    if (res.ok) assert.equal(res.value.runId, 'run_big');
+  });
+
+  it('keeps short objectives verbatim in the Run label', async () => {
+    const { adapter, calls } = makeAdapter(() => okMut({ run: { id: 'run_s' } }));
+    const res = await adapter.createRun({ objective: 'short brief' });
+    assert.ok(res.ok);
+    const obj = calls[0].find((a) => a.startsWith('--objective='))!;
+    assert.equal(obj, '--objective=Council review — short brief');
+  });
+
+  it('rejects an empty objective at the adapter boundary — no spawn', async () => {
+    const { adapter, calls } = makeAdapter(() => okEnv({}));
+    for (const bad of ['', '   ', '\n\t ']) {
+      const res = await adapter.createRun({ objective: bad });
+      assert.equal(res.ok, false);
+      if (!res.ok) assert.match(res.error.message, /bad_objective|objective/i);
+    }
+    assert.equal(calls.length, 0);
   });
 
   it('creates a task under the explicit run with a spec file', async () => {
@@ -316,6 +364,7 @@ describe('OrcaAdapter.launchWorker', () => {
     const cmd = args[1];
     if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
     if (cmd === 'wait') return okEnv({ idle: true });
+    if (cmd === 'show') return okTerm(readyTerm('term_new1'), 'rcpt-ts-1');
     if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
     if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
     return failEnv('unexpected_command', String(cmd));
@@ -329,7 +378,7 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.equal(res.value.outcome, 'started');
     assert.equal(res.value.dispatchId, 'ctx_d1');
     assert.equal(res.value.terminalHandle, 'term_new1');
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
 
     const create = calls[0];
     assert.deepEqual(create.slice(0, 2), ['terminal', 'create']);
@@ -351,7 +400,13 @@ describe('OrcaAdapter.launchWorker', () => {
       assert.ok(!wait.includes(bad), `terminal wait must not carry ${bad}`);
     }
 
-    const start = calls[2];
+    // Readiness proof: documented `terminal show` runs after the idle wait —
+    // idle alone cannot distinguish a trust screen from a real prompt.
+    const show = calls[2];
+    assert.deepEqual(show.slice(0, 2), ['terminal', 'show']);
+    assert.ok(show.includes('--terminal') && show.includes('term_new1'));
+
+    const start = calls[3];
     assert.deepEqual(start.slice(0, 2), ['orchestration', 'worker-start']);
     for (const flag of ['--task', '--run', '--terminal', '--worktree', '--json']) {
       assert.ok(start.includes(flag), `missing ${flag}`);
@@ -368,9 +423,9 @@ describe('OrcaAdapter.launchWorker', () => {
     const { adapter, calls } = makeAdapter(devinLaunchHandler());
     const res = await adapter.launchWorker(launchSpec({ retainTerminal: true }));
     assert.ok(res.ok);
-    assert.equal(calls.length, 4);
-    assert.deepEqual(calls[3].slice(0, 2), ['orchestration', 'worker-keep-open']);
-    assert.ok(calls[3].includes('ctx_d1'));
+    assert.equal(calls.length, 5);
+    assert.deepEqual(calls[4].slice(0, 2), ['orchestration', 'worker-keep-open']);
+    assert.ok(calls[4].includes('ctx_d1'));
   });
 
   it('rejects a malicious model string before any spawn', async () => {
@@ -456,7 +511,9 @@ describe('OrcaAdapter.launchWorker', () => {
         ? failMut('outcome_unknown', 'req-orca-77')
         : args[1] === 'worker-list'
           ? okEnv({ workers: [] })
-          : okTerm({ terminal: { handle: 'term_x' }, idle: true }, 'rcpt-tc-1'),
+          : args[1] === 'show'
+            ? okTerm(readyTerm('term_x'))
+            : okTerm({ terminal: { handle: 'term_x' }, idle: true }, 'rcpt-tc-1'),
     );
     const res = await adapter.launchWorker(launchSpec());
     assert.ok(res.ok);
@@ -470,6 +527,7 @@ describe('OrcaAdapter.launchWorker', () => {
   it('reports unknown outcome when the launch reply cannot be parsed', async () => {
     const { adapter } = makeAdapter((args) =>
       args[1] === 'worker-start' ? proc({ exitCode: 0, stdout: '<html>oops</html>' }) :
+      args[1] === 'show' ? okTerm(readyTerm('term_x')) :
       okEnv({ terminal: { handle: 'term_x' }, idle: true }),
     );
     const res = await adapter.launchWorker(launchSpec());
@@ -507,9 +565,11 @@ describe('OrcaAdapter.launchWorker', () => {
     const { adapter, calls } = makeAdapter((args) =>
       args[1] === 'worker-list'
         ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', outcome: 'succeeded', liveness: 'idle', terminalState: 'retained' }] })
-        : args[1] === 'worker-start'
-          ? okEnv({ dispatchId: 'ctx_d2' })
-          : okEnv({}),
+        : args[1] === 'show'
+          ? okTerm(readyTerm('term_keep'))
+          : args[1] === 'worker-start'
+            ? okEnv({ dispatchId: 'ctx_d2' })
+            : okEnv({}),
     );
     const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
     assert.ok(res.ok);
@@ -527,9 +587,11 @@ describe('OrcaAdapter.launchWorker', () => {
     const { adapter, calls } = makeAdapter((args) =>
       args[1] === 'worker-list'
         ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', state: 'succeeded', liveness: 'live', terminalState: 'retained' }] })
-        : args[1] === 'worker-start'
-          ? okEnv({ dispatchId: 'ctx_d3' })
-          : okEnv({}),
+        : args[1] === 'show'
+          ? okTerm(readyTerm('term_keep'))
+          : args[1] === 'worker-start'
+            ? okEnv({ dispatchId: 'ctx_d3' })
+            : okEnv({}),
     );
     const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
     assert.ok(res.ok);
@@ -537,6 +599,101 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.equal(res.value.outcome, 'started');
     const start = calls.find((a) => a[1] === 'worker-start');
     assert.ok(start?.includes('--terminal') && start.includes('term_keep'));
+  });
+
+  // Readiness proof regressions — a trust/permission screen satisfies
+  // tui-idle but is NOT a launchable prompt (the live OSINTGPT startup bug:
+  // worker-start refused "not running a recognized agent" AFTER idle passed).
+  // Every not-ready/unproven state must refuse BEFORE worker-start.
+  for (const [name, showReply, match] of [
+    [
+      'a trust/permission menu (agentWait pending)',
+      readyTermWith('term_t', { agentWait: 'permission-prompt' }),
+      /agent_not_ready|waiting on/i,
+    ],
+    [
+      'a disconnected terminal',
+      readyTermWith('term_t', { connected: false }),
+      /agent_not_ready|not connected/i,
+    ],
+    [
+      'an unrecognized agent identity',
+      readyTermWith('term_t', { agentIdentity: null }),
+      /agent_not_ready|recognized/i,
+    ],
+    [
+      'a different agent than the launched command',
+      readyTermWith('term_t', { agentIdentity: 'codex' }),
+      /agent_not_ready|recognized/i,
+    ],
+    [
+      'a show receipt describing another terminal',
+      { terminal: { handle: 'term_other', connected: true, agentIdentity: 'devin', agentWait: null } },
+      /readiness_unproven|unidentified/i,
+    ],
+    [
+      'a malformed show receipt',
+      { unexpected: true },
+      /readiness_unproven|no terminal record/i,
+    ],
+    [
+      'a show receipt that omits agentWait entirely',
+      { terminal: { handle: 'term_t', connected: true, agentIdentity: 'devin' } },
+      /readiness_unproven|agentWait/i,
+    ],
+  ] as const) {
+    it(`refuses worker-start when readiness shows ${name}`, async () => {
+      const { adapter, calls } = makeAdapter((args) => {
+        const cmd = args[1];
+        if (cmd === 'create') return okTerm({ terminal: { handle: 'term_t' } }, 'rcpt-tc-1');
+        if (cmd === 'wait') return okEnv({ idle: true }); // idle lies — trust screen reads idle
+        if (cmd === 'show') return okTerm(showReply);
+        return failEnv('unexpected_command', String(cmd));
+      });
+      const res = await adapter.launchWorker(launchSpec());
+      assert.ok(res.ok);
+      if (!res.ok) return;
+      assert.equal(res.value.outcome, 'unknown', name);
+      assert.match(res.value.detail ?? '', match);
+      assert.ok(
+        calls.every((a) => a[1] !== 'worker-start'),
+        `worker-start must not run when readiness is unproven: ${name}`,
+      );
+      // The terminal handle is still surfaced for operator attention.
+      assert.equal(res.value.terminalHandle, 'term_t');
+    });
+  }
+
+  it('refuses worker-start when terminal show itself fails', async () => {
+    const { adapter, calls } = makeAdapter((args) => {
+      const cmd = args[1];
+      if (cmd === 'create') return okTerm({ terminal: { handle: 'term_t' } }, 'rcpt-tc-1');
+      if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'show') return failEnv('terminal_not_found', 'term_t');
+      return failEnv('unexpected_command', String(cmd));
+    });
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('applies the same readiness proof to a retained terminal before reusing it', async () => {
+    // Settled prior dispatch, but the retained terminal sits on a trust menu —
+    // custody alone is not readiness.
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', state: 'succeeded' }] })
+        : args[1] === 'show'
+          ? okTerm(readyTermWith('term_keep', { agentWait: 'workspace-trust' }))
+          : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'), 'must not start on a trust-screen terminal');
   });
 });
 
@@ -562,6 +719,7 @@ describe('OrcaAdapter mutation recovery', () => {
       if (args[1] === 'request-show') return okEnv({ requestId: 'req-ws-1', state: 'absent' });
       if (args[1] === 'create') return okTerm({ terminal: { handle: 'term_r' } }, 'rcpt-tc-1');
       if (args[1] === 'wait') return okEnv({ idle: true });
+      if (args[1] === 'show') return okTerm({ terminal: { handle: 'term_r', connected: true, agentIdentity: 'devin', agentWait: null } });
       if (args[1] === 'worker-start') {
         return args.includes('--retry-request')
           ? okMut({ dispatchId: 'ctx_replayed', mutation: undefined }, 'req-ws-1')
@@ -593,7 +751,9 @@ describe('OrcaAdapter mutation recovery', () => {
             ? okTerm({ terminal: { handle: 'term_r' } }, 'rcpt-tc-1')
             : args[1] === 'wait'
               ? okEnv({ idle: true })
-              : okMut({ dispatchId: 'ctx_d1' }, 'req-ws-1'),
+              : args[1] === 'show'
+                ? okTerm({ terminal: { handle: 'term_r', connected: true, agentIdentity: 'devin', agentWait: null } })
+                : okMut({ dispatchId: 'ctx_d1' }, 'req-ws-1'),
       );
       await adapter.launchWorker(launchSpec());
       const before = calls.length;
@@ -971,6 +1131,7 @@ describe('OrcaAdapter.observeWorker/sendNotification/stop/release', () => {
       const cmd = args[1];
       if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
       if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'show') return okTerm(readyTerm('term_new1'), 'rcpt-ts-1');
       if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
       if (cmd === 'worker-keep-open') return okMut({ state: 'released' }, 'req-ko-1'); // did NOT retain
       return failEnv('unexpected_command', String(cmd));
@@ -995,6 +1156,7 @@ describe('OrcaAdapter.observeWorker/sendNotification/stop/release', () => {
         const cmd = args[1];
         if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
         if (cmd === 'wait') return okEnv({ idle: true });
+        if (cmd === 'show') return okTerm(readyTerm('term_new1'), 'rcpt-ts-1');
         if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
         if (cmd === 'worker-keep-open') return okMut(koReceipt, 'req-ko-1');
         return failEnv('unexpected_command', String(cmd));
@@ -1013,6 +1175,7 @@ describe('OrcaAdapter.observeWorker/sendNotification/stop/release', () => {
         const cmd = args[1];
         if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
         if (cmd === 'wait') return okEnv({ idle: true });
+        if (cmd === 'show') return okTerm(readyTerm('term_new1'), 'rcpt-ts-1');
         if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
         if (cmd === 'worker-keep-open') return okMut(koReceipt, 'req-ko-1');
         return failEnv('unexpected_command', String(cmd));

@@ -31,6 +31,13 @@ live agent behavior or throughput.
 
 ## Real Orca run
 
+Post-release startup regressions from the first OSINTGPT setup increased the
+local suite to 303 passing tests. The repair separates long review briefs from
+Orca Run labels, pauses on trust/unproven readiness, and preserves supervisor
+resource evidence. A fake-host crash seam checks that attach intent is durable
+before the host call; malformed custody ledgers refuse reuse. This is automated
+recovery evidence, not a new live council or proof of new provider integrations.
+
 Host: Orca 1.4.261 on Windows; Devin CLI 3000.11.92, pinned `swe-2-max` with
 `--permission-mode dangerous` (the explicitly requested bypass posture).
 No fallback model was used.

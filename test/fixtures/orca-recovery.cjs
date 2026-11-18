@@ -57,7 +57,27 @@
         } catch {
           /* best effort — a read-only scenario simply replays */
         }
-        if (entry && typeof entry === 'object') envelope = entry;
+        if (entry && typeof entry === 'object') {
+          // Spy seam: an entry may carry {"spyFile": "<abs>", "spyLabel": "…"}
+          // asking the fake to snapshot that file into the call log at the
+          // exact moment the host receives this command — e.g. proving the
+          // durable record already said start_issued when worker-start ran.
+          if (typeof entry.spyFile === 'string' && log) {
+            try {
+              const content = fs.readFileSync(entry.spyFile, 'utf8');
+              fs.appendFileSync(
+                log,
+                JSON.stringify({ spy: entry.spyLabel ?? key, content }) + '\n',
+              );
+            } catch (e) {
+              fs.appendFileSync(
+                log,
+                JSON.stringify({ spy: entry.spyLabel ?? key, error: String(e) }) + '\n',
+              );
+            }
+          }
+          envelope = { ok: entry.ok !== false, ...(entry.result !== undefined ? { result: entry.result } : {}), ...(entry.error !== undefined ? { error: entry.error } : {}), ...(entry.id !== undefined ? { id: entry.id } : {}) };
+        }
       }
     } catch {
       /* a broken scenario yields the default empty ok envelope */

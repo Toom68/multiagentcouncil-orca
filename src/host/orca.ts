@@ -179,6 +179,35 @@ export function buildAgentCommandText(tokens: readonly string[]): string {
   return tokens.join(' ');
 }
 
+/** Truncate to a UTF-8 byte budget without ever splitting a sequence. */
+function boundedUtf8(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= maxBytes) return s;
+  let cut = maxBytes;
+  while (cut > 0 && (buf[cut] & 0b1100_0000) === 0b1000_0000) cut -= 1;
+  return buf.subarray(0, cut).toString('utf8');
+}
+
+const RUN_LABEL_PREFIX = 'Council review — ';
+const RUN_LABEL_MAX_BYTES = 1024;
+
+/**
+ * The full council objective stays verbatim in state, artifacts, prompts and
+ * the approval hash. The Orca Run only ever receives a bounded descriptive
+ * metadata label — host `run-create` refuses objectives over 1024 chars, so
+ * the adapter boundary converts the brief (`Council review — <prefix…>`).
+ */
+export function runObjectiveLabel(objective: string): string {
+  const budget = RUN_LABEL_MAX_BYTES - Buffer.byteLength(RUN_LABEL_PREFIX, 'utf8');
+  if (Buffer.byteLength(objective, 'utf8') <= budget) return RUN_LABEL_PREFIX + objective;
+  const ellipsis = '…';
+  return (
+    RUN_LABEL_PREFIX +
+    boundedUtf8(objective, budget - Buffer.byteLength(ellipsis, 'utf8')) +
+    ellipsis
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Envelope parsing
 // ---------------------------------------------------------------------------
@@ -640,6 +669,8 @@ export class OrcaHost {
     const requestKey = assertSafeValue('requestKey', input.requestKey);
 
     let terminalHandle: string | undefined;
+    const expectedAgent =
+      input.lane.kind === 'argv' ? input.lane.command[0] : input.lane.agent;
 
     if (input.retainedTerminal) {
       const handle = assertSafeValue('retainedTerminal.handle', input.retainedTerminal.handle);
@@ -655,6 +686,26 @@ export class OrcaHost {
           error: settled.error ?? {
             code: 'terminal_busy',
             message: `terminal ${handle} still owns active work`,
+          },
+          receipts,
+        };
+      }
+      // A kept-open terminal can also sit on a trust/permission menu — the
+      // same explicit readiness proof as the fresh-argv path applies.
+      const ready = await this.terminalReady(handle, expectedAgent);
+      receipts.terminalShow = ready.state === 'ready' ? ready.value : ready.value ?? ready.error;
+      if (ready.state !== 'ready') {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'uncertain',
+          failedStage: 'readiness',
+          terminalHandle: handle,
+          error: {
+            code: ready.state === 'not_ready' ? 'agent_not_ready' : 'readiness_unproven',
+            message: ready.message,
+            ...(ready.value === undefined ? {} : { data: ready.value }),
           },
           receipts,
         };
@@ -727,6 +778,28 @@ export class OrcaHost {
             message:
               'terminal wait did not prove the agent idle; the terminal may still be usable — reconcile before retry',
             data: waited.error,
+          },
+          receipts,
+        };
+      }
+      // tui-idle is not proof the agent is recognized and at a prompt — a
+      // trust screen reads idle too. Require the documented terminal show
+      // to prove the expected agent is present and not waiting on input.
+      const ready = await this.terminalReady(terminalHandle, expectedAgent);
+      receipts.terminalShow = ready.state === 'ready' ? ready.value : ready.value ?? ready.error;
+      if (ready.state !== 'ready') {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'uncertain',
+          failedStage: 'readiness',
+          terminalHandle,
+          requestId: created.requestId,
+          error: {
+            code: ready.state === 'not_ready' ? 'agent_not_ready' : 'readiness_unproven',
+            message: ready.message,
+            ...(ready.value === undefined ? {} : { data: ready.value }),
           },
           receipts,
         };
@@ -843,6 +916,87 @@ export class OrcaHost {
       };
     }
     return { ok: true };
+  }
+
+  /**
+   * Prove a terminal is actually ready to receive a Task — `tui-idle` alone
+   * is insufficient: a workspace-trust or permission screen also reads idle,
+   * and `worker-start` then refuses "not running a recognized agent" after
+   * the terminal was already created. Readiness requires the documented
+   * `terminal show` to report the terminal connected, carrying the expected
+   * agent identity, and NOT waiting on a prompt (`agentWait === null`).
+   * We never auto-accept trust/permission menus — a not-ready terminal is
+   * reported, never poked.
+   */
+  private async terminalReady(
+    handle: string,
+    expectedAgent: string,
+  ): Promise<
+    | { state: 'ready'; value: unknown }
+    | { state: 'not_ready' | 'unproven'; message: string; error?: OrcaCliErrorShape; value?: unknown }
+  > {
+    const shown = await this.run<Record<string, unknown>>([
+      'terminal',
+      'show',
+      '--terminal',
+      handle,
+      '--json',
+    ]);
+    if (!shown.ok) {
+      return {
+        state: 'unproven',
+        message: `terminal show for ${handle} failed (${shown.error.code}: ${shown.error.message}) — readiness could not be proven; inspect the terminal before retry`,
+        error: shown.error,
+      };
+    }
+    const t = asRecord(asRecord(shown.value)?.terminal ?? shown.value);
+    if (t === undefined) {
+      return {
+        state: 'unproven',
+        message: `terminal show for ${handle} returned no terminal record — readiness could not be proven; inspect the terminal before retry`,
+        value: shown.value,
+      };
+    }
+    const reported = firstString(t.handle);
+    if (reported !== handle) {
+      return {
+        state: 'unproven',
+        message: `terminal show described ${reported ?? 'an unidentified terminal'}, expected ${handle} — refusing to treat the read as this terminal`,
+        value: shown.value,
+      };
+    }
+    if (t.connected !== true) {
+      return {
+        state: 'not_ready',
+        message: `terminal ${handle} is not connected — the agent may still be booting; inspect it, then retry/reconcile`,
+        value: shown.value,
+      };
+    }
+    const identity = firstString(t.agentIdentity);
+    if (identity === undefined || identity.toLowerCase() !== expectedAgent.toLowerCase()) {
+      return {
+        state: 'not_ready',
+        message: `terminal ${handle} is not running a recognized ${expectedAgent} agent (agentIdentity=${JSON.stringify(identity ?? null)}) — resolve it in the terminal (never auto-accept trust/permission prompts), then retry/reconcile`,
+        value: shown.value,
+      };
+    }
+    // The field must be OBSERVED — a receipt that omits agentWait entirely
+    // proves nothing (the documented shape carries it null when prompt-free).
+    if (!('agentWait' in t)) {
+      return {
+        state: 'unproven',
+        message: `terminal show for ${handle} did not report agentWait — readiness could not be proven; inspect the terminal before retry`,
+        value: shown.value,
+      };
+    }
+    if (t.agentWait !== null) {
+      return {
+        state: 'not_ready',
+        message: `terminal ${handle} agent is waiting on ${JSON.stringify(t.agentWait)} — a trust/permission/menu prompt needs a decision in that terminal (never auto-accept it); resolve it, then retry/reconcile`,
+        value: shown.value,
+      };
+    }
+    return { state: 'ready', value: shown.value };
   }
 
   /**
@@ -1338,8 +1492,13 @@ export class OrcaAdapter implements HostAdapter {
 
   async createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId }>> {
     try {
+      if (input.objective.trim().length === 0) {
+        return failure(adapterErr('bad_objective', 'objective must be non-empty'));
+      }
+      // Only the bounded label crosses into Orca — the full brief never does;
+      // the low-level host check still guards whatever reaches argv.
       const res = await this.host.createRun(
-        input.objective,
+        runObjectiveLabel(input.objective),
         requestKey('run', input.objective),
       );
       if (!res.ok) {

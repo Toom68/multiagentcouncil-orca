@@ -583,10 +583,20 @@ function orcaCalls(log: string): string[][] {
   return readFileSync(log, 'utf8')
     .split('\n')
     .filter((l) => l.trim().length > 0)
-    .map((l) => {
-      const argv = (JSON.parse(l) as { argv: string[] }).argv;
-      return [path.basename(argv[0] ?? ''), ...argv.slice(1)];
-    });
+    .map((l) => JSON.parse(l) as { argv?: string[] })
+    .filter((e): e is { argv: string[] } => Array.isArray(e.argv))
+    .map((e) => [path.basename(e.argv[0] ?? ''), ...e.argv.slice(1)]);
+}
+
+/** Fixture spy snapshots: files the fake orca captured at the exact moment a
+ *  host command ran — proves what the durable record said at that seam. */
+function spyReads(log: string): { spy: string; content?: string; error?: string }[] {
+  if (!existsSync(log)) return [];
+  return readFileSync(log, 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { spy?: string; content?: string; error?: string })
+    .filter((e) => typeof e.spy === 'string') as { spy: string; content?: string; error?: string }[];
 }
 
 const hasCall = (log: string, head: string): boolean =>
@@ -1170,6 +1180,9 @@ test('start-supervisor preserves an existing caller Run binding', async () => {
       'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
       'terminal create': [{ ok: true, result: { terminal: { handle: 'term_newsup' } } }],
       'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_newsup', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
       'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_newsup' } } }],
     },
     'term_primary',
@@ -1195,6 +1208,9 @@ test('start-supervisor with no bound Run uses worker-start --spec-file implicit 
       'orchestration run-current': [{ ok: true, result: { runId: null } }],
       'terminal create': [{ ok: true, result: { terminal: { handle: 'term_newsup2' } } }],
       'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_newsup2', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
       'orchestration worker-start': [
         { ok: true, result: { dispatch: { id: 'ctx_newsup2' }, task: { id: 'task_implicit' } } },
       ],
@@ -1210,6 +1226,256 @@ test('start-supervisor with no bound Run uses worker-start --spec-file implicit 
   assert.ok(ws.includes('--spec-file'));
   assert.ok(!ws.includes('--task') || ws.indexOf('--spec-file') < (ws.indexOf('--task') === -1 ? Infinity : ws.indexOf('--task')));
   assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_newsup2');
+});
+
+test('start-supervisor pauses on a trust screen, then resumes the SAME task+terminal', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-trust');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [
+        { ok: true, result: { runId: 'run_caller' } },
+        { ok: true, result: { runId: 'run_caller' } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t1' } } }],
+      'terminal wait': [{ ok: true, result: {} }, { ok: true, result: {} }],
+      'terminal show': [
+        // Idle but stuck on a workspace-trust menu — the live bug shape.
+        { ok: true, result: { terminal: { handle: 'term_t1', connected: true, agentIdentity: 'devin', agentWait: 'workspace-trust' } } },
+        // After the human resolves trust inside that terminal.
+        { ok: true, result: { terminal: { handle: 'term_t1', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-list': [{ ok: true, result: { workers: [] } }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_sup' } } }],
+    },
+    'term_primary',
+  );
+  const args = ['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'];
+
+  const r1 = await cliJson(args, env);
+  assert.equal(r1.code, 0, r1.stdout + r1.stderr);
+  assert.equal(r1.body.outcome, 'paused');
+  assert.equal(r1.body.supervisorStarted, false);
+  assert.equal(r1.body.needsAttention, true);
+  assert.equal((r1.body.reason as { code: string }).code, 'agent_not_ready');
+  assert.match((r1.body.reason as { message: string }).message, /waiting|trust|prompt/i);
+  assert.equal(r1.body.taskId, 'task_sup');
+  assert.equal(r1.body.terminalHandle, 'term_t1');
+  assert.match(String(r1.body.recovery), /never auto-accept|re-run/i);
+  // worker-start NEVER ran — the refusal precedes it.
+  assert.equal(hasCall(log, 'orchestration worker-start'), false);
+  // Durable evidence: task+terminal recorded, supervisor NOT persisted.
+  const rec1 = JSON.parse(readFileSync(path.join(f.runDir, 'supervisor', 'startup.json'), 'utf8')) as {
+    taskId: string | null;
+    terminalHandle: string | null;
+    status: string;
+  };
+  assert.equal(rec1.taskId, 'task_sup');
+  assert.equal(rec1.terminalHandle, 'term_t1');
+  assert.equal(rec1.status, 'paused');
+  assert.equal(readState(f.runDir).supervisor, null);
+
+  // Re-run after trust is resolved: recorded resources are reused, never duplicated.
+  const r2 = await cliJson(args, env);
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+  assert.equal(r2.body.outcome, 'launched');
+  const taskCreates = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create');
+  const termCreates = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'terminal create');
+  assert.equal(taskCreates.length, 1, 'recorded task reused — no duplicate task-create');
+  assert.equal(termCreates.length, 1, 'recorded terminal reused — no duplicate terminal create');
+  const ws = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start')!;
+  assert.ok(ws.includes('task_sup') && ws.includes('term_t1'), 'same task+terminal on resume');
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_t1');
+});
+
+test('start-supervisor pauses — never launches — on unrecognized/disconnected/malformed readiness', async () => {
+  for (const [name, showResult, code] of [
+    ['unrecognized agent', { terminal: { handle: 'term_t2', connected: true, agentIdentity: null, agentWait: null } }, 'agent_not_ready'],
+    ['disconnected terminal', { terminal: { handle: 'term_t2', connected: false, agentIdentity: 'devin', agentWait: null } }, 'agent_not_ready'],
+    ['malformed show receipt', { terminal: null }, 'readiness_unproven'],
+    ['show describing another terminal', { terminal: { handle: 'term_other', connected: true, agentIdentity: 'devin', agentWait: null } }, 'readiness_unproven'],
+    ['missing agentWait field', { terminal: { handle: 'term_t2', connected: true, agentIdentity: 'devin' } }, 'readiness_unproven'],
+  ] as const) {
+    const f = await initRun();
+    const dir = tmp(`sup-nr-${name.replace(/\W+/g, '-')}`);
+    const { env, log } = fakeOrca(
+      dir,
+      {
+        'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+        'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup2' } } }],
+        'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t2' } } }],
+        'terminal wait': [{ ok: true, result: {} }],
+        'terminal show': [{ ok: true, result: showResult }],
+      },
+      'term_primary',
+    );
+    const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+    assert.equal(r.code, 0, `${name}: ${r.stdout}${r.stderr}`);
+    assert.equal(r.body.outcome, 'paused', name);
+    assert.equal((r.body.reason as { code: string }).code, code, name);
+    assert.equal(hasCall(log, 'orchestration worker-start'), false, `${name}: worker-start must never run`);
+    assert.equal(readState(f.runDir).supervisor, null, `${name}: no supervisor persisted`);
+  }
+});
+
+test('start-supervisor pauses on a definitive worker-start refusal, then resumes on the SAME task', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-refused');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [
+        { ok: true, result: { runId: 'run_caller' } },
+        { ok: true, result: { runId: 'run_caller' } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t3' } } }],
+      'terminal wait': [{ ok: true, result: {} }, { ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_t3', connected: true, agentIdentity: 'devin', agentWait: null } } },
+        { ok: true, result: { terminal: { handle: 'term_t3', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-list': [{ ok: true, result: { workers: [] } }],
+      'orchestration worker-start': [
+        // Definitive refusal — the host's own "Nothing changed" marker.
+        { ok: false, error: { code: 'not_bound', message: 'This caller is not bound. Nothing changed. Orchestration mutation request ID: u-1.' } },
+        { ok: true, result: { dispatch: { id: 'ctx_sup3' } } },
+      ],
+    },
+    'term_primary',
+  );
+  const args = ['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'];
+  const r1 = await cliJson(args, env);
+  assert.equal(r1.code, 0, r1.stdout + r1.stderr);
+  assert.equal(r1.body.outcome, 'paused');
+  assert.equal((r1.body.reason as { code: string }).code, 'start_refused');
+  // Definitive refusal is resumable: the second run re-issues on the same resources.
+  const r2 = await cliJson(args, env);
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+  assert.equal(r2.body.outcome, 'launched');
+  const taskCreates = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create');
+  assert.equal(taskCreates.length, 1, 'no duplicate task after a definitive refusal');
+  const starts = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start');
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1].includes('task_sup'), 'resume starts the recorded task');
+});
+
+test('start-supervisor locks an unconfirmed worker-start — a re-run refuses rather than double-dispatch', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-uncertain');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t4' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_t4', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      // Timeout-shaped failure: NOT definitive — the mutation may have landed.
+      // spyFile makes the fake host snapshot the durable record at the exact
+      // moment worker-start arrives — proving start_issued was persisted
+      // BEFORE the mutation, not only after its outcome.
+      'orchestration worker-start': [
+        {
+          ok: false,
+          error: { code: 'unknown', message: 'connection lost waiting for mutation receipt' },
+          spyFile: path.join(f.runDir, 'supervisor', 'startup.json'),
+          spyLabel: 'record-at-worker-start',
+        },
+      ],
+    },
+    'term_primary',
+  );
+  const args = ['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'];
+  const r1 = await cliJson(args, env);
+  assert.equal(r1.code, 0, r1.stdout + r1.stderr);
+  assert.equal(r1.body.outcome, 'paused');
+  assert.equal((r1.body.reason as { code: string }).code, 'start_uncertain');
+  const rec = JSON.parse(readFileSync(path.join(f.runDir, 'supervisor', 'startup.json'), 'utf8')) as { status: string };
+  assert.equal(rec.status, 'start_issued');
+  // At the invocation seam the record already said start_issued — a crash
+  // here can never be mistaken for "no start was attempted".
+  const spy = spyReads(log).find((s) => s.spy === 'record-at-worker-start');
+  assert.ok(spy?.content, 'expected the fake host to snapshot the record at worker-start');
+  assert.match(spy!.content!, /"status":\s*"start_issued"/);
+
+  // Re-run REFUSES — an unconfirmed dispatch must be reconciled, never re-issued.
+  const r2 = await cliJson(args, env);
+  assert.notEqual(r2.code, 0);
+  const errOut = `${r2.stdout}${r2.stderr}`;
+  assert.match(errOut, /already issued|launch_unknown/i);
+  // Exactly one worker-start ever ran.
+  const starts = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start');
+  assert.equal(starts.length, 1);
+});
+
+test('start-supervisor resume refuses unsafe worker-list ledgers — never guesses custody', async () => {
+  for (const [name, workerListResult, code, match] of [
+    ['missing workers array', { other: 1 }, 'custody_unproven', /no workers array/i],
+    ['malformed row', { workers: [null] }, 'custody_unproven', /no identifiable/i],
+    ['unidentifiable row', { workers: [{ garbage: true }] }, 'custody_unproven', /no identifiable/i],
+    // Physical 'released' without an explicit verdict is NOT proof of safe reuse.
+    ['verdict-less released row', { workers: [{ terminal: 'term_t5', dispatchId: 'ctx_x', outcome: 'released' }] }, 'custody_unproven', /no explicit verdict/i],
+    ['verdict-less settled row', { workers: [{ terminal: 'term_t5', dispatchId: 'ctx_x', state: 'settled' }] }, 'custody_unproven', /no explicit verdict/i],
+    // A clearly-live row is a real ownership conflict — named differently.
+    ['live owner', { workers: [{ terminal: 'term_t5', dispatchId: 'ctx_live', outcome: 'in_progress', liveness: 'live' }] }, 'terminal_owned', /already owns/i],
+    // Explicit verdicts on OTHER terminals do not block.
+    ['settled elsewhere is free', { workers: [{ terminal: 'term_other', dispatchId: 'ctx_o', outcome: 'succeeded' }] }, 'launched', ''],
+  ] as const) {
+    const f = await initRun();
+    const dir = tmp(`sup-cust-${name.replace(/\W+/g, '-')}`);
+    const { env, log } = fakeOrca(
+      dir,
+      {
+        'orchestration run-current': [
+          { ok: true, result: { runId: 'run_caller' } },
+          { ok: true, result: { runId: 'run_caller' } },
+        ],
+        'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+        'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t5' } } }],
+        'terminal wait': [{ ok: true, result: {} }, { ok: true, result: {} }],
+        'terminal show': [
+          // First run pauses on a trust prompt → a resumable record exists.
+          { ok: true, result: { terminal: { handle: 'term_t5', connected: true, agentIdentity: 'devin', agentWait: 'workspace-trust' } } },
+          { ok: true, result: { terminal: { handle: 'term_t5', connected: true, agentIdentity: 'devin', agentWait: null } } },
+        ],
+        'orchestration worker-list': [{ ok: true, result: workerListResult }],
+        'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_sup5' } } }],
+      },
+      'term_primary',
+    );
+    const args = ['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'];
+    const r1 = await cliJson(args, env);
+    assert.equal(r1.body.outcome, 'paused', `${name} setup: ${r1.stdout}${r1.stderr}`);
+    const r2 = await cliJson(args, env);
+    assert.equal(r2.code, 0, `${name}: ${r2.stdout}${r2.stderr}`);
+    assert.equal(r2.body.outcome, code === 'launched' ? 'launched' : 'paused', name);
+    if (code !== 'launched') {
+      assert.equal((r2.body.reason as { code: string }).code, code, name);
+      assert.match((r2.body.reason as { message: string }).message, match, name);
+      assert.equal(hasCall(log, 'orchestration worker-start'), false, `${name}: no start on unproven custody`);
+    }
+  }
+});
+
+test('start-supervisor refuses when state already records a supervisor — zero host calls', async () => {
+  const f = await initRun();
+  const store = createStore({ runDir: f.runDir });
+  const st = await store.loadState();
+  assert.ok(st.ok);
+  st.value.supervisor = { terminalHandle: 'term_existing', dispatchId: 'ctx_existing' };
+  assert.ok((await store.saveState(st.value)).ok);
+
+  const dir = tmp('sup-exists');
+  const { env, log } = fakeOrca(dir, {}, 'term_primary');
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.match(`${r.stdout}${r.stderr}`, /already records a supervisor|invalid_transition/i);
+  assert.equal(orcaCalls(log).length, 0, 'refusal precedes every host call');
 });
 
 test('init quotes spaced supervisor command paths and refuses dangerous shell chars', async () => {
