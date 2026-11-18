@@ -296,7 +296,9 @@ export function createPromptBuilder(): PromptBuilder {
         outputBlock('FindingsFile', input.outputPath, skeleton, [
           `\`findings\` holds at most ${ctx.config.maxFindingsPerSeat} entries, unique \`findingId\`s.`,
           '`schemaVersion`, `runId`, `participantId`, `perspectiveId` fixed as shown.',
-          '`kind`/`severity`/`evidence.kind` must be values from the enums shown.',
+          '`kind`/`severity`/`evidence.kind`/`counterEvidence.kind` must be values from the enums shown.',
+          'Every `evidence` and `counterEvidence` element is an Evidence OBJECT `{kind, note, ...}` — e.g. `{"kind":"reasoned","note":"why this finding may not hold"}` — never a bare string; keep `counterEvidence: []` when there is none.',
+          'Before `worker_done`, self-check your JSON field types: `findings` is an array of objects, every `evidence`/`counterEvidence` element is an object, `confidence` is a number. The runner validates strictly and rejects malformed entries — it does not repair output.',
           `Free-text fields capped at ${ctx.config.maxTextChars} characters each.`,
         ]),
         budgetsBlock([

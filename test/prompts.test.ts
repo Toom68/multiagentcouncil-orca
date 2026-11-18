@@ -236,6 +236,18 @@ describe('independent reviewer', () => {
     assert.match(spec, /unsupported/);
     assert.match(spec, /re-derives/);
   });
+  test('pins the counterEvidence object-shape contract — objects, never strings', () => {
+    // Regression for the live partial run: a reviewer's findings were rejected
+    // because counterEvidence held bare strings. The spec must show the same
+    // Evidence-object shape as evidence, forbid string elements, and keep []
+    // honest — plus ask for a field-type self-check without claiming repair.
+    assert.match(spec, /Evidence OBJECT `\{kind, note/);
+    assert.match(spec, /\{"kind":"reasoned","note":"/);
+    assert.match(spec, /never a bare string/i);
+    assert.match(spec, /counterEvidence: \[\]/);
+    assert.match(spec, /self-check your JSON field types/i);
+    assert.match(spec, /does not repair output/i);
+  });
 });
 
 describe('scribe notes', () => {
