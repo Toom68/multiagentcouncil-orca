@@ -606,7 +606,14 @@ interface RecoveryFixture extends InitFixture {
  * engine's launch guard refuses to retry on its own.
  */
 async function recoveryRun(
-  opts: { supervisorHandle?: string; specText?: string; attemptExtras?: Record<string, unknown> } = {},
+  opts: {
+    supervisorHandle?: string;
+    specText?: string;
+    attemptExtras?: Record<string, unknown>;
+    /** Journaled task-create failure text; defaults to the real definitive
+     * refusal ("not bound ... Nothing changed. request ID: <uuid>"). */
+    failureMessage?: string;
+  } = {},
 ): Promise<RecoveryFixture> {
   const f = await initRun({ perspectives: 10, participants: 2 });
   const store = createStore({ runDir: f.runDir });
@@ -668,7 +675,9 @@ async function recoveryRun(
           op: 'task-create',
           attemptId,
           code: 'adapter_error',
-          message: `This caller is not bound to Run run_child, which is bound to term_deadbeef. Nothing changed. Orchestration mutation request ID: ${requestId}.`,
+          message:
+            opts.failureMessage ??
+            `This caller is not bound to Run run_child, which is bound to term_deadbeef. Nothing changed. Orchestration mutation request ID: ${requestId}.`,
         },
       },
     ]);
@@ -953,6 +962,182 @@ test('reconcile keeps the engine guard armed when the retried task-create also f
   const errs = journalTail(f.runDir, 2).filter((e) => e.type === 'error');
   assert.equal(errs.length >= 1, true);
   assert.equal(errs[errs.length - 1].payload?.op, 'task-create'); // failure journaled, guard stays armed
+});
+
+test('concurrent reconciles on the same attempt create at most one task', async () => {
+  // The whole read/probe/list/create/persist transaction runs under the run
+  // lock: the loser blocks, re-reads state, sees the persisted taskId and
+  // refuses invalid_transition — it never reaches the host at all.
+  const f = await recoveryRun();
+  const dir = tmp('recon-race');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [{ ok: true, result: { tasks: [] } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_race' } } }],
+    },
+    'term_sup',
+  );
+  const args = ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'];
+  const [r1, r2] = await Promise.all([cliJson(args, env), cliJson(args, env)]);
+  const codes = [r1.code, r2.code].sort();
+  assert.deepEqual(codes, [0, 4], `one success one refusal, got ${r1.code} and ${r2.code}: ${r1.stderr} ${r2.stderr}`);
+  assert.equal(
+    orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create').length,
+    1,
+    'at most one task-create across both invocations',
+  );
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, 'task_race');
+});
+
+test('reconcile refuses to create on a timeout/unknown failure — even with a uuid and confirmation', async () => {
+  // A journaled request id + operator confirmation + empty task-list is NOT
+  // proof of no-effects: the timed-out task-create may have landed anyway.
+  const f = await recoveryRun({
+    failureMessage: `task-create request timed out; outcome unknown. Orchestration mutation request ID: 74a45889-c510-491e-9598-26264fc8f5c7.`,
+  });
+  const dir = tmp('recon-timeout');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'absent' } }], // ledger has no record either
+      'orchestration task-list': [{ ok: true, result: { tasks: [] } }],
+    },
+    'term_sup',
+  );
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 11, r.stdout + r.stderr); // launch_unknown
+  assert.match((r.body.error as Record<string, unknown>).message as string, /not a verified definitive/);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null);
+
+  // The same uncertain failure still allows ADOPTION of a unique matching
+  // task — adopting an existing task can never create a duplicate.
+  const f2 = await recoveryRun({
+    failureMessage: `connection lost during task-create; outcome unknown. Orchestration mutation request ID: 74a45889-c510-491e-9598-26264fc8f5c7.`,
+  });
+  const d2 = tmp('recon-adopt-uncertain');
+  const f2o = fakeOrca(
+    d2,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'absent' } }],
+      'orchestration task-list': [
+        { ok: true, result: { tasks: [{ id: 'task_landed', spec: f2.specText }] } },
+      ],
+    },
+    'term_sup',
+  );
+  const r2 = await cliJson(
+    ['reconcile', '--run', f2.runDir, '--attempt', f2.attemptId, '--confirm-no-effects', f2.requestId, '--as-supervisor', '--json'],
+    f2o.env,
+  );
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+  assert.equal(r2.body.resolution, 'adopted');
+  assert.equal(r2.body.taskId, 'task_landed');
+  assert.equal(hasCall(f2o.log, 'orchestration task-create'), false);
+});
+
+test('reconcile treats a structured refused request state as verified no-effects and creates', async () => {
+  // Journal message has no definitive marker, but the request ledger says the
+  // mutation was refused — that is the structured verified no-effects signal.
+  const f = await recoveryRun({
+    failureMessage: `task-create rejected. Orchestration mutation request ID: 74a45889-c510-491e-9598-26264fc8f5c7.`,
+  });
+  const dir = tmp('recon-structured');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [{ ok: true, result: { tasks: [] } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_struct' } } }],
+    },
+    'term_sup',
+  );
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.resolution, 'created');
+  assert.equal(r.body.taskId, 'task_struct');
+  assert.equal(
+    orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create').length,
+    1,
+  );
+});
+
+test('reconcile refuses malformed or incomplete task-list receipts instead of treating them as empty', async () => {
+  const f = await recoveryRun();
+  const cases: [string, unknown][] = [
+    ['no task array at all', { result: 'unavailable' }],
+    ['tasks field is not an array', { tasks: 'two tasks, trust me' }],
+    ['non-object row', { tasks: ['task_a', { id: 'task_ok', spec: 'x' }] }],
+    ['row with no identifiable fields', { tasks: [{ id: 'task_ok', spec: 'x' }, { status: 'running' }] }],
+  ];
+  for (const [label, receipt] of cases) {
+    const dir = tmp('recon-malf');
+    const { env, log } = fakeOrca(
+      dir,
+      {
+        'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+        'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+        'orchestration task-list': [{ ok: true, result: receipt }],
+      },
+      'term_sup',
+    );
+    const r = await cliJson(
+      ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+      env,
+    );
+    assert.equal(r.code, 11, `case "${label}": ${r.stdout} ${r.stderr}`);
+    assert.equal(hasCall(log, 'orchestration task-create'), false, `case "${label}" created a task`);
+  }
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null);
+});
+
+test('reconcile refuses an unreadable task ledger instead of assuming zero tasks', async () => {
+  const f = await recoveryRun();
+  const dir = tmp('recon-unread');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_child' } }],
+      'orchestration request-show': [{ ok: true, result: { state: 'refused' } }],
+      'orchestration task-list': [{ ok: false, error: { code: 'refused', message: 'run ledger unavailable' } }],
+    },
+    'term_sup',
+  );
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 10, r.stdout + r.stderr); // adapter_error — ledger unreadable
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null);
+});
+
+test('reconcile refuses a journaled failure that carries no request id', async () => {
+  const f = await recoveryRun({
+    failureMessage: 'task-create failed: spawn error before the request was ever issued',
+  });
+  const dir = tmp('recon-nouuid');
+  const { env, log } = fakeOrca(dir, {}, 'term_sup');
+  const r = await cliJson(
+    ['reconcile', '--run', f.runDir, '--attempt', f.attemptId, '--confirm-no-effects', f.requestId, '--as-supervisor', '--json'],
+    env,
+  );
+  assert.equal(r.code, 11, r.stdout + r.stderr); // launch_unknown — no request id to confirm
+  assert.match((r.body.error as Record<string, unknown>).message as string, /no Orca request id/);
+  assert.equal(orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create').length, 0);
+  assert.equal(readState(f.runDir).participants[0].attempts[0].taskId, null);
 });
 
 test('reconcile refuses non-null-task attempts and missing evidence', async () => {

@@ -41,6 +41,24 @@ package `bin` maps `council` to `dist/src/cli.js` (see `package.json`). All
 commands accept `--json`; agent callers should prefer it. `council help` (or no
 arguments) prints the command list.
 
+### Running it on another project
+
+There is nothing to install or register — no Orca plugin, no MCP server, no
+global writes. From the workspace you want reviewed:
+
+1. Clone and build this repository anywhere (e.g. `npm install && npm run
+   build`), then note the absolute path to `dist/src/cli.js`.
+2. Invoke it by absolute path **from the target workspace** —
+   `node <checkout>/dist/src/cli.js init --objective "..." --json` — because
+   the Orca context comes from the caller's working directory and the run
+   directory is created under that target's `.council/` tree.
+3. Tell the supervising agent to read `<checkout>/skills/council/SKILL.md` by
+   absolute path; it contains the exact command loop it must run.
+
+A `council` command on `PATH` is optional: a user may run `npm link` in this
+checkout themselves if they want one — nothing does it automatically, and no
+Orca skill/plugin registration is required or attempted.
+
 ## The run directory
 
 Every run lives under `<target>/.council/runs/<crun_id>/` (the `.council/` tree
@@ -158,8 +176,14 @@ caller to the persisted council child Run before advancing: `run-current` →
 `run-use --id <run> --from <handle>` → verified `run-current`. This repairs the
 crash case where the child Run stayed bound to a vanished terminal — Orca
 refuses task-create for any caller not bound to that Run. The flag exists only
-for the dedicated supervisor; manual `supervise --advance` never touches your
-Run binding and never displaces a recorded supervisor's identity.
+for the dedicated supervisor. In **manual** mode the CLI never issues
+`run-use` (it never rebinds you to an existing Run) and never displaces a
+recorded supervisor's identity — but it is not binding-neutral in one case:
+when a run has no child Orca Run yet, the first `advance` creates one and the
+host binds **you** to it, displacing whatever Run you were bound to before.
+If you are manually driving a fresh run while bound to another Run, either
+rebind back afterwards (`orca orchestration run-use --id <your-run> --from
+<handle>`) or prefer a dedicated supervisor.
 
 ### `council reconcile` — resolve a persisted no-task launch intent
 
@@ -172,23 +196,39 @@ When a worker's task-create was **definitively refused** (Orca's refusal
 carries an `Orchestration mutation request ID` and states "Nothing changed"),
 the engine persists `intent_recorded` with `taskId/dispatchId/terminalHandle`
 all null and refuses to retry on its own — the durable guard against
-double-launch. `reconcile` is the explicit, evidence-based way through:
+double-launch. `reconcile` is the explicit, evidence-based way through. The
+whole transaction — state read, journal check, binding, request probe,
+task-list, adopt-or-create, persist — runs under the run's file lock, so two
+concurrent reconciles on one attempt can never both create a task: the second
+blocks, re-reads, and refuses on the persisted `taskId`.
 
 1. `--confirm-no-effects` must name the **exact request id** journaled on the
-   recorded `task-create` failure for that attempt (see `council tail`).
+   recorded `task-create` failure for that attempt (see `council tail`). A
+   journaled failure with no request id refuses outright — there is nothing
+   to confirm against.
 2. With `--as-supervisor` the caller is bound to the child Run first (same
    rules as `supervise --advance --as-supervisor`); otherwise your current
    binding is used as-is.
 3. `task-list --full` is inspected for a task carrying this attempt's exact
-   spec (`specs/<attemptId>.md`): a unique match is **adopted**, zero matches
-   permits **exactly one** fresh task-create.
-4. The resolved `taskId` plus a journaled `task.created` event are persisted
+   spec (`specs/<attemptId>.md`): a unique match is **adopted** — safe even
+   when the failure's outcome is uncertain, because adopting an existing task
+   creates nothing.
+4. **Zero matches permits `create` only under a verified definitive refusal**:
+   the journaled refusal text explicitly states no change was applied ("Nothing
+   changed"), carries an explicit `effects: "none"` marker, or the request
+   ledger reports the mutation `refused`/`rejected`. A timeout, connection
+   loss, or any other generic failure — even with a matching request id and
+   confirmation — refuses the create path: such a failure can leave a live
+   task behind. A malformed or incomplete `task-list` receipt (no task array,
+   non-object or unidentifiable rows) also refuses rather than counting as
+   zero tasks.
+5. The resolved `taskId` plus a journaled `task.created` event are persisted
    before any launch; the next `supervise --advance` launches the worker on it.
 
 Any ambiguity refuses rather than guesses: multiple matching tasks, a pending
 or completed-but-absent request, a missing spec artifact, a missing/mismatched
-request id, or an attempt that is not a null-task intent. Nothing is ever
-reset, erased, or retried blindly.
+request id, an unreadable task ledger, or an attempt that is not a null-task
+intent. Nothing is ever reset, erased, or retried blindly.
 
 ### `council approve` — the enforceable gate
 
@@ -305,8 +345,11 @@ e.g. the reduced smoke config is `requestedPerspectives=10`, `participants=2`.
 1. `init` → `start-supervisor` (which runs the pinned
    `devin --model swe-2-max --permission-mode dangerous` lane and records the
    supervisor's dispatch) — or drive `supervise --advance` yourself per wake.
-   Your own Orca Run binding stays untouched; the council lives in a separate
-   child Run the engine creates on the first advance.
+   With a dedicated supervisor your Orca Run binding stays untouched; the
+   council lives in a separate child Run the engine creates on the first
+   advance. If you drive `advance` manually on a run that has no child Run
+   yet, the host binds **you** to the child Run it creates — see the manual
+   mode note under `supervise --advance` above.
 2. Wait for the supervisor's `needs_approval` mail; review
    `roster.proposed.json`; write `roster.approved.json`; run `approve`; then
    send the printed `send --to dispatch:<id>` nudge so the supervisor's next

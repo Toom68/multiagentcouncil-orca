@@ -801,10 +801,38 @@ function journaledRequestIds(event: { payload?: Record<string, unknown> }): stri
   return [...out];
 }
 
-function taskRows(receipt: unknown): Record<string, unknown>[] {
+/**
+ * task-list rows — refuse malformed or incomplete receipts rather than let a
+ * bad read masquerade as "zero matching tasks" and unlock a second create.
+ * A receipt must expose an explicit array; every row must be an object with
+ * at least one identifiable field (id or spec-ish), else the read is treated
+ * as untrusted evidence and reconciliation refuses.
+ */
+function taskRowsStrict(receipt: unknown, runId: string): Record<string, unknown>[] {
   const r = asRec(receipt);
   const list = r?.tasks ?? r?.items ?? (Array.isArray(receipt) ? receipt : undefined);
-  return Array.isArray(list) ? list.filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null) : [];
+  if (!Array.isArray(list)) {
+    fail('launch_unknown', `task-list for Run ${runId} returned no task array — the receipt is malformed or incomplete; reconcile manually`, {
+      details: { adapterCode: 'malformed_task_list' },
+    });
+  }
+  for (const row of list) {
+    if (typeof row !== 'object' || row === null) {
+      fail('launch_unknown', `task-list for Run ${runId} contains a non-object row — refusing to treat the read as reliable`, {
+        details: { adapterCode: 'malformed_task_list' },
+      });
+    }
+    const identifiable = [
+      row.id, row.taskId, row.specFile, row.spec_file, row.specPath, row.spec_path,
+      row.spec, row.title, row.taskTitle, row.task,
+    ].some((v) => v !== undefined && v !== null);
+    if (!identifiable) {
+      fail('launch_unknown', `task-list for Run ${runId} contains a row with no task id or spec fields — refusing to treat the read as reliable`, {
+        details: { adapterCode: 'incomplete_task_list' },
+      });
+    }
+  }
+  return list as Record<string, unknown>[];
 }
 
 /**
@@ -849,13 +877,35 @@ function taskMatchesAttempt(
 }
 
 /**
+ * Is the recorded task-create failure a VERIFIED definitive no-effect
+ * refusal? Only then may a fresh task be created — a timeout, lost
+ * connection, or any generic failure can leave a live task behind, and a
+ * request id plus operator confirmation alone does not disprove that.
+ * Definitive means: the journaled refusal text explicitly states no change
+ * was applied (the host's "Nothing changed" guarantee), an explicit
+ * effects:'none' marker, or a structured refused/rejected request state.
+ */
+function isDefinitiveRefusal(failure: { payload?: Record<string, unknown> }, requestState: string): boolean {
+  const p = failure.payload ?? {};
+  const d = asRec(p.data);
+  const texts = [p.message, d?.message, p.error].filter((x): x is string => typeof x === 'string');
+  if (texts.some((t) => /nothing changed/i.test(t))) return true;
+  const effects = firstStr(p.effects, d?.effects);
+  if (effects !== undefined && /^(none|no[-_]?effects)$/i.test(effects)) return true;
+  return ['refused', 'rejected', 'no_effects'].includes(requestState);
+}
+
+/**
  * Reconcile a persisted launch intent whose task-create was definitively
  * refused (the "no-task intent" case: intent_recorded, every host id null,
  * engine refusing to retry on its own). Explicit operator confirmation
  * names the Orca request id of the recorded refusal; the host task list is
  * then inspected for a task carrying this attempt's exact spec — a unique
- * match is adopted, no match permits exactly one fresh task-create. Any
- * ambiguity, unresolved operation, or present dispatch refuses: never
+ * match is adopted, and a fresh task-create is allowed ONLY under a verified
+ * definitive refusal. The whole read/probe/list/resolve/persist transaction
+ * runs inside the store's run lock so a second concurrent reconcile blocks,
+ * re-reads state, and sees the persisted taskId — never two task-creates.
+ * Any ambiguity, unresolved operation, or present dispatch refuses: never
  * launch twice, never blind-retry.
  */
 async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
@@ -871,7 +921,44 @@ async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<
   const dedicated = v['as-supervisor'] === true;
 
   const { store } = makeEngine(runDir);
-  const state = await loadRun(store);
+  // Serialize the ENTIRE transaction under the run lock. Inner store calls
+  // (loadState/readJournal/readArtifact/saveState/appendJournal) run directly
+  // inside this lock session — withLock is not reentrant, so nothing below
+  // may call it again. CliError is caught into a Result so its specific code
+  // survives (a thrown one would be flattened to io_error).
+  const txn = await store.withLock(
+    async (): Promise<Result<{ payload: Record<string, unknown>; human: string }>> => {
+      try {
+        return { ok: true, value: await reconcileUnderLock(store, runDir, attemptId, confirm, dedicated) };
+      } catch (e) {
+        if (e instanceof CliError) return { ok: false, error: e.error };
+        return {
+          ok: false,
+          error: err('io_error', `reconcile failed unexpectedly: ${e instanceof Error ? e.message : String(e)}`),
+        };
+      }
+    },
+  );
+  return unwrap(txn);
+}
+
+async function reconcileUnderLock(
+  store: Store,
+  runDir: string,
+  attemptId: string,
+  confirm: string,
+  dedicated: boolean,
+): Promise<{ payload: Record<string, unknown>; human: string }> {
+  const st = await store.loadState();
+  if (!st.ok) {
+    if (st.error.code === 'io_error') {
+      fail('io_error', `run directory unreadable or not initialized: ${store.runDir}`, {
+        details: st.error.details,
+      });
+    }
+    throw new CliError(st.error);
+  }
+  const state = st.value;
   if (state.orcaRunId === null) {
     fail('invalid_transition', 'no Orca Run is recorded for this council run — there is nothing to reconcile against');
   }
@@ -971,7 +1058,8 @@ async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<
     // refuse rather than risk a second task for the same intent.
     throw new CliError(listed.error);
   }
-  const matches = taskRows(listed.value).filter((row) =>
+  const rows = taskRowsStrict(listed.value, orcaRunId);
+  const matches = rows.filter((row) =>
     taskMatchesAttempt(row, {
       specRel,
       specAbsNorm,
@@ -1008,8 +1096,17 @@ async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<
       `request ${confirm} is recorded completed but no host task matches ${attemptId} — investigate before any retry`,
       { details: { attemptId, requestId: confirm } },
     );
+  } else if (!isDefinitiveRefusal(failureEvent, requestState)) {
+    // A uuid + operator confirmation + empty list is NOT proof of no-effects:
+    // a timed-out or otherwise generic failure may have left a live task.
+    // Adoption above stays allowed; creation needs the definitive refusal.
+    fail(
+      'launch_unknown',
+      `the recorded task-create failure for ${attemptId} is not a verified definitive no-effect refusal (request ${confirm}, state '${requestState}') — a timed-out or generic failure may have created a task anyway; inspect the request ledger and \`task-list --run ${orcaRunId} --full\` manually, or adopt a matching task`,
+      { details: { attemptId, requestId: confirm, requestState } },
+    );
   } else {
-    // Confirmed no-effects + zero matching tasks: exactly one fresh task.
+    // Verified definitive refusal + zero matching tasks: exactly one fresh task.
     const created = await lazyHost().createTask({
       runId: orcaRunId,
       specFilePath: resolve(runDir, specRel),
@@ -1042,34 +1139,34 @@ async function cmdReconcile(argv: readonly string[]): Promise<{ payload: Record<
   }
 
   // Persist the real task id before any launch: the engine's null-task guard
-  // is bypassed only by this journaled reconciliation, never erased.
+  // is bypassed only by this journaled reconciliation, never erased. Already
+  // inside the run lock — re-check the attempt is still the null-task intent
+  // in case anything raced the outer reads.
+  const st2 = await store.loadState();
+  if (!st2.ok) throw new CliError(st2.error);
+  const cur = st2.value.participants
+    .find((pp) => pp.participantId === p.participantId)
+    ?.attempts.find((a) => a.attemptId === attemptId);
+  if (cur === undefined || cur.status !== 'intent_recorded' || cur.taskId !== null) {
+    fail(
+      'invalid_transition',
+      `attempt ${attemptId} changed during reconciliation — aborting; re-inspect before retry`,
+      { details: { attemptId } },
+    );
+  }
+  cur.taskId = taskId;
+  unwrap(await store.saveState(st2.value));
   unwrap(
-    await store.withLock(async () => {
-      const st = await store.loadState();
-      if (!st.ok) return st;
-      const cur = st.value.participants
-        .find((pp) => pp.participantId === p.participantId)
-        ?.attempts.find((a) => a.attemptId === attemptId);
-      if (cur === undefined || cur.status !== 'intent_recorded' || cur.taskId !== null) {
-        return {
-          ok: false as const,
-          error: err('invalid_transition', `attempt ${attemptId} changed during reconciliation — aborting; re-inspect before retry`),
-        };
-      }
-      cur.taskId = taskId;
-      const w = await store.saveState(st.value);
-      if (!w.ok) return w;
-      return store.appendJournal([
-        {
-          ts: new Date().toISOString(),
-          type: 'task.created',
-          actor: 'engine',
-          phase: attempt.phase,
-          participantId: p.participantId,
-          payload: { attemptId, taskId, scope: 'task', reconciled: resolution, confirmedRequestId: confirm },
-        },
-      ]);
-    }),
+    await store.appendJournal([
+      {
+        ts: new Date().toISOString(),
+        type: 'task.created',
+        actor: 'engine',
+        phase: attempt.phase,
+        participantId: p.participantId,
+        payload: { attemptId, taskId, scope: 'task', reconciled: resolution, confirmedRequestId: confirm },
+      },
+    ]),
   );
 
   const advance = `council supervise --run ${cmdToken(runDir)} --advance --as-supervisor --json`;

@@ -22,20 +22,27 @@ Commands below use two placeholders:
 
 - `ORCA` — the Orca executable for this session, resolved per the `orchestration`
   skill (`ORCA_CLI_COMMAND` → `orca-dev` in dev checkouts → `orca` on Windows).
-- `COUNCIL` — the built CLI: `node dist/src/cli.js` in this checkout
-  (`npm install && npm run build`; the package's `bin` maps `council` to
-  `dist/src/cli.js`).
+- `COUNCIL` — the built CLI: `node <checkout>/dist/src/cli.js`, invoked by
+  absolute path (`npm install && npm run build` in the checkout first; the
+  package's `bin` maps `council` to `dist/src/cli.js`). Run every `council`
+  command **from the workspace being reviewed** — the Orca context comes from
+  the caller's working directory, and the run directory is created under that
+  target's `.council/`. Nothing is installed or registered: no plugin, no MCP
+  server, no global writes (a user may `npm link` manually if they want a
+  `council` command on PATH — nothing does it for them).
 
 ## Ground rules (read first)
 
 - **Preserve your Run binding.** Record it once and always pass `--run` explicitly
   to orchestration commands you issue yourself. The council runs inside a
   separate child Run created by the `council` CLI's host adapter on the first
-  `supervise --advance` (under whichever agent drives it — the supervisor
-  worker, or you in manual mode), so your own Run is never touched — and you
-  never run `run-create`/`run-use` for the council yourself. Re-run
-  `run-current` after launching the supervisor to confirm your binding is
-  unchanged.
+  `supervise --advance`, and you never run `run-create`/`run-use` for the
+  council yourself. With a dedicated supervisor your own binding is never
+  touched — re-run `run-current` after launching it to confirm. In **manual**
+  mode (you drive `advance` yourself) the CLI still never issues `run-use`,
+  but on a run with no child Run yet the first `advance` creates one and the
+  host binds **you** to it — that displaces your prior binding; restore it
+  with Step 0's `run-use` afterwards.
 - **Only an agent consumes its own mail.** Plain `check`/`--ack` on a mailbox
   marks mail handled and hides it from the agent that owns it. The `council`
   CLI's host adapter never runs `check` or `--ack` at all — observation is via
@@ -150,7 +157,9 @@ repair path for a restarted supervisor whose child Run stayed bound to a
 crashed terminal (Orca refuses task-create for any unbound caller). The
 generated spec's command is fixed: the worker must run it verbatim, never
 edit, append to, or interpolate it. Manual `advance` (Step "Manual driving")
-never rebinds and never displaces the recorded supervisor.
+never issues `run-use` and never displaces the recorded supervisor — but on a
+run with no child Run yet, the first manual `advance` creates it and the host
+binds you to it (see Ground rules).
 
 ## Step 4 — approval gate (the only gate that matters)
 
@@ -260,13 +269,21 @@ COUNCIL reconcile --run <runDir> --attempt <attemptId> \
   --confirm-no-effects <requestId> [--as-supervisor] --json
 ```
 
-It verifies the journaled refusal carries that exact request id, scans
-`task-list --full` for a task carrying this attempt's exact spec (adopt a
-unique match; create exactly one task when none exists under confirmed
-no-effects), then persists `taskId` + `task.created` — the next `advance`
-launches on it. Multiple matches, a pending request, a missing/mismatched
-request id, or a non-null-task attempt all refuse with actionable errors.
-Find `attemptId`/`requestId` via `COUNCIL tail --run <runDir>` or `status`.
+The whole transaction runs under the run's file lock — a concurrent
+`reconcile` on the same attempt blocks and then refuses on the persisted
+`taskId`, never a second task-create. It verifies the journaled refusal
+carries that exact request id, scans `task-list --full` for a task carrying
+this attempt's exact spec (adopt a unique match), then persists `taskId` +
+`task.created` — the next `advance` launches on it. **Create happens only
+under a verified definitive refusal**: the journaled refusal says "Nothing
+changed", carries an explicit no-effects marker, or the request ledger
+reports `refused`/`rejected`. A timeout, lost connection, or other generic
+failure — even with a matching request id — refuses the create path; so do
+multiple matches, a pending request, a malformed `task-list`, a
+missing/mismatched request id, or a non-null-task attempt. Adoption of a
+unique existing match stays allowed under an uncertain failure — adopting
+creates nothing. Find `attemptId`/`requestId` via `COUNCIL tail --run
+<runDir>` or `status`.
 
 ## Manual driving (no supervisor worker)
 
@@ -276,6 +293,9 @@ end your turn when it reaches `wait`, `needs_approval`, `finished`, or
 `blocked`. Run `approve`/`cancel` as above — and after `approve`, the next
 `advance` you run IS the wake; no mail nudge is needed because you are the
 supervisor. The same ground rules apply: no poll loops, your own mailbox only.
+Binding caveat, repeated from the ground rules: manual mode never runs
+`run-use`, but the first `advance` on a run with no child Run yet creates it
+and binds you to it — restore your prior binding afterwards if you had one.
 
 ## Honest boundaries (do not over-promise)
 
@@ -289,8 +309,10 @@ supervisor. The same ground rules apply: no poll loops, your own mailbox only.
   config; all permission posture is chosen explicitly per launch and recorded in
   the approval.
 - Live validation status: module and acceptance tests pass; the reduced live
-  smoke (10 perspectives / 2 reviewers) is **pending** — a settlement-detection
-  stall in the host adapter is under repair (docs/ORCA-COMPATIBILITY.md §7).
-  Do not claim an end-to-end live run until it records real receipts.
+  smoke (10 perspectives / 2 reviewers) is **pending** — the supervisor-recovery
+  path (child-Run rebind + one task reconciliation) was exercised live against
+  a real crashed-supervisor run, but no end-to-end run has finished yet
+  (docs/ORCA-COMPATIBILITY.md §7). Do not claim an end-to-end live run until
+  it records real receipts.
 - `council` commands here are the implemented CLI; `docs/USAGE.md` is the
   authoritative reference (flags, artifact paths, config keys).
