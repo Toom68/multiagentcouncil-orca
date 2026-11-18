@@ -492,8 +492,8 @@ async function responsesFor(env: Env, pid: string, round: number, disposition: s
   };
 }
 
-/** Complete every launched worker with appropriate valid output, then advance until non-progress. */
-async function drive(env: Env): Promise<AdvanceResult> {
+/** Complete every launched worker with appropriate valid output, then advance until non-progress (or `stop`). */
+async function drive(env: Env, stop?: () => boolean): Promise<AdvanceResult> {
   for (let guard = 0; guard < 400; guard++) {
     for (const l of env.host.launches) {
       const d = l.result.dispatchId;
@@ -516,6 +516,7 @@ async function drive(env: Env): Promise<AdvanceResult> {
     }
     const r = await env.engine.advance();
     assert.ok(r.ok, `advance failed: ${r.ok ? '' : JSON.stringify(r.error)}`);
+    if (stop?.()) return r.value;
     if (r.value.action !== 'progress') return r.value;
   }
   throw new Error('drive guard exhausted — engine did not settle');
@@ -1124,4 +1125,85 @@ test('envelope byte cap drops whole entries and logs omissions', async () => {
     assert.ok(Buffer.byteLength(env.db.artifacts.get(k)!, 'utf8') <= 1400, `${k} exceeds envelope cap`);
     assert.ok(parseChallengeEnvelope(parsed, { runId: RUN, round: 1 }).ok, `${k} malformed`);
   }
+});
+
+// ─── Timed-out workers keep their slot ──────────────────────────────────────
+
+test('timed-out worker keeps its slot: next phase waits, stop requested once, slot frees on settle', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, concurrency: 1 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+
+  // Concurrency 1: the first advance launches only the first seat.
+  await env.engine.advance();
+  const indep = () => env.host.launches.filter((l) => l.spec.phase === 'independent_review');
+  assert.equal(indep().length, 1, 'concurrency 1 launches one reviewer at a time');
+
+  // Seat 1 finishes with valid findings; its freed slot goes to seat 2.
+  const l1 = indep()[0];
+  const p1 = env.db.state.participants.find((p) => p.participantId === l1.spec.participantId)!;
+  await env.store.writeArtifact(outPaths.findings(p1.participantId), JSON.stringify(mkFindings(p1.participantId, p1.perspectiveId!)));
+  env.host.settle(l1.result.dispatchId!);
+  await env.engine.advance();
+  assert.equal(indep().length, 2, 'seat 2 launches once seat 1 settles');
+  const disp2 = indep()[1].result.dispatchId!;
+
+  // Seat 2 keeps running; the host refuses our stop. Jump past the deadline.
+  env.host.stopImpl = () => ok({ outcome: 'refused' });
+  env.clock.t += env.db.state.config.deadlines.independentMs + env.db.state.config.deadlines.graceMs + 1;
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok, JSON.stringify(r1));
+  const seat2 = env.db.state.participants.find((p) => p.participantId === indep()[1].spec.participantId)!;
+  assert.equal(seat2.attempts.at(-1)!.status, 'timed_out');
+  // A best-effort stop was requested exactly once and journaled honestly.
+  assert.deepEqual(env.host.stops.map((s) => s.dispatchId), [disp2]);
+  const stopEvs = env.db.journal.filter((e) => e.type === 'worker.stop_requested');
+  assert.equal(stopEvs.length, 1);
+  assert.equal(stopEvs[0].payload?.outcome, 'refused');
+  assert.equal(env.db.state.status, 'scribe_notes', 'phase closes on seat 1 findings');
+
+  // The timed-out seat still holds the only slot: the scribe must NOT launch.
+  const launchesBefore = env.host.launches.length;
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok && r2.value.action === 'wait', JSON.stringify(r2));
+  assert.equal(env.host.launches.length, launchesBefore, 'no launch while a timed-out worker may still run');
+  const scribe = env.db.state.participants.find((p) => p.participantId === 'scribe')!;
+  assert.equal(scribe.attempts.at(-1)!.status, 'planned');
+  // A second advance still waits — and does NOT issue a duplicate stop request.
+  const r3 = await env.engine.advance();
+  assert.ok(r3.ok && r3.value.action === 'wait');
+  assert.equal(env.host.stops.length, 1, 'no duplicate stop request');
+
+  // Proof of death frees the slot: seat 2 finishes → the scribe launches.
+  env.host.settle(disp2);
+  const r4 = await env.engine.advance();
+  assert.ok(r4.ok && r4.value.action === 'progress');
+  assert.equal(env.host.launches.at(-1)!.spec.phase, 'scribe_notes');
+});
+
+// ─── Drift before finalization ──────────────────────────────────────────────
+
+test('drift injected after the last launch is journaled and marked on the emitted report', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }), {
+    liveSource: { 'src/app.js': 'original' },
+  });
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Drive until the run's last launch (scribe synthesis) is dispatched.
+  await drive(env, () => env.host.launches.some((l) => l.spec.phase === 'scribe_synthesis'));
+  assert.ok(env.host.launches.some((l) => l.spec.phase === 'scribe_synthesis'), 'synthesis launched');
+  // A pinned source file changes now — after the run's last launch; only the
+  // pre-report check can see it.
+  env.db.liveSource['src/app.js'] = 'mutated after approval';
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal(r.outcome, 'succeeded', 'drift alone must not fail the run');
+  assert.equal(env.db.state.status, 'reported');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'snapshot.drift' && e.payload?.scope === 'pre-report'),
+    'pre-report snapshot.drift event',
+  );
+  const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
+  assert.equal(report.coverage.partial, true, 'drifted report is visibly partial');
+  assert.ok(report.limitations.some((l) => /drift/i.test(l)), 'drift noted in report limitations');
 });

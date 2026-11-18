@@ -118,6 +118,13 @@ const paths = {
 
 const TERMINAL_ATTEMPT = new Set(['settled_ok', 'settled_failed', 'timed_out', 'stopped']);
 const ACTIVE_ATTEMPT = new Set(['dispatched', 'working', 'unknown']);
+/**
+ * Attempts whose worker may physically still be running — or whose launch
+ * outcome was never disproven. Each holds a concurrency slot until
+ * observation or a confirmed stop proves it settled/dead. `timed_out`
+ * stays here: a deadline mark is not proof of death.
+ */
+const SLOT_HOLDING_ATTEMPT = new Set(['intent_recorded', 'dispatched', 'working', 'unknown', 'timed_out']);
 
 const ok = <T>(value: T): Result<T> => ({ ok: true, value });
 const failRes = (error: CouncilError): Result<never> => ({ ok: false, error });
@@ -137,6 +144,8 @@ interface StepCtx {
   taskCreateFailed: Set<AttemptId>;
   /** True when a prior run-create intent exists without a recorded success. */
   runCreateUnresolved: boolean;
+  /** Attempt ids with a stop already requested (journal-derived, durable). */
+  stopRequestedAttempts: Set<AttemptId>;
   /** Perspective catalog from the admitted proposal (reviewer spec inputs). */
   perspectives?: Map<string, Perspective>;
   /** Admitted findings paths handed to the scribe-notes prompt. */
@@ -252,8 +261,14 @@ export function createEngine(deps: EngineDeps): Engine {
     return attempt;
   };
 
-  const activeAttempts = (state: CouncilState): PhaseAttempt[] =>
-    state.participants.flatMap((p) => p.attempts.filter((a) => ACTIVE_ATTEMPT.has(a.status)));
+  /**
+   * Attempts occupying a concurrency slot: any whose worker might still be
+   * physically running (dispatched/working/timed_out) or whose launch was
+   * never disproven (intent_recorded/unknown). A slot is released only when
+   * observation or a confirmed stop proves the worker settled/dead.
+   */
+  const slotHoldingAttempts = (state: CouncilState): PhaseAttempt[] =>
+    state.participants.flatMap((p) => p.attempts.filter((a) => SLOT_HOLDING_ATTEMPT.has(a.status)));
 
   const expectedOutputPath = (attempt: PhaseAttempt): string => {
     const pid = attempt.participantId;
@@ -275,11 +290,16 @@ export function createEngine(deps: EngineDeps): Engine {
 
   // ── Observation ────────────────────────────────────────────────────────────
 
-  /** Observe every launched attempt once; updates attempt status in place. */
+  /**
+   * Observe every launched attempt once; updates attempt status in place.
+   * Timed-out attempts keep being observed: their workers may still be
+   * running, and a proven finish is what releases their concurrency slot.
+   */
   const reconcileAttempts = async (ctx: StepCtx): Promise<void> => {
     for (const p of ctx.state.participants) {
       for (const attempt of p.attempts) {
-        if (!ACTIVE_ATTEMPT.has(attempt.status) || attempt.dispatchId === null) continue;
+        const observable = ACTIVE_ATTEMPT.has(attempt.status) || attempt.status === 'timed_out';
+        if (!observable || attempt.dispatchId === null) continue;
         const obs = await host.observeWorker({ dispatchId: attempt.dispatchId });
         if (!obs.ok) {
           emit(ctx, 'mail.observed', {
@@ -304,7 +324,17 @@ export function createEngine(deps: EngineDeps): Engine {
           }, { participantId: p.participantId, phase: attempt.phase, ...(attempt.round !== null ? { round: attempt.round } : {}) });
           if (attempt.status === 'settled_failed') p.status = 'failed';
         } else if (o.liveness === 'working' || o.liveness === 'waiting_human') {
-          if (attempt.status !== 'working') {
+          if (attempt.status === 'timed_out') {
+            // Past-deadline worker confirmed alive — keep the timed_out mark
+            // and the held slot; the observation itself is the evidence.
+            emit(ctx, 'mail.observed', {
+              attemptId: attempt.attemptId,
+              dispatchId: attempt.dispatchId,
+              observation: 'alive',
+              liveness: o.liveness,
+              detail: 'worker still running past phase deadline — slot held',
+            }, { participantId: p.participantId, phase: attempt.phase });
+          } else if (attempt.status !== 'working') {
             attempt.status = 'working';
             emit(ctx, 'worker.started', {
               attemptId: attempt.attemptId,
@@ -349,14 +379,58 @@ export function createEngine(deps: EngineDeps): Engine {
     }
   };
 
-  /** Mark overdue active attempts timed_out; returns true when the run died. */
-  const enforceDeadlines = (ctx: StepCtx): boolean => {
+  /**
+   * Best-effort stop for an attempt whose worker may still be running. The
+   * request is journaled with its honest outcome — a confirmed stop upgrades
+   * the attempt to 'stopped' and frees its slot; anything less leaves the
+   * status untouched and the slot held. One request per attempt per run
+   * (durable via the journal), never claimed as proof unless confirmed.
+   */
+  const requestDeadlineStop = async (
+    ctx: StepCtx,
+    p: Participant,
+    a: PhaseAttempt,
+    scope: 'run' | 'phase',
+  ): Promise<void> => {
+    if (a.dispatchId === null || ctx.stopRequestedAttempts.has(a.attemptId)) return;
+    ctx.stopRequestedAttempts.add(a.attemptId);
+    const r = await host.requestStop({ dispatchId: a.dispatchId, reason: `${scope} deadline exceeded` });
+    const outcome = r.ok ? r.value.outcome : 'error';
+    emit(ctx, 'worker.stop_requested', {
+      attemptId: a.attemptId,
+      dispatchId: a.dispatchId,
+      outcome,
+      scope: `${scope}_deadline`,
+      note: 'best-effort stop after deadline — not claimed proof of exit',
+      ...(r.ok ? {} : { error: r.error.message }),
+    }, { participantId: p.participantId, phase: a.phase });
+    if (outcome === 'stopped') {
+      a.status = 'stopped';
+      a.settledAt = ctx.now.toISOString();
+      emit(ctx, 'worker.stopped', { attemptId: a.attemptId, dispatchId: a.dispatchId },
+        { participantId: p.participantId, phase: a.phase });
+    }
+  };
+
+  /** Mark overdue work timed_out and stop it best-effort; true on run death. */
+  const enforceDeadlines = async (ctx: StepCtx): Promise<boolean> => {
     const { state } = ctx;
     const elapsedRun = ctx.now.getTime() - Date.parse(state.createdAt);
     if (elapsedRun > state.config.deadlines.runMs) {
-      for (const a of activeAttempts(state)) {
-        a.status = 'timed_out';
-        a.settledAt = ctx.now.toISOString();
+      for (const p of state.participants) {
+        for (const a of p.attempts) {
+          if (a.status === 'dispatched' || a.status === 'working') {
+            a.status = 'timed_out';
+            a.settledAt = ctx.now.toISOString();
+            await requestDeadlineStop(ctx, p, a, 'run');
+          } else if (a.status === 'unknown') {
+            // Launch outcome never resolved — keep 'unknown', ask for a stop.
+            await requestDeadlineStop(ctx, p, a, 'run');
+          } else if (a.status === 'planned' || a.status === 'intent_recorded') {
+            a.status = 'timed_out';
+            a.settledAt = ctx.now.toISOString();
+          }
+        }
       }
       state.status = 'failed';
       emit(ctx, 'deadline.hit', { scope: 'run', elapsedMs: elapsedRun });
@@ -370,12 +444,7 @@ export function createEngine(deps: EngineDeps): Engine {
     let hit = false;
     for (const p of state.participants) {
       for (const a of p.attempts) {
-        if (
-          a.status === 'dispatched' ||
-          a.status === 'working' ||
-          a.status === 'planned' ||
-          a.status === 'intent_recorded'
-        ) {
+        if (a.status === 'dispatched' || a.status === 'working') {
           a.status = 'timed_out';
           a.settledAt = ctx.now.toISOString();
           p.status = 'timed_out';
@@ -384,6 +453,22 @@ export function createEngine(deps: EngineDeps): Engine {
             dispatchId: a.dispatchId,
             elapsedMs: elapsed,
           }, { participantId: p.participantId, phase: a.phase });
+          await requestDeadlineStop(ctx, p, a, 'phase');
+          hit = true;
+        } else if (a.status === 'planned' || a.status === 'intent_recorded') {
+          a.status = 'timed_out';
+          a.settledAt = ctx.now.toISOString();
+          p.status = 'timed_out';
+          emit(ctx, 'worker.timed_out', {
+            attemptId: a.attemptId,
+            dispatchId: a.dispatchId,
+            elapsedMs: elapsed,
+          }, { participantId: p.participantId, phase: a.phase });
+          hit = true;
+        } else if (a.status === 'unknown' && a.dispatchId !== null) {
+          // Outcome still unresolved: request an honest stop; the attempt
+          // stays 'unknown' (slot held) unless the host confirms the stop.
+          await requestDeadlineStop(ctx, p, a, 'phase');
           hit = true;
         }
       }
@@ -562,7 +647,7 @@ export function createEngine(deps: EngineDeps): Engine {
   };
 
   interface LaunchOutcome {
-    kind: 'launched' | 'failed' | 'unknown' | 'task_error' | 'budget' | 'approval';
+    kind: 'launched' | 'failed' | 'unknown' | 'task_error' | 'budget' | 'approval' | 'concurrency';
     error?: CouncilError;
     note?: string;
   }
@@ -589,6 +674,18 @@ export function createEngine(deps: EngineDeps): Engine {
     if (attempt.phase !== 'organiser') {
       const ap = await revalidateApproval(ctx);
       if (!ap.ok) return { kind: 'approval', error: ap.error };
+    }
+    // Concurrency: every attempt whose worker may still be alive holds a
+    // slot — dispatched/working, timed_out (deadline is not proof of death),
+    // and launch-outcome-unknown alike. A 'planned' attempt launching for the
+    // first time must wait for a slot; an 'intent_recorded' resume already
+    // notionally holds one and proceeds so the launch can be resolved.
+    if (
+      attempt.status === 'planned' &&
+      slotHoldingAttempts(state).filter((a) => a.attemptId !== attempt.attemptId).length >=
+        state.config.concurrency
+    ) {
+      return { kind: 'concurrency' };
     }
     const reuseAllowed =
       !opts.isFreshFallback &&
@@ -1005,6 +1102,9 @@ export function createEngine(deps: EngineDeps): Engine {
     if (lo.kind === 'budget') {
       return blocked(ctx.state.status, lo.error?.message ?? 'launch budget exceeded');
     }
+    if (lo.kind === 'concurrency') {
+      return advanceResult('wait', ctx.state.status, 'concurrency slots held by unresolved workers');
+    }
     if (lo.kind === 'approval') {
       const stale = lo.error?.code === 'approval_stale' || lo.error?.code === 'snapshot_drift';
       return stale
@@ -1052,7 +1152,7 @@ export function createEngine(deps: EngineDeps): Engine {
     if (p === undefined) return { kind: 'error', error: err('invalid_transition', 'organiser participant missing') };
     const attempt = attemptsFor(p, 'organiser', null).at(-1)!;
     await reconcileAttempts(ctx);
-    if (enforceDeadlines(ctx)) {
+    if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
     }
     const adm = await admitPhaseOutputs(ctx);
@@ -1067,6 +1167,7 @@ export function createEngine(deps: EngineDeps): Engine {
         const lo = await launchAttempt(ctx, p, attempt);
         if (lo.kind === 'launched') return advanceResult('progress', state.status, 'organiser launched');
         if (lo.kind === 'failed') return blocked(state.status, `organiser launch failed; cancel the run or reconcile`);
+        if (lo.kind === 'concurrency') return advanceResult('wait', state.status, 'concurrency slots held by unresolved workers');
         return launchErrorResult(ctx, lo);
       }
       case 'dispatched':
@@ -1094,14 +1195,13 @@ export function createEngine(deps: EngineDeps): Engine {
     let launched = 0;
     for (const { p, attempt } of due) {
       if (attempt.status !== 'planned' && attempt.status !== 'intent_recorded') continue;
-      const active = activeAttempts(ctx.state).length;
-      if (active >= ctx.state.config.concurrency) break;
       const lo = await launchAttempt(ctx, p, attempt);
       if (lo.kind === 'launched') {
         launched += 1;
         continue;
       }
       if (lo.kind === 'failed') continue; // seat marked failed; keep launching others
+      if (lo.kind === 'concurrency') break; // slots held by unresolved workers — retry next advance
       return { error: launchErrorResult(ctx, lo) };
     }
     return { launched };
@@ -1110,7 +1210,7 @@ export function createEngine(deps: EngineDeps): Engine {
   const stepIndependent = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
     await reconcileAttempts(ctx);
-    if (enforceDeadlines(ctx)) {
+    if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
     }
     const adm = await admitPhaseOutputs(ctx);
@@ -1192,7 +1292,7 @@ export function createEngine(deps: EngineDeps): Engine {
   const stepScribeNotes = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
     await reconcileAttempts(ctx);
-    if (enforceDeadlines(ctx)) {
+    if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
     }
     const adm = await admitPhaseOutputs(ctx);
@@ -1207,6 +1307,7 @@ export function createEngine(deps: EngineDeps): Engine {
       const lo = await launchAttempt(ctx, p, attempt);
       if (lo.kind === 'launched') return advanceResult('progress', state.status, 'scribe notes launched');
       if (lo.kind === 'failed') return blocked(state.status, 'scribe notes launch failed; reconcile');
+      if (lo.kind === 'concurrency') return advanceResult('wait', state.status, 'concurrency slots held by unresolved workers — scribe notes deferred');
       return launchErrorResult(ctx, lo);
     }
     if (ACTIVE_ATTEMPT.has(attempt.status)) {
@@ -1297,7 +1398,7 @@ export function createEngine(deps: EngineDeps): Engine {
     if (cursor === null) return { kind: 'error', error: err('invalid_transition', 'discussing without cursor') };
     const phase: PhaseKind = cursor.stage === 'challenges' ? 'challenge' : 'author_response';
     await reconcileAttempts(ctx);
-    if (enforceDeadlines(ctx)) {
+    if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
     }
     const adm = await admitPhaseOutputs(ctx);
@@ -1486,7 +1587,7 @@ export function createEngine(deps: EngineDeps): Engine {
   const stepSynthesising = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
     await reconcileAttempts(ctx);
-    if (enforceDeadlines(ctx)) {
+    if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
     }
     const adm = await admitPhaseOutputs(ctx);
@@ -1499,6 +1600,7 @@ export function createEngine(deps: EngineDeps): Engine {
       const lo = await launchAttempt(ctx, p, attempt);
       if (lo.kind === 'launched') return advanceResult('progress', state.status, 'scribe synthesis launched');
       if (lo.kind === 'failed') return blocked(state.status, 'scribe synthesis launch failed; reconcile');
+      if (lo.kind === 'concurrency') return advanceResult('wait', state.status, 'concurrency slots held by unresolved workers — scribe synthesis deferred');
       return launchErrorResult(ctx, lo);
     }
     if (ACTIVE_ATTEMPT.has(attempt.status)) {
@@ -1571,6 +1673,49 @@ export function createEngine(deps: EngineDeps): Engine {
         error: err('invalid_transition', 'cannot finalize: roster or ledger artifacts missing'),
       };
     }
+
+    // Final drift check — detect, never claim prevention. Approval/snapshot
+    // revalidation gates launches only; the tree may have drifted since the
+    // synthesis launch. The run still closes and the report is still written,
+    // but the drift is journaled and marked visibly in the emitted report.
+    const runnerLims = await runnerLimitations(ctx);
+    let driftBlocksFullCoverage = false;
+    const drift = await store.verifySourceSnapshot();
+    if (!drift.ok) {
+      emit(ctx, 'snapshot.drift', {
+        scope: 'pre-report',
+        verifiable: false,
+        error: drift.error.message,
+      });
+      runnerLims.push(
+        `source snapshot verification failed before report (${drift.error.message}) — drift status unverifiable; coverage marked partial`,
+      );
+      driftBlocksFullCoverage = true;
+    } else if (drift.value.drift) {
+      const snapR = ctx.snapshot !== undefined ? { ok: true as const, value: ctx.snapshot } : await store.readSnapshot();
+      const pinned = new Set(Object.keys(snapR.ok ? snapR.value.files : {}));
+      const manifestChanged = drift.value.changed.filter((p) => pinned.has(p));
+      const added = drift.value.changed.filter((p) => !pinned.has(p));
+      emit(ctx, 'snapshot.drift', {
+        scope: 'pre-report',
+        changed: drift.value.changed,
+        manifestChanged,
+        added,
+        blocking: false,
+      });
+      if (manifestChanged.length > 0) {
+        driftBlocksFullCoverage = true;
+        runnerLims.push(
+          `source drift after approval: ${manifestChanged.length} pinned file(s) changed/removed (${manifestChanged.slice(0, 10).join(', ')}) — report reflects the approved snapshot, not the live tree`,
+        );
+      }
+      if (added.length > 0) {
+        runnerLims.push(
+          `${added.length} file(s) added to the reviewed tree after the approved snapshot — outside the reviewed corpus`,
+        );
+      }
+    }
+
     // Scribe narrative only — its claims/coverage are never trusted.
     let scribe: ScribeNarrative | undefined;
     const rawReport = await readJson(paths.scribeReportJson);
@@ -1589,8 +1734,11 @@ export function createEngine(deps: EngineDeps): Engine {
       participants: state.participants,
       ledger,
       scribe,
-      runnerLimitations: await runnerLimitations(ctx),
+      runnerLimitations: runnerLims,
     });
+    // Drift detected after approval means the emitted report cannot claim
+    // full coverage of the reviewed corpus — mark it visibly partial.
+    if (driftBlocksFullCoverage) report.coverage.partial = true;
     const writes: [string, string][] = [
       [paths.reportJson, JSON.stringify(report, null, 2)],
       [paths.reportMd, renderReportMarkdown(report)],
@@ -1657,6 +1805,7 @@ export function createEngine(deps: EngineDeps): Engine {
       rejectedAttempts: new Set(),
       taskCreateFailed: new Set(),
       runCreateUnresolved: false,
+      stopRequestedAttempts: new Set(),
     };
     const journal = await store.readJournal();
     if (journal.ok) {
@@ -1669,6 +1818,9 @@ export function createEngine(deps: EngineDeps): Engine {
         }
         if (e.type === 'error' && e.payload?.op === 'task-create' && typeof e.payload?.attemptId === 'string') {
           ctx.taskCreateFailed.add(e.payload.attemptId);
+        }
+        if (e.type === 'worker.stop_requested' && typeof e.payload?.attemptId === 'string') {
+          ctx.stopRequestedAttempts.add(e.payload.attemptId);
         }
       }
       if (runOk) ctx.runCreateUnresolved = false;
@@ -1859,8 +2011,10 @@ export function createEngine(deps: EngineDeps): Engine {
           pending.push(
             `reconcile unknown outcome for ${a.participantId}/${a.phase} dispatch ${a.dispatchId ?? 'none'} requestId ${a.requestId ?? 'none'} — never relaunch`,
           );
-        }
-        if (state.status === 'cancelled' && (a.status === 'dispatched' || a.status === 'working')) {
+        } else if (
+          state.status === 'cancelled' &&
+          (a.status === 'dispatched' || a.status === 'working' || a.status === 'timed_out')
+        ) {
           pending.push(`dispatch ${a.dispatchId} may still be running; stop was refused/unconfirmed`);
         }
       }
@@ -1892,7 +2046,9 @@ export function createEngine(deps: EngineDeps): Engine {
         }
         for (const p of state.participants) {
           for (const a of p.attempts) {
-            if (!ACTIVE_ATTEMPT.has(a.status) || a.dispatchId === null) continue;
+            // timed_out workers may still be physically running — a deadline
+            // mark is not proof of death — so they get a stop request too.
+            if ((!ACTIVE_ATTEMPT.has(a.status) && a.status !== 'timed_out') || a.dispatchId === null) continue;
             const r = await host.requestStop({ dispatchId: a.dispatchId, reason: input.reason });
             if (!r.ok) {
               emit(ctx, 'worker.stop_requested', {
