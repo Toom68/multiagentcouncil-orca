@@ -10,7 +10,7 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 | 3 | Implement durable council core and approval enforcement | Complete |
 | 4 | Implement Orca execution, agent messaging, organiser, and scribe | Pending: adapter and protocol implemented; complete live council validation outstanding |
 | 5 | Implement invocation surfaces, installation, and user documentation | Complete |
-| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: 223 local tests pass and audit fixes landed; Linux CI and live smoke outstanding |
+| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: 254 local tests pass, audit fixes landed, and Node 22/24 Linux CI is green; live smoke finalization outstanding |
 
 ## Design assignments
 
@@ -26,4 +26,4 @@ The shared TypeScript interfaces, validation, storage/snapshots, protocol/claims
 
 After the Orca crash, the primary Codex orchestrator recovered the clean checkout, reclaimed the build Run, and reran `npm test`: 223/223 passed on Windows Node 26.7.0. Linux Node 22/24 CI exposed an independence-test path assumption; the repaired test allows the reviewer's own output while rejecting peer artifacts on both path styles. Prompts and documentation now match actual commands, artifact paths, config keys, permission handling, approval wakes, and cooperative access restrictions. Updated CI results remain to be observed.
 
-The saved live smoke has a completed organiser and valid ten-perspective proposal, but reviewer discussion and scribe completion have not yet been verified live. Actual Orca receipts exposed a settlement-state mismatch in the adapter; its repair and outcome-safety regressions are being finalized before the smoke resumes. Worker concurrency is kept small during recovery.
+Actual Orca receipts exposed a settlement-state mismatch in the adapter; its repair and outcome-safety regressions are committed and pass against the saved organiser receipt. GitHub CI for commit `f13c9ec` completed successfully on Node 22 and 24. The recovered live supervisor has admitted the ten-perspective proposal and received primary-orchestrator approval for two complementary Devin seats with one discussion round. Reviewer discussion and scribe completion remain to be verified live. Worker concurrency is kept small during recovery.
