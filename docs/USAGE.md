@@ -42,8 +42,8 @@ npm test
 
 Run the CLI as `node dist/src/cli.js <command>` from this checkout — the
 package `bin` maps `council` to `dist/src/cli.js` (see `package.json`). All
-commands accept `--json`; agent callers should prefer it. `council help` (or no
-arguments) prints the command list.
+commands accept `--json`; agent callers should prefer it. `council help`, no
+arguments, or `<command> --help` prints the command list.
 
 ### Running it on another project
 

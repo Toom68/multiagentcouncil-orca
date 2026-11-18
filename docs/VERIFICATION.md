@@ -214,9 +214,10 @@ Honest limits of this evidence:
 - The forward-test exercised `init` only; no council worker launched, no
   supervisor, no reviewer. A mixed-provider live council remains untested —
   `claude`/`codex` lanes are help-verified, never live-verified.
-- Minor UX note surfaced by the test agent: `init --help` exits
-  `config_invalid`; `help` is the global usage command. Documented here as
-  a papercut, not fixed in this stage.
+- Minor UX note surfaced by the test agent: `init --help` exited
+  `config_invalid`. Fixed in a follow-up commit — `<command> --help`/`-h`
+  now prints usage and exits 0 before any flag, config, or host resolution,
+  covered by a CLI regression test.
 - The disposable fixture, its installed skill copies, and the initialized
   run remain under `.council-dev/` (ignored) as evidence; no real user
   install was performed.

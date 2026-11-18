@@ -200,6 +200,27 @@ test('help and unknown command', async () => {
   assert.match((bad.body.error as Record<string, unknown>).message as string, /frobnicate/);
 });
 
+test('per-command --help exits 0 before flag, config, or host resolution', async () => {
+  const initHelp = await cli(['init', '--help']);
+  assert.equal(initHelp.code, 0);
+  assert.match(initHelp.stdout, /usage: council <command>/);
+  assert.match(initHelp.stdout, /init +--objective/);
+
+  const dashH = await cli(['status', '-h']);
+  assert.equal(dashH.code, 0);
+  assert.match(dashH.stdout, /status +--run/);
+
+  // A nonexistent --config is never read and an unknown flag never parsed —
+  // help short-circuits the whole handler path.
+  const cfgHelp = await cli(['init', '--help', '--config', path.join(tmp('nocfg'), 'missing.json')]);
+  assert.equal(cfgHelp.code, 0);
+  assert.match(cfgHelp.stdout, /usage: council <command>/);
+
+  const bogusFlagHelp = await cli(['init', '--bogus', '--help']);
+  assert.equal(bogusFlagHelp.code, 0);
+  assert.match(bogusFlagHelp.stdout, /usage: council <command>/);
+});
+
 test('unknown flag and missing required flag are usage errors', async () => {
   const badFlag = await cliJson(['init', '--objective', 'x', '--target', 'y', '--bogus', '--json']);
   assert.equal(badFlag.code, 2);

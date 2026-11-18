@@ -2506,6 +2506,10 @@ async function main(argv: readonly string[]): Promise<number> {
       json,
     );
   }
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(HELP);
+    return 0;
+  }
   try {
     const { payload, human } = await handler(argv.slice(1));
     emit(payload, json, human);
