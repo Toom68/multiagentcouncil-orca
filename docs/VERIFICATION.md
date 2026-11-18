@@ -162,3 +162,61 @@ Raw local session artifacts remain ignored under `.council-dev/`. This record
 includes correlation IDs and aggregate findings without publishing credentials,
 private runtime state, or worker transcripts. Reproduce the procedure with
 [USAGE.md](USAGE.md) and the tracked fixture; new model output will vary.
+
+## Public-use extension (2026-11-19)
+
+The discovery/provider-neutrality extension adds `src/catalog.ts` (versioned
+launch policy + fingerprint), `staff`/`execution`/`AgentChoice.profile`
+contract fields, the engine execution-policy boundary, catalog-wired CLI
+(`init` staff requirement, `catalog`, staff-aware `doctor`, catalog-aware
+`verify`, catalog-resolved `start-supervisor`), the zero-dependency
+installer (`scripts/install.mjs`), the runtime locator
+(`skills/council/scripts/council.mjs`), and a slimmed skill entrypoint with
+bundled references.
+
+Automated evidence on Windows Node 26.7.0: clean `tsc` build and **385
+tests, 384 pass, 0 fail, 1 skip** (a Windows file-symlink privilege case;
+junction variants run). Coverage includes: exact catalog argv rendering and
+refusals (unknown agent, unsafe model/profile/effort, no fallback),
+inherited-property safety, policy-hash mismatch blocking before any host
+mutation, missing-policy and invalid-staff refusal at init and approval,
+mixed-provider staff/seat lifecycle, legacy runs as an unchanged fixed
+point, legacy approval-hash pin, catalog fingerprint capture/drift/legacy
+verify, selected-lane supervisor launch (including a codex named-profile
+lane), supervisor-pin reuse refusal, doctor staff gating, and
+install/update/uninstall conflict + junction/foreign/pointer preservation
+cases against isolated temp homes.
+
+**Discovery forward-test (live, free Devin `swe-2-max`).** A disposable
+folder workspace (`.council-dev/discovery-target/`) received a real
+project-scope install via `node scripts/install.mjs --project <dir>` —
+`.agents/skills/council` + `.claude/skills/council` copies and manifest
+pointers only, no user-scope writes. A fresh Devin session
+(`devin --model swe-2-max --permission-mode dangerous`, model shown in TUI)
+was given a natural-language "spin up a council" request with no skill or
+CLI path. The agent discovered the installed skill on its own, drove every
+command through `scripts/council.mjs` (locator → manifest pointer → this
+checkout's `dist/src/cli.js`), ran `catalog --json` and `init`, and stopped
+as instructed before any supervisor/roster/approval/reviewer launch. The
+persisted run `crun_01M7RER8AJWTXASDVA3YZCGQHG` shows `status:initialized`,
+the explicitly chosen staff verbatim, and `execution.policyHash` equal to
+the shipped `LAUNCH_POLICY_HASH`. This proves discovery → locator → CLI
+wiring → catalog validation on the Devin lane only.
+
+Honest limits of this evidence:
+
+- `worker-start` cannot pin a Devin model (host refuses `--model`; the
+  agent's own config selected `swe-2-flash-max`, also Free). The first
+  attempt was stopped deliberately — dispatch `ctx_33f998f8890b`,
+  `ptyKilled:true` — and the test was rerun on a terminal pinned by
+  `--command` instead. Model choice for an `--agent devin` launch follows
+  the account's own configuration; the shipped catalog never selects it.
+- The forward-test exercised `init` only; no council worker launched, no
+  supervisor, no reviewer. A mixed-provider live council remains untested —
+  `claude`/`codex` lanes are help-verified, never live-verified.
+- Minor UX note surfaced by the test agent: `init --help` exits
+  `config_invalid`; `help` is the global usage command. Documented here as
+  a papercut, not fixed in this stage.
+- The disposable fixture, its installed skill copies, and the initialized
+  run remain under `.council-dev/` (ignored) as evidence; no real user
+  install was performed.

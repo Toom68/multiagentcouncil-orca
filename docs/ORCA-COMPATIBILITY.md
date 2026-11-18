@@ -19,8 +19,10 @@ receipts, output rejection, recovery, and cleanup caveats.
   `shell: false`. No string is ever concatenated into a shell line by the
   adapter. The single exception in *shape* is `terminal create --command` —
   which takes one shell command string — so the adapter only builds it from
-  tokens matching `^[A-Za-z0-9][A-Za-z0-9._-]*$` or `^--[a-z][a-z0-9-]*$`, after
-  allowlist checks on binary/model/permission tokens (see §4).
+  tokens matching `^[A-Za-z0-9][A-Za-z0-9._:/+-]*$` (alnum-led; `:`,`/`,`+`
+  admitted for `provider/model:level` selector data) or
+  `^--[a-z][a-z0-9-]*$`, after allowlist checks on binary/model/permission
+  tokens (see §4). Whitespace, quotes, and shell operators stay impossible.
 - Timeouts: every call carries a hard timeout; on expiry the adapter SIGTERMs,
   waits a grace period (default 2 s), then SIGKILLs. A timed-out **mutation**
   is reported as *uncertain* (the mutation may have landed).
@@ -112,7 +114,7 @@ Terminals:
   `terminalState`. **Silence is not exit** — a quiet worker can be alive;
   conversely a dead terminal with an unsettled dispatch is failed/uncertain.
 
-## 4. Custom argv lane — pinning `devin --model swe-2-max`
+## 4. Custom argv lanes — the shipped launch catalog
 
 Verified facts:
 
@@ -120,14 +122,27 @@ Verified facts:
   account catalog lists `swe-2-max` as **Free** (lightning variants are paid —
   never substitute).
 - `worker-start --model <m>` is honored for Claude/Codex-class agents but is
-  **not** a reliable Devin selector — the adapter *refuses*
-  `{agent:'devin', model:…}` with `unsupported_lane`.
+  **not** a reliable Devin selector — so the catalog's Devin lane emits the
+  model on `terminal create --command` argv instead.
+- `claude --model/--effort/--permission-mode`, `codex
+  --model/--profile/--sandbox/--ask-for-approval`, and Devin
+  `--permission-mode` are **help-verified** on this host; only the Devin
+  `swe-2-max` lane has run a live council.
+
+The launch policy is the shipped catalog (`src/catalog.ts`,
+`resolveAgentLaunch`): each AgentChoice `{agent, model, permissionMode,
+effort?, profile?}` validates against fixed argv templates and explicit
+posture maps — `devin`/`claude`/`codex` only, no other lane exists and none
+is substituted. A run's recorded catalog fingerprint (`config.execution`)
+must match the loaded catalog before any launch; `OrcaAdapterOptions.agents`
+remains as a programmatic back-compat injection (tests, embedders) and is
+not used by the shipped CLI path.
 
 The lane the adapter implements (`startPhaseWorker`, lane `argv`):
 
 ```
-terminal create --worktree <sel> --title <t> --command "devin --model swe-2-max --permission-mode dangerous"   # bare — no --full
-terminal wait --terminal <term_…> --for tui-idle --timeout-ms <n>                                          # bare — no --full
+terminal create --worktree <sel> --title <t> --command "<resolved catalog argv>"   # bare — no --full
+terminal wait --terminal <term_…> --for tui-idle --timeout-ms <n>                  # bare — no --full
 orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --terminal <term_…> --json --full
 ```
 
@@ -135,19 +150,19 @@ The durable uncertain-outcome surface of this lane is `worker-start` (the
 orchestration mutation carrying the request id); the two `terminal` steps
 are evidence-only and are never retry-requested.
 
-- The `--command` string is assembled **only** from allowlisted tokens:
-  binary ∈ `allowedAgentBinaries` (default `['devin']`), flags are fixed
-  literals, model/permission values must both match `COMMAND_TOKEN_RE` and
-  appear in the configured allowlist (`swe-2-max`; the permission mode
-  approved for the Run). Nothing else — paths, objectives, titles, user text —
-  can enter the string.
+- The `--command` string is assembled **only** from catalog tokens: binary ∈
+  `allowedAgentBinaries` (default = the catalog's binaries
+  `devin`/`claude`/`codex`), flags are the catalog's fixed literals,
+  model/posture/effort/profile values must both match `COMMAND_TOKEN_RE` and
+  resolve inside the catalog's explicit maps. Nothing else — paths,
+  objectives, titles, user text — can enter the string.
 - **Permission mode mapping (verified against `devin --help` on this host):**
   Devin CLI `--permission-mode` accepts only `auto | accept-edits | smart |
-  dangerous`. The council/AGENTS.md posture named **"bypass"** is user-facing
-  vocabulary; the adapter maps it explicitly to `dangerous` (the
-  all-tools-approved mode) via `AgentLaunchPolicy.permissionModeMap`, accepts
-  `dangerous` directly, and **rejects every other mode** — `bypass` is never
-  emitted to the CLI.
+  dangerous`. The council posture named **"bypass"** is user-facing
+  vocabulary; the catalog maps it to each lane's documented all-access mode
+  (`dangerous` for Devin, `bypassPermissions` for Claude,
+  `danger-full-access` + `--ask-for-approval never` for Codex) — `bypass` is
+  never emitted to a CLI.
 - `terminal wait --for tui-idle` failing leaves the terminal in an unknown
   readiness state → outcome `uncertain` (reconcile, do not blindly recreate).
 - Retained terminals: a settled worker's terminal may receive a new phase
@@ -226,8 +241,9 @@ are evidence-only and are never retry-requested.
 3. `terminal wait --for tui-idle` succeeded for the pinned Devin lane in the
    live smoke. Other CLIs and readiness under load remain unverified; a
    failed wait is treated as `uncertain`.
-4. `--effort` values accepted per agent are not enumerated in help; adapter
-   passes through allowlisted tokens only.
+4. `--effort` values are enumerated in the shipped catalog only for Claude
+   (`low|medium|high|max`, help-verified); other lanes refuse effort
+   requests rather than ignoring them.
 5. Remote/`host != local` worker behavior is untested; `worker-list` exposes
    `host` for detection.
 6. `orchestration approve`/`deny` are hidden (absent from `--help` listing)

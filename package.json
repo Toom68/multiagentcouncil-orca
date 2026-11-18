@@ -1,6 +1,6 @@
 {
   "name": "multiagent-council",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A council of independent reviewers that challenges a project and returns an evidence-backed report to its primary orchestrator.",
   "type": "module",

@@ -18,9 +18,12 @@ limitations, and honest coverage.
 - **Orca** CLI on `PATH` (or `ORCA_CLI_COMMAND`) — the only production host in
   v1; the adapter surface is verified against Orca 1.4.261
   ([docs/ORCA-COMPATIBILITY.md](docs/ORCA-COMPATIBILITY.md)).
-- **Devin CLI** on `PATH` for real review workers — `devin` + `swe-2-max` is
-  the only allowlisted and live-validated lane. Other agent CLIs need an
-  explicit adapter policy and are unverified.
+- **Agent CLIs** for the staff and seat lanes you choose. The shipped catalog
+  (`council catalog --json`) documents `devin`, `claude`, and `codex` argv
+  lanes; `devin` + `swe-2-max` is the only lane exercised live so far —
+  the others are help-verified, not live-verified. There is no default
+  provider: fresh runs require an explicit staff and per-seat choices, each
+  validated against the catalog and bound by the roster approval.
 
 ## Build & run
 
@@ -28,14 +31,22 @@ limitations, and honest coverage.
 npm ci
 npm run build
 
-node dist/src/cli.js init --objective ./OBJECTIVE.md --target /path/to/project
+node dist/src/cli.js catalog --json                # supported lanes + selectors
+node dist/src/cli.js init --objective ./OBJECTIVE.md --target /path/to/project --config ./council.config.json
 node dist/src/cli.js start-supervisor --run <runDir>   # or supervise --advance yourself
 node dist/src/cli.js status --run <runDir> --json
 # at the gate: write roster.approved.json, then
 node dist/src/cli.js approve --run <runDir> --roster <runDir>/roster.approved.json
 ```
 
-The package also exposes a `council` bin → `dist/src/cli.js`. See
+`--config` must carry an explicit `staff` object — `{organiser, scribe,
+supervisor}`, each an AgentChoice `{agent, model, permissionMode,
+effort?, profile?}` from the shipped catalog. There is no default provider.
+
+The package also exposes a `council` bin → `dist/src/cli.js`. To install the
+agent skill once so any project can discover it, run
+`node scripts/install.mjs` (dry-run first; see
+[docs/AI-INSTALL.md](docs/AI-INSTALL.md) for the agent-facing guide). See
 [docs/USAGE.md](docs/USAGE.md) for the full command surface, the run-directory
 layout, and the approval-wake model, and
 [skills/council/SKILL.md](skills/council/SKILL.md) for the agent-facing

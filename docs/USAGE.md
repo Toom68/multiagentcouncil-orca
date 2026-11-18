@@ -20,13 +20,17 @@ and is covered by `test/cli.test.ts` / `test/acceptance.test.ts`.
 - A running Orca (the council is Orca-first; the core protocol is host-agnostic
   behind `src/host/` for later adapters). The adapter surface in
   `docs/ORCA-COMPATIBILITY.md` was verified against Orca **1.4.261** on Windows.
-- Agent CLIs only if you launch real workers: the default — and the only
-  allowlisted and live-validated lane so far — is Devin CLI with model
-  `swe-2-max`. Other Orca agent ids (`claude`, `codex`, …) need an explicit
-  launch policy in `src/host/orca.ts` and are unverified. Paid `*-lightning`
-  variants and automatic model fallbacks are never selected.
+- Agent CLIs only for the lanes you actually select. The shipped launch
+  catalog (`src/catalog.ts`, `council catalog --json`) documents `devin`,
+  `claude`, and `codex` argv lanes with fixed permission/effort/profile
+  mappings; `devin` + `swe-2-max` is the only lane exercised live so far —
+  `claude` and `codex` are help-verified only. Paid `*-lightning` variants
+  and automatic model fallbacks are never selected, and an unavailable
+  choice fails visibly — never a substitute.
 - No MCP server, no native Orca plugin, no global config or permission changes
-  are required or performed. The product does not install its own skill.
+  are required or performed. The optional `scripts/install.mjs` installer
+  copies the agent skill and records only the runtime path — see
+  [AI-INSTALL.md](AI-INSTALL.md).
 
 ## Build and invoke
 
@@ -43,17 +47,23 @@ arguments) prints the command list.
 
 ### Running it on another project
 
-There is nothing to install or register — no Orca plugin, no MCP server, no
-global writes. From the workspace you want reviewed:
+Two supported paths; neither registers an Orca plugin, MCP server, or global
+config:
 
-1. Clone and build this repository anywhere (e.g. `npm install && npm run
-   build`), then note the absolute path to `dist/src/cli.js`.
-2. Invoke it by absolute path **from the target workspace** —
-   `node <checkout>/dist/src/cli.js init --objective "..." --json` — because
+1. **Install-once skill (recommended for agents).** From a built checkout,
+   `node scripts/install.mjs` copies `skills/council/` into the user skill
+   dirs (`~/.agents/skills/council`, `~/.claude/skills/council`) and records
+   the built CLI in a managed pointer; `--project <dir>` scopes the install
+   to one project instead. Agents then invoke the bundled locator
+   `node <SKILL_DIR>/scripts/council.mjs <command>` from the workspace being
+   reviewed — no checkout path to paste. `COUNCIL_CLI` overrides resolution
+   explicitly. Full agent-facing guide, dry-run/inspection, conflict and
+   preservation rules: [AI-INSTALL.md](AI-INSTALL.md).
+2. **Direct invocation.** Invoke the built CLI by absolute path **from the
+   target workspace** — `node <checkout>/dist/src/cli.js init ...` — because
    the Orca context comes from the caller's working directory and the run
-   directory is created under that target's `.council/` tree.
-3. Tell the supervising agent to read `<checkout>/skills/council/SKILL.md` by
-   absolute path; it contains the exact command loop it must run.
+   lands under that target's `.council/` tree. Tell the supervising agent to
+   read `<checkout>/skills/council/SKILL.md` by absolute path.
 
 A `council` command on `PATH` is optional: a user may run `npm link` in this
 checkout themselves if they want one — nothing does it automatically, and no
@@ -102,7 +112,7 @@ cannot prevent the change and cannot say who changed it.
 ### `council init` — create a run
 
 ```text
-council init --objective <file> --target <path> [--config <file>] --json
+council init --objective <file> --target <path> --config <file> --json
 ```
 
 Creates the run directory, snapshots the target (git HEAD plus a per-file hash
@@ -110,22 +120,49 @@ manifest), resolves and validates the config, writes `meta.json` (including
 `launchBudgetFloor`, the minimum launches this config needs), and emits
 `prompts/supervisor.md` plus the exact `advanceCommand` the supervisor runs.
 
+**Fresh runs require an explicit, complete staff.** `--config` must carry
+`staff.organiser`, `staff.scribe`, and `staff.supervisor` — each an
+AgentChoice `{agent, model, permissionMode, effort?, profile?}` validated
+against the shipped catalog *before* any run state is created (the roster
+gate cannot authorize staff work retroactively). A staff-less config is
+refused. `init` also captures the catalog execution fingerprint
+(`execution.catalogVersion`, `execution.policyHash`) into the config — a
+config-supplied fingerprint must match the shipped catalog exactly — so a
+later catalog change blocks launches rather than silently reinterpreting
+approved choices. Staff and fingerprint flow into the approval hash like
+every other config field.
+
 The full brief is preserved in council artifacts, prompts and the approval
 binding. Only a bounded descriptive label is sent to Orca's shorter Run
 objective field; a multi-kilobyte review brief does not need to be shortened
 to fit that host metadata limit.
 
+### `council catalog` — supported launch lanes (read-only)
+
+```text
+council catalog --json
+```
+
+Reports `catalogVersion`, the launch-policy hash, and each documented lane:
+binary, model flag, permission-posture tokens, effort/profile selectors where
+verified, a `verification` label (`live-verified` / `help-verified` /
+`unverified`), and **local binary presence**. Presence is PATH visibility
+only — it never implies the account is authenticated, approved, free, or
+unlimited. The command launches nothing and inspects no credentials.
+
 ### `council doctor` — environment check
 
 ```text
-council doctor --json
+council doctor [--config <file> | --run <runDir>] --json
 ```
 
 Reports each check as `verified` / `missing` / `failed`: Node ≥ 22, the `orca`
 executable (`ORCA_CLI_COMMAND` or `orca` on PATH) plus a live `orca status
---json` call, `devin` (required for the default lane), and `claude`/`codex`
-(optional). Prints `ready` when every required check verifies; missing optional
-agent CLIs only narrow roster choices.
+--json` call — the always-required host checks. Every catalog lane also
+appears as an *informational* presence check. With `--config` or `--run`,
+each staff role's AgentChoice is validated against the catalog and only the
+**selected** agents' binaries gate readiness; a legacy staff-less config is
+reported as such. `ready` is true when every required check verifies.
 
 ### `council start-supervisor` — launch the dedicated supervisor worker
 
@@ -134,8 +171,12 @@ council start-supervisor --run <runDir> [--wait-ms <n>] --json
 ```
 
 Creates the supervisor's Orca Task from `prompts/supervisor.md`, opens a
-terminal running the pinned lane `devin --model swe-2-max --permission-mode
-dangerous`, waits for the agent's prompt (`terminal wait --for tui-idle`,
+terminal running the run's `staff.supervisor` lane resolved through the
+shipped catalog (the approved `{agent, model, permissionMode, effort?,
+profile?}` becomes fixed argv tokens; a recorded execution-fingerprint
+mismatch refuses before any host call; legacy pre-staff runs keep the
+original `devin --model swe-2-max --permission-mode dangerous` pin), waits
+for the agent's prompt (`terminal wait --for tui-idle`,
 `--wait-ms` bounds it, default 60 s, range 1 000–600 000), then `worker-start`s
 the Task on that terminal and persists the supervisor's
 `{terminalHandle, dispatchId}` into `state.json` so `council approve` can
@@ -307,11 +348,14 @@ council verify --run <runDir> --json
 ```
 
 Reports integrity only: re-hashes the live target against `snapshot.json`
-(drift + changed paths) and recomputes the approval binding hash against
-`approval.json` (`bindingIntact`, `matchesStateHash`). `verified: true` means
-no drift and an intact approval — it is **not** a proof of truth of findings,
-and it never executes or validates cited code. A drifted tree or mismatched
-binding means re-snapshot and re-approve before any launch.
+(drift + changed paths), recomputes the approval binding hash against
+`approval.json` (`bindingIntact`, `matchesStateHash`), and compares the run's
+recorded execution fingerprint against the shipped catalog (`catalog`:
+`intact` / `drifted`, or `legacy` on pre-catalog runs). `verified: true`
+means no drift, an intact approval, and a matching catalog fingerprint — it
+is **not** a proof of truth of findings, and it never executes or validates
+cited code. A drifted tree, mismatched binding, or drifted catalog means
+re-snapshot/re-approve/reconcile before any launch.
 
 ### `council cancel` — explicit cancellation
 
@@ -356,6 +400,16 @@ only cap and validate outputs afterwards.
 | `maxMailPerParticipant` | 6 | per-seat runner-originated mail cap |
 | `maxTextChars` | 4000 | cap on any single free-text field in worker output |
 | `deadlines` | object below | per-phase wall-clock limits in ms, checked inside `advance` (never real-time) |
+| `staff` | required on fresh runs | `{organiser, scribe, supervisor}` — each a complete AgentChoice `{agent, model, permissionMode, effort?, profile?}` from the shipped catalog; a partial staff object is invalid |
+| `execution` | captured by `init` | `{catalogVersion, policyHash}` — the shipped catalog fingerprint; a supplied fingerprint must match or init refuses |
+
+`AgentChoice` axes: `agent` is the CLI lane (`devin`/`claude`/`codex`);
+`model` is an explicit model id validated as data; `permissionMode` is a
+posture token from that lane's explicit map (the user-facing `bypass` maps to
+each lane's documented all-access mode); `effort` is honored only where the
+lane documents a selector (Claude `--effort`); `profile` is a named CLI
+profile (Codex `--profile` only — never a config-file path). Any choice the
+catalog cannot launch is refused — no fallback, no substitution.
 
 `deadlines` defaults: `organiserMs` 30 min, `independentMs` 4 h,
 `scribeNotesMs` 1 h, `challengeMs` 2 h, `responseMs` 2 h, `synthesisMs` 2 h,
@@ -368,8 +422,8 @@ e.g. the reduced smoke config is `requestedPerspectives=10`, `participants=2`.
 
 ## Flow recap for the calling agent
 
-1. `init` → `start-supervisor` (which runs the pinned
-   `devin --model swe-2-max --permission-mode dangerous` lane and records the
+1. `init` (with an explicit `staff` in `--config`) → `start-supervisor`
+   (which resolves the run's `staff.supervisor` catalog lane and records the
    supervisor's dispatch) — or drive `supervise --advance` yourself per wake.
    With a dedicated supervisor your Orca Run binding stays untouched; the
    council lives in a separate child Run the engine creates on the first
@@ -402,13 +456,16 @@ outcome recovery.
   agreement never upgrades a claim.
 - Does not replay or rebuild state: `events.jsonl` is a durable, hash-chained
   record for audit and reconciliation, not a state-replay engine.
-- Does not install a skill, change permission posture, or touch global config;
-  the user-facing "bypass" posture maps to Devin CLI `--permission-mode
-  dangerous` at the adapter boundary — a separately approved product posture,
-  not a silent default.
-- Does not silently fall back to other or paid models; every seat's
-  agent/model/permission is an explicit, approved, allowlisted choice — and
-  only `devin`/`swe-2-max` is allowlisted by default or validated live.
+- Does not install a skill for you or touch global config; the optional
+  installer only copies the skill and records the runtime path (see
+  [AI-INSTALL.md](AI-INSTALL.md)). The user-facing "bypass" posture maps to
+  each lane's documented all-access mode at the catalog boundary — a
+  separately approved product posture, not a silent default.
+- Does not silently fall back to other or paid models; every seat's and
+  staff role's agent/model/permission/effort/profile is an explicit,
+  approved, catalog-validated choice — and only `devin`/`swe-2-max` is
+  validated live. `claude` and `codex` lanes are help-verified; treat their
+  first real launches as unproven.
 - Does not produce automatic fixes or rerun-diff reports in this release.
 
 ## Validation status — honest ledger
