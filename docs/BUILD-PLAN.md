@@ -11,6 +11,7 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 | 4 | Implement Orca execution, agent messaging, organiser, and scribe | Complete: real reduced council finished every phase, with partial coverage explicitly reported |
 | 5 | Implement invocation surfaces, installation, and user documentation | Complete |
 | 6 | Independent review, integration tests, live Orca smoke test, and fixes | Complete: 285 tests pass, final source CI is green on Node 22/24, and the completed partial live council is documented |
+| 7 | First-project startup fixes: long review briefs and Devin trust/readiness | Pending: OSINTGPT setup exposed these two gaps; preserve its active council and approval gate while repairing the launcher |
 
 ## Design assignments
 
