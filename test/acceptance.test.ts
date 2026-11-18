@@ -386,6 +386,40 @@ async function pump(ctx: Ctx, maxSteps = 40): Promise<AdvanceResult> {
 
 // ─── The full lifecycle ──────────────────────────────────────────────────────
 
+/**
+ * Independence check for an independent-review spec. The spec MUST name the
+ * seat's own output file — which legitimately ends in `findings/<pid>.json`
+ * with a platform-dependent separator (`/` on POSIX, `\` on Windows) — and
+ * must NOT reference anything produced by another participant. Own path is
+ * scrubbed in both separator styles before the peer-artifact scan so the
+ * check means "peer leakage", not "the findings dir exists at all".
+ */
+function assertIndependentSpec(spec: string, participantId: string, peers: string[]): void {
+  const ownSuffixes = [`findings/${participantId}.json`, `findings\\${participantId}.json`];
+  assert.ok(
+    ownSuffixes.some((s) => spec.includes(s)),
+    `independent spec must name its own output findings/${participantId}.json`,
+  );
+  let scrubbed = spec;
+  for (const suffix of ownSuffixes) scrubbed = scrubbed.split(suffix).join('');
+  for (const peer of peers) {
+    assert.ok(
+      !scrubbed.includes(peer),
+      `independent spec references peer participant ${peer}`,
+    );
+  }
+  for (const pat of [
+    /findings[/\\][^\s`'"]+\.json/i, // any surviving findings artifact → a peer's
+    /rounds[/\\]\d+[/\\]/i, // discussion round dirs (envelopes, challenges, responses)
+    /claims\.json/i, // the claim ledger
+    /events\.jsonl/i, // the journal
+    /roster\.(proposed|approved)\.json/i, // organiser/approval artifacts
+    /scribe[/\\]/i, // scribe artifacts
+  ]) {
+    assert.doesNotMatch(scrubbed, pat, `independent spec references peer artifact ${pat}`);
+  }
+}
+
 test('complete flow: init → organiser → approval gate → reviews → discussion → report', async () => {
   const ctx = await initRun();
   const { host, store } = ctx;
@@ -426,11 +460,12 @@ test('complete flow: init → organiser → approval gate → reviews → discus
     reviewLaunches.map((l) => l.spec.participantId).sort(),
     ['rev-1', 'rev-2'],
   );
+  const reviewIds = reviewLaunches.map((l) => l.spec.participantId);
   for (const l of reviewLaunches) {
     const spec = readFileSync(l.spec.specFilePath, 'utf8');
     assert.match(spec, /independent/i);
-    // No concrete peer artifact path may be handed to an independent reviewer.
-    assert.doesNotMatch(spec, /findings\/rev-|rounds\/\d+\/envelopes|claims\.json/i, 'independent spec must not reference peer artifacts');
+    // Own output path is required; every peer-produced artifact is forbidden.
+    assertIndependentSpec(spec, l.spec.participantId, reviewIds.filter((p) => p !== l.spec.participantId));
   }
 
   // 5) Drive the rest: scribe notes → challenge envelopes → responses → synthesis.
@@ -565,4 +600,46 @@ test('council cancel reports confirmed vs unverifiable stops honestly', async ()
   assert.equal(body.confirmedStopped.length, 0);
   assert.equal(body.unverifiable.length, 2);
   assert.match(body.note, /not proven stopped|unverifiable/i);
+});
+
+// ─── Independence-check regression ───────────────────────────────────────────
+// The complete-flow assertion once failed on POSIX because the seat's OWN
+// output path (`…/findings/rev-1.json`) matched the peer-artifact pattern —
+// on Windows it never did (`…\findings\rev-1.json`). These cases pin the
+// helper's contract on both separator styles so neither platform can regress.
+
+test('independence check accepts the own output path on POSIX and Windows separators', () => {
+  const posix = [
+    'You are the independent reviewer for participant `rev-1`.',
+    'Write exactly one JSON file at this path:',
+    '`/tmp/run/findings/rev-1.json`',
+    'Report worker_done with `--report-path /tmp/run/findings/rev-1.json`.',
+  ].join('\n');
+  const windows = [
+    'You are the independent reviewer for participant `rev-1`.',
+    'Write exactly one JSON file at this path:',
+    '`C:\\work\\run\\findings\\rev-1.json`',
+    'Report worker_done with `--report-path C:\\work\\run\\findings\\rev-1.json`.',
+  ].join('\n');
+  assert.doesNotThrow(() => assertIndependentSpec(posix, 'rev-1', ['rev-2']));
+  assert.doesNotThrow(() => assertIndependentSpec(windows, 'rev-1', ['rev-2']));
+});
+
+test('independence check rejects peer leakage on POSIX and Windows separators', () => {
+  const leaks = [
+    '/tmp/run/findings/rev-2.json', // peer findings, POSIX
+    'C:\\work\\run\\findings\\rev-2.json', // peer findings, Windows
+    '/tmp/run/rounds/1/envelopes/challenge/rev-1.json', // own-named envelope is still peer content
+    'C:\\work\\run\\rounds\\2\\envelopes\\response\\rev-1.json',
+    '/tmp/run/claims.json',
+    'ask rev-2 what it found', // a peer identity, not a path
+  ];
+  for (const leak of leaks) {
+    const spec = `own output \`/tmp/run/findings/rev-1.json\`\npeer material: ${leak}`;
+    assert.throws(
+      () => assertIndependentSpec(spec, 'rev-1', ['rev-2']),
+      /peer|references|leaks/i,
+      `must reject spec containing ${leak}`,
+    );
+  }
 });

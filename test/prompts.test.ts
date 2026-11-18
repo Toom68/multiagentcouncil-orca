@@ -89,12 +89,12 @@ function allWorkerSpecs(): Record<string, string> {
     }),
     challenge: b.challenge(ctx, {
       participantId: 'p-rev-2',
-      envelopePath: 'rounds/1/outbox/p-rev-2.json',
+      envelopePath: 'rounds/1/envelopes/challenge/p-rev-2.json',
       outputPath: 'rounds/1/challenges/p-rev-2.json',
     }),
     authorResponse: b.authorResponse(ctx, {
       participantId: 'p-rev-1',
-      envelopePath: 'rounds/1/outbox/p-rev-1.json',
+      envelopePath: 'rounds/1/envelopes/response/p-rev-1.json',
       outputPath: 'rounds/1/responses/p-rev-1.json',
     }),
     scribeSynthesis: b.scribeSynthesis(ctx, {
@@ -137,6 +137,32 @@ describe('shared invariants', () => {
     test(`${role}: uses JSON contracts, never YAML`, () => {
       assert.match(spec, /```json/);
       assert.doesNotMatch(spec, /```ya?ml/);
+    });
+    test(`${role}: permits only the coordinator-bound orchestration signals`, () => {
+      // worker_done is required for completion; ask/escalation are the only
+      // other allowed signals. The old blanket `orca orchestration` ban made
+      // the required worker_done impossible — it must not return.
+      assert.match(spec, /worker_done/);
+      assert.match(spec, /`ask`/);
+      assert.match(spec, /`escalation`/);
+      assert.match(spec, /coordinator-bound/);
+      assert.doesNotMatch(spec, /do NOT run\s+`orca orchestration` commands/i);
+    });
+    test(`${role}: forbids extra agents, peer mail, and foreign mailboxes`, () => {
+      assert.match(spec, /do NOT start other agents/i);
+      assert.match(spec, /never mail to peers/i);
+      assert.match(spec, /never a consuming `check`\/`--ack`/i);
+    });
+    test(`${role}: labels cooperative restrictions without claiming detection`, () => {
+      assert.match(spec, /cooperative/i);
+      // The runner detects snapshot drift (files changed), validates admitted
+      // output, and journals rejections — it cannot observe reads, egress, or
+      // stray writes, and cannot attribute edits to a specific worker.
+      assert.match(spec, /proves files changed, not who changed them/);
+      assert.match(spec, /cannot prevent or fully observe egress/i);
+      assert.doesNotMatch(spec, /attributed to you/i);
+      assert.doesNotMatch(spec, /detects it through your artifacts/i);
+      assert.doesNotMatch(spec, /journaled as suspect/i);
     });
   }
 });
@@ -201,6 +227,10 @@ describe('independent reviewer', () => {
   test('seals independence and labels it cooperative', () => {
     assert.match(spec, /INDEPENDENT review/);
     assert.match(spec, /cooperative/i);
+    // Reads of peer artifacts are a cooperative rule — the runner cannot
+    // observe them, so the spec must not claim it journals/attributes reads.
+    assert.match(spec, /cannot observe/i);
+    assert.doesNotMatch(spec, /journals and attributes/i);
   });
   test('states evidence rules and grade re-derivation honestly', () => {
     assert.match(spec, /unsupported/);
@@ -224,7 +254,7 @@ describe('scribe notes', () => {
 describe('challenge', () => {
   const spec = allWorkerSpecs().challenge;
   test('points at exactly one envelope and forbids ledger/peer reads', () => {
-    assert.match(spec, /rounds\/1\/outbox\/p-rev-2\.json/);
+    assert.match(spec, /rounds\/1\/envelopes\/challenge\/p-rev-2\.json/);
     assert.match(spec, /ONLY peer content you may read/i);
     assert.match(spec, /Do NOT open the claim ledger/);
     // must not be told to read findings files or the journal

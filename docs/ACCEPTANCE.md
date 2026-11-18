@@ -33,38 +33,39 @@ not a live worker launch, and a mocked adapter is not a real Orca Task/Dispatch.
 
 | Requirement (BRIEF / IMPLEMENTATION) | Tier | Planned evidence |
 | --- | --- | --- |
-| Documented install/invocation path | A | `npm install && npm run build` succeeds; `docs/USAGE.md` marks each command `[implemented]`/`[planned]` honestly. |
+| Documented install/invocation path | A | `npm install && npm run build` succeeds; `docs/USAGE.md` documents the implemented command surface. |
 | Enforceable roster approval gate; drift blocks launch | B + C | B: engine tests for pre-approval refusal and every approval-invalidation vector. C: `roster.approved.json` + `approval.json` written before any reviewer launch; journal shows zero launches pre-approval. |
-| Independent reviews, then bounded exchange | B + C | B: envelope separation tests (no peer data in independent prompts). C: `findings/<pid>.json` for each seat, then `rounds/1/` challenge/response envelopes. |
-| Separate scribe, prioritised report | B + C | B: ledger/coverage and scribe-synthesis unit tests. C: the engine owns canonical `claims.json` (claims, statuses, grades, dissent, coverage); a distinct scribe participant contributes synthesis via `report.json`/`report.md` (`summary.md` only if the final CLI emits it). |
-| Persisted progress and artifacts | C | `.council/runs/<id>/` containing `state.json`, `events.jsonl`, `snapshot.json`, `approval.json`, findings, and report artifacts (plus `meta.json` only if the final CLI emits it). |
+| Independent reviews, then bounded exchange | B + C | B: envelope separation tests (no peer data in independent prompts). C: `findings/<pid>.json` for each seat, then `rounds/1/envelopes/{challenge,response}/` per-recipient envelopes and `rounds/1/{challenges,responses}/` outputs. |
+| Separate scribe, prioritised report | B + C | B: ledger/coverage and scribe-synthesis unit tests. C: the engine owns canonical `claims.json` (claims, statuses, grades, dissent, coverage); a distinct scribe participant contributes synthesis via `scribe/{report.json,report.md,summary.md}`, emitted as the canonical `report.json`/`report.md`/`summary.md`. |
+| Persisted progress and artifacts | C | `.council/runs/<id>/` containing `council.json`, `state.json`, `events.jsonl`, `snapshot.json`, `approval.json`, `meta.json`, `specs/`, findings, and report artifacts. |
 | Bounded resource use (concurrency, launches, rounds, envelopes, deadlines) | B + C | B: budget-enforcement tests. C: smoke config with `participants=2` recorded in the approval; launch counts journaled in `events.jsonl`. |
 | Failure visibility; partial runs marked partial | B | Engine tests for failed/incomplete seats and "no successful-looking empty report"; smoke reports honestly if a seat fails. |
 | Devin `swe-2-max` only; no fallback, no paid models | C | Every approved seat records `agent=devin, model=swe-2-max` in `roster.approved.json`; actual launches are journaled in `events.jsonl`. |
 
-Command names above follow `docs/USAGE.md` (e.g. `council init`,
-`council approve`, `council supervise --advance`, `council status`,
-`council verify`). They are referenced **conditionally**: several are still
-`[planned]` and the CLI owner's final build decides what exists; this document
-does not invent commands or code APIs beyond `docs/design/CONTRACTS.md`.
+Command names above follow the implemented CLI in `docs/USAGE.md` (`council
+init`, `doctor`, `start-supervisor`, `supervise --advance`, `approve`,
+`status`, `tail`, `verify`, `cancel`). All exist; nothing here is conditional
+on future work.
 
 ## Expected council outputs (live smoke)
 
 Per `docs/design/IMPLEMENTATION.md`, the smoke run uses
 `requestedPerspectives=10` and `participants=2` against this fixture:
 
-1. Organiser proposes exactly 10 distinct perspectives → `roster.proposed.json`.
+1. Organiser proposes exactly 10 distinct perspectives → raw output
+   `organiser/roster.proposed.json`, admitted to `roster.proposed.json`.
 2. Orchestrator selects 2 seats with explicit agents/models →
-   `roster.approved.json`; `council approve` writes `approval.json` bound to the
-   snapshot hash. No reviewer may launch before this gate.
+   `roster.approved.json`; `council approve` writes `approval.json` bound to
+   `sha256(canonical({runId, objective, seats, proposedRosterHash, config,
+   snapshotId, snapshotHeadHash}))`. No reviewer may launch before this gate.
 3. Each reviewer writes `findings/<pid>.json` independently; one bounded
-   challenge/response round produces `rounds/1/` envelopes.
+   challenge/response round produces `rounds/1/envelopes/{challenge,response}/`
+   inputs and `rounds/1/{challenges,responses}/` outputs.
 4. The engine maintains canonical `claims.json` and coverage; the scribe
-   contributes synthesis via `report.json`/`report.md` (`summary.md` only if
-   the final CLI emits it).
-5. `events.jsonl` + `state.json` evidence real Task/Dispatch completions —
-   save the actual receipts, not descriptions of them (`meta.json` likewise,
-   only if the final CLI emits it).
+   contributes synthesis via `scribe/{report.json,report.md,summary.md}`,
+   emitted as `report.json`/`report.md`/`summary.md`.
+5. `events.jsonl` + `state.json` + `meta.json` evidence real Task/Dispatch
+   completions — save the actual receipts, not descriptions of them.
 
 ## Fair evaluation
 
@@ -82,13 +83,19 @@ Judge the smoke report on **usefulness and honesty**, not verbatim prose:
 
 ## Honest limitations
 
-- **This is a reduced smoke.** Two selected reviewers from a ten-perspective
-  proposal cannot and do not claim 15-seat load, concurrency, or budget-stress
-  validation. Fifteen is the product default, not what this run proves.
+- **This is a reduced smoke — and it has not completed yet.** Two selected
+  reviewers from a ten-perspective proposal cannot and do not claim 15-seat
+  load, concurrency, or budget-stress validation. Fifteen is the product
+  default, not what this run proves. As of the current build the first live
+  run surfaced a settlement-detection stall in the host adapter (dispatch
+  `succeeded` not mapped to a settled liveness — see
+  `docs/ORCA-COMPATIBILITY.md` §7); live Tier-C evidence stays **pending**
+  until a smoke run records real Task/Dispatch completions end-to-end.
 - The live run validates the Orca worker path end-to-end at small scale only:
   real launches, real Task/Dispatch correlation, real artifacts. Throughput,
   deadline behavior under load, and long-run stability remain unverified.
 - Reviewer edit/egress restrictions are cooperative prompt-level rules;
-  snapshot re-hash detects violations after the fact and cannot prevent them.
+  snapshot re-hash detects that files changed after the fact — it cannot
+  prevent edits and cannot attribute them to a specific worker.
 - Any Orca platform behavior not exercised during the run must be listed as
   unverified rather than assumed working.

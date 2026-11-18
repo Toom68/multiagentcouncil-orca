@@ -5,7 +5,9 @@ Scope: `src/host/process.ts` (safe subprocess boundary) and `src/host/orca.ts`
 **1.4.261** on Windows (`C:\Users\tomy\AppData\Local\Programs\orca\resources\bin\orca`)
 during the integration-design phase or via `--help` / live read commands.
 Anything not exercised live is labeled **assumed from docs/help** and carries a
-receipt-validation note in `src/host/orca.ts`.
+receipt-validation note in `src/host/orca.ts`. A full end-to-end council smoke
+(organiser → approval → reviewers → discussion → scribe → report) has not
+completed yet — see §7 item 9 for the stall it surfaced.
 
 ## 1. Executable and process spawning (Windows)
 
@@ -224,3 +226,13 @@ are evidence-only and are never retry-requested.
    cooperative — Orca does not validate phase names.
 8. Long-running mailbox growth and `inbox --limit` pagination shape are
    unverified at scale.
+9. **Live-smoke settlement stall (open, fix in flight).** The first end-to-end
+   smoke surfaced a `worker-show` row reporting `state:"succeeded"`,
+   `stage:"settled"`, `liveness:"unverifiable"`,
+   `terminalState:"retained"` that the adapter's `mapLiveness` did not map to
+   a settled outcome — the engine waited indefinitely on a finished worker.
+   The repair lands in `src/host/orca.ts` (separate owner). Until a reduced
+   smoke (10 proposed perspectives, 2 reviewer seats) records real
+   Task/Dispatch completion receipts, treat liveness reads through
+   `worker-list --run` and `request-show` reconciliation — never silence —
+   as the source of truth, and hold all live-integration claims as pending.

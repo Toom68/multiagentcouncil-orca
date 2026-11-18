@@ -14,7 +14,12 @@
  *   envelope path and forbid reading ledger/transcript/other envelopes.
  * - scribe specs see everything but must never invent verification and must
  *   preserve dissent/withdrawals.
- * - every spec forbids launching further agents.
+ * - every spec forbids launching further agents, peer mail, and foreign
+ *   mailboxes — the only orchestration signals allowed are the
+ *   coordinator-bound worker_done / ask / escalation in "When done".
+ * - cooperative restrictions are labelled honestly: the runner detects
+ *   snapshot drift (files changed — never who changed them) and validates
+ *   admitted output; it does not observe reads, egress, or stray writes.
  */
 
 import { SCHEMA_VERSION } from './contracts.js';
@@ -64,17 +69,24 @@ function leafRules(extra: string[] = []): string {
   return [
     '## Rules of this assignment',
     '',
-    '- You are a leaf worker. Do NOT start other agents or workers, do NOT run',
-    '  `orca orchestration` commands, and do NOT dispatch sub-tasks.',
+    '- You are a leaf worker. Do NOT start other agents or workers and do NOT',
+    '  dispatch sub-tasks. The only `orca orchestration` commands you may run',
+    '  are the coordinator-bound `worker_done` / `ask` / `escalation` signals',
+    '  under "When done" — never worker-start, never mail to peers or any',
+    '  other recipient, and never a consuming `check`/`--ack` on a mailbox',
+    '  that is not yours.',
     '- Do NOT edit, create, or delete files in the reviewed target. This is a',
     '  **cooperative** rule: the runner cannot physically block edits inside',
-    '  your session, but it re-hashes the snapshot and rejects your output on',
-    '  drift — violations are journaled and attributed to you.',
-    '- Do NOT send mail, post to external services, or fetch network resources.',
-    '  Also cooperative: the runner cannot prevent egress inside your session,',
-    '  but it detects it through your artifacts and the worker audit.',
-    '- Write ONLY the path(s) listed under "Output". Other files inside the run',
-    '  directory are discarded and the attempt is journaled as suspect.',
+    '  your session. It re-hashes the snapshot and detects drift — which',
+    '  proves files changed, not who changed them — and drift is journaled',
+    '  and blocks further work.',
+    '- Do NOT post to external services or fetch network resources. Also',
+    '  cooperative: the runner cannot prevent or fully observe egress inside',
+    '  your session — honor the boundary; violations visible in your output',
+    '  are rejected and journaled.',
+    '- Write ONLY the path(s) listed under "Output". Only the listed file is',
+    '  validated and admitted; anything else written inside the run',
+    '  directory is ignored.',
     ...extra.map((line) => `- ${line}`),
   ].join('\n');
 }
@@ -122,7 +134,10 @@ function completionBlock(outputPath: string): string {
     '',
     `Report \`worker_done\` to your coordinator with \`--outcome succeeded\` and`,
     `\`--report-path ${outputPath}\`. If you could not complete the work, report`,
-    '`--outcome failed` — never hide failure in prose.',
+    '`--outcome failed` — never hide failure in prose. A blocking question',
+    'goes through `ask`; a blocker the coordinator must resolve goes through',
+    'an `escalation`. These coordinator-bound signals are the only',
+    'orchestration commands you may run.',
   ].join('\n');
 }
 
@@ -250,10 +265,10 @@ export function createPromptBuilder(): PromptBuilder {
           '',
           'Do NOT read the council run directory or anything under it except',
           'your own output file: peer artifacts that appear there later are',
-          'structurally excluded from your inputs, and reading them is a',
-          '**cooperative** rule violation the runner journals and attributes to',
-          'you. If you accidentally encounter peer output, ignore it and note',
-          'the incident in `notes`.',
+          'structurally excluded from your inputs. Reading them is a',
+          '**cooperative** rule violation the runner cannot observe — honor it.',
+          'If you accidentally encounter peer output, ignore it and note the',
+          'incident in `notes`.',
         ].join('\n'),
         [
           '## How to review',

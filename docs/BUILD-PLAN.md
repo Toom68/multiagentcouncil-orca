@@ -9,7 +9,7 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 | 2 | Approve architecture, contracts, file ownership, and implementation assignments | Complete |
 | 3 | Implement durable council core and approval enforcement | Complete |
 | 4 | Implement Orca execution, agent messaging, organiser, and scribe | Pending: adapter and protocol implemented; complete live council validation outstanding |
-| 5 | Implement invocation surfaces, installation, and user documentation | Pending: CLI and skill implemented; final documentation alignment outstanding |
+| 5 | Implement invocation surfaces, installation, and user documentation | Complete |
 | 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: 223 local tests pass and audit fixes landed; Linux CI and live smoke outstanding |
 
 ## Design assignments
@@ -24,4 +24,6 @@ All three planning workers delivered their proposals and exchanged focused peer 
 
 The shared TypeScript interfaces, validation, storage/snapshots, protocol/claims/reports, host adapter, prompts/skill, CLI, CI definition, and acceptance fixture have been implemented and pushed. Approval includes the full proposal hash and explicit worker Run IDs. An independent lightweight Codex audit found timeout slot accounting and final-source-drift gaps; fixes are committed with tests.
 
-After the Orca crash, the primary Codex orchestrator recovered the clean checkout, reclaimed the build Run, and reran `npm test`: 223/223 passed on Windows Node 26.7.0. Linux Node 22/24 CI exposed an independence-test path assumption; a Devin release-readiness worker owns that repair and final docs. The saved live smoke has a completed organiser and valid ten-perspective proposal, but reviewer discussion and scribe completion have not yet been verified live. Worker concurrency is kept small during recovery.
+After the Orca crash, the primary Codex orchestrator recovered the clean checkout, reclaimed the build Run, and reran `npm test`: 223/223 passed on Windows Node 26.7.0. Linux Node 22/24 CI exposed an independence-test path assumption; the repaired test allows the reviewer's own output while rejecting peer artifacts on both path styles. Prompts and documentation now match actual commands, artifact paths, config keys, permission handling, approval wakes, and cooperative access restrictions. Updated CI results remain to be observed.
+
+The saved live smoke has a completed organiser and valid ten-perspective proposal, but reviewer discussion and scribe completion have not yet been verified live. Actual Orca receipts exposed a settlement-state mismatch in the adapter; its repair and outcome-safety regressions are being finalized before the smoke resumes. Worker concurrency is kept small during recovery.

@@ -13,10 +13,14 @@ limitations, and honest coverage.
 
 ## Requirements
 
-- **Node.js >= 22** (tested on 22.x and 24.x). No runtime dependencies.
-- **Orca** CLI on `PATH` (or `ORCA_CLI_COMMAND`) — the only production host in v1.
-- **Devin CLI** on `PATH` for real review workers (default agent `devin`,
-  model `swe-2-max`). Other agent CLIs are optional.
+- **Node.js >= 22**. No runtime dependencies. The CI matrix covers Node
+  22.x/24.x on Linux; local validation ran on Windows Node 26.7.0.
+- **Orca** CLI on `PATH` (or `ORCA_CLI_COMMAND`) — the only production host in
+  v1; the adapter surface is verified against Orca 1.4.261
+  ([docs/ORCA-COMPATIBILITY.md](docs/ORCA-COMPATIBILITY.md)).
+- **Devin CLI** on `PATH` for real review workers — `devin` + `swe-2-max` is
+  the only allowlisted and live-validated lane. Other agent CLIs need an
+  explicit adapter policy and are unverified.
 
 ## Build & run
 
@@ -27,6 +31,8 @@ npm run build
 node dist/src/cli.js init --objective ./OBJECTIVE.md --target /path/to/project
 node dist/src/cli.js start-supervisor --run <runDir>   # or supervise --advance yourself
 node dist/src/cli.js status --run <runDir> --json
+# at the gate: write roster.approved.json, then
+node dist/src/cli.js approve --run <runDir> --roster <runDir>/roster.approved.json
 ```
 
 The package also exposes a `council` bin → `dist/src/cli.js`. See
@@ -41,6 +47,10 @@ operating guide.
   discussion → scribe → report; durable journal-backed state; hash-bound
   approval invalidated by config/source drift; bounded launches/concurrency/
   deadlines/envelopes enforced by the runner.
+- **Status**: module and acceptance tests pass (`npm test`); a reduced live
+  Orca smoke (10 perspectives, 2 reviewers) is **pending** — see
+  [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Do not read this as a finished,
+  live-validated product.
 - **Cooperative (prompt-level, not sandboxed)**: reviewer edit restrictions,
   network/egress limits, and per-worker token/tool budgets. The runner enforces
   what it can observe; the rest is enforced by the worker prompts.

@@ -29,14 +29,17 @@ Commands below use two placeholders:
 ## Ground rules (read first)
 
 - **Preserve your Run binding.** Record it once and always pass `--run` explicitly
-  to orchestration commands you issue yourself. The council runs inside a child
-  Run owned by the supervisor worker, so your own Run is never touched — and you
-  never run `run-create`/`run-use` for the council yourself; binding a child Run
-  is the supervisor's job. Re-run `run-current` after launching the supervisor to
-  confirm your binding is unchanged.
+  to orchestration commands you issue yourself. The council runs inside a
+  separate child Run created by the `council` CLI's host adapter on the first
+  `supervise --advance` (under whichever agent drives it — the supervisor
+  worker, or you in manual mode), so your own Run is never touched — and you
+  never run `run-create`/`run-use` for the council yourself. Re-run
+  `run-current` after launching the supervisor to confirm your binding is
+  unchanged.
 - **Only an agent consumes its own mail.** Plain `check`/`--ack` on a mailbox
-  marks mail handled and hides it from the agent that owns it. The supervisor's
-  `council` CLI only ever uses `check --peek` / `inbox`. You may run consuming
+  marks mail handled and hides it from the agent that owns it. The `council`
+  CLI's host adapter never runs `check` or `--ack` at all — observation is via
+  read-only `inbox` and `worker-*` commands only. You may run consuming
   `check` for YOUR OWN mailbox only; never for a helper's.
 - **No polling, no sleeps.** Everything is wake-driven: after any step that has
   nothing to do, end your turn; Orca wakes you when mail or a `worker_done`
@@ -61,11 +64,13 @@ Save the `runId` (may be `null`). If anything ever rebinds you, restore with
 COUNCIL init --objective <objective-file> --target <path> [--config <file>] --json
 ```
 
-Writes `.council/runs/<crun_id>/` inside the target: `objective.md`,
-`snapshot.json`, `state.json`, and `prompts/supervisor.md` — the generated
-supervisor spec. `--config` overrides defaults (participants 15, concurrency 5,
-rounds 1 of max 3, findings/reviewer 7, challenges/reviewer/round 3, envelope
-8192 bytes, launch and wall-clock limits).
+Writes `.council/runs/<crun_id>/` inside the target: `council.json`,
+`objective.md`, `snapshot.json`, `state.json`, `meta.json`, and
+`prompts/supervisor.md` — the generated supervisor spec. `--config` overrides
+defaults (`requestedPerspectives` 15 of 10–25, `participants` 15,
+`concurrency` 5, `rounds` 1 of 1–3, `maxFindingsPerSeat` 7,
+`maxChallengesPerSeatPerRound` 3, `envelopeBytes` 8192, computed `maxLaunches`
+floor + slack, `deadlines` object — see docs/USAGE.md for the full table).
 
 **Enforcement honesty:** budgets the runner physically forwards or launches —
 concurrency, launches/phases, rounds, envelope bytes, per-recipient envelopes —
@@ -77,14 +82,27 @@ prevention.
 ## Step 2 — launch the dedicated supervisor
 
 The supervisor is a Devin `swe-2-max` worker that exists to carry a Dispatch
-identity and receive wakes; it runs only `council supervise --advance`. Two
-approved launch lanes:
+identity and receive wakes; it runs only `council supervise --advance`.
 
-**Default — custom argv lane (pins the model):**
+**Default — the CLI does it:**
+
+```text
+COUNCIL start-supervisor --run <runDir> [--wait-ms <n>] --json
+```
+
+One command: creates the Orca Task from `prompts/supervisor.md`, opens a
+terminal on the pinned lane `devin --model swe-2-max --permission-mode
+dangerous`, waits for the agent prompt (`--wait-ms`, default 60 s), binds the
+Task with `worker-start`, and records the supervisor's
+`{terminalHandle, dispatchId}` in `state.json` so `council approve` can
+address its wake. Save the printed `dispatchId`.
+
+**Manual equivalent** (what `start-supervisor` runs internally — use only to
+debug or when the command cannot reach Orca):
 
 ```text
 ORCA orchestration task-create --spec-file <runDir>/prompts/supervisor.md --task-title "Council supervisor" --json
-ORCA terminal create --worktree active --title council-supervisor --command "devin --model swe-2-max" --json
+ORCA terminal create --worktree active --title council-supervisor --command "devin --model swe-2-max --permission-mode dangerous" --json
 ORCA terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
 ORCA orchestration worker-start --task <taskId> --terminal <handle> --worktree current --json
 ```
@@ -134,24 +152,32 @@ the exact command. Before approving, READ the proposal:
                                 #  reviewQuestions[]}
 ```
 
-Write your selection to `<runDir>/roster.approved.json`: a subset of the
-proposed perspective ids, one per seat, each with an explicit
-`{lane, agent, model}` — default lane `argv`, agent `devin`, model `swe-2-max`.
-Then:
+Write your selection to `<runDir>/roster.approved.json` — exactly
+`config.participants` `seats`, each
+`{seatId, perspectiveId, participantId, agent: {agent, model, permissionMode}}`:
+`perspectiveId` must come from the proposal (one per seat, no duplicates), and
+the agent choice is explicit and approval-bound — the only allowlisted and
+live-validated lane is `devin` / `swe-2-max` / permissionMode `bypass` (the
+adapter maps `bypass` → Devin CLI `--permission-mode dangerous`; any other
+posture needs an explicit adapter policy). Then:
 
 ```text
 COUNCIL approve --run <runDir> --roster <runDir>/roster.approved.json [--note "<why>"]
 ```
 
-This writes `approval.json` binding `sha256(canonical({objective, approved
-roster, config, snapshot}))`. Reviewers cannot launch before it exists. Any
-later change to the objective, selection, config, or the target tree itself
-(re-hashed at launch) invalidates the approval and returns the run to
-`awaiting_approval` — approve again explicitly. There is no soft approval.
+This writes `approval.json` binding
+`sha256(canonical({runId, objective, seats, proposedRosterHash, config,
+snapshotId, snapshotHeadHash}))` — the whole proposed roster is hashed in, so
+editing the proposal invalidates too. Reviewers cannot launch before a valid
+approval exists. Any later change to the objective, selection, config, or the
+target tree itself invalidates it and blocks launches; a mid-run invalidation
+is cured only by re-approving the *exact same* seats/agents (start a new run
+to change the roster). There is no soft approval.
 
-**Approval is two actions, not one.** Writing `approval.json` changes files but
-wakes nobody — the supervisor is idle waiting for mail. After `council approve`
-succeeds, explicitly wake it:
+**Approval is two actions, not one.** `council approve` emits a journaled
+approval-wake notification through the engine (to the bound council Run,
+carrying the supervisor's dispatch id) AND prints an explicit `wakeCommand` —
+send it, because a file write alone never wakes the supervisor agent:
 
 ```text
 ORCA orchestration send --to dispatch:<supervisorDispatchId> --subject "approval recorded" --body "approval.json written for run <crun_id>; run council supervise --advance"
@@ -167,10 +193,14 @@ ORCA orchestration send --to dispatch:<supervisorDispatchId> --subject "approval
 - On `finished`, the supervisor's `worker_done` carries the outcome and
   `--report-path`. Read `<runDir>/report.md` first, then `report.json`. A
   partially failed run is marked partial — never treat it as clean.
-- Evidence: citation re-resolution against the recorded snapshot happens inside
-  `advance` at the report barrier and is journaled in `events.jsonl`; a matching
-  citation alone never upgrades a claim to `verified_defect` — that grade needs
-  captured reproduction or a contradiction validated by another participant.
+- Evidence: `code_location` citations are re-resolved against the recorded
+  snapshot (path in the manifest, line range and snippet against the file
+  text) when findings enter the canonical ledger — invalid pieces are rejected
+  and journaled, and claims built only on rejected evidence grade
+  `unsupported`. Grades are derived, never trusted: in v1 reviewer-produced
+  evidence can never reach `verified_defect` — the ceiling is
+  `plausible_risk`, and a matching citation or peer agreement upgrades
+  nothing.
 
 ## Cancellation
 
@@ -213,14 +243,18 @@ supervisor. The same ground rules apply: no poll loops, your own mailbox only.
 
 ## Honest boundaries (do not over-promise)
 
-- Reviewer edit bans, "no external communication", and egress limits are
+- Reviewer edit bans, "no peer mail/reads", and egress limits are
   **cooperative** prompt-level rules, not sandbox guarantees. The run verifies
-  drift afterwards (snapshot re-hash); it cannot prevent a determined worker.
+  drift afterwards (snapshot re-hash detects files changed — never who changed
+  them); it cannot prevent a determined worker or observe reads/egress.
 - No Orca MCP server or native plugin is involved — none exists for this on
   Orca 1.4.261; do not promise one.
 - The product never installs this skill, changes permissions, or edits global
   config; all permission posture is chosen explicitly per launch and recorded in
   the approval.
-- `council` command names here reflect the approved design in
-  `docs/design/IMPLEMENTATION.md`; `docs/USAGE.md` marks which are already
-  implemented in the current build.
+- Live validation status: module and acceptance tests pass; the reduced live
+  smoke (10 perspectives / 2 reviewers) is **pending** — a settlement-detection
+  stall in the host adapter is under repair (docs/ORCA-COMPATIBILITY.md §7).
+  Do not claim an end-to-end live run until it records real receipts.
+- `council` commands here are the implemented CLI; `docs/USAGE.md` is the
+  authoritative reference (flags, artifact paths, config keys).
