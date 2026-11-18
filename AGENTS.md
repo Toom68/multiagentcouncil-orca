@@ -6,6 +6,7 @@ Build an Orca-first review council. Read `docs/BRIEF.md` before implementation.
 
 - The primary orchestrator owns architecture approval, integration, commits, and pushes.
 - Use Devin CLI with the exact model `swe-2-max` for development workers. Do not substitute a paid model or launch Codex workers without the primary orchestrator's explicit approval.
+- The user requested Devin bypass mode for development. Launch future development workers with `devin --model swe-2-max --permission-mode dangerous`; this does not expand their assigned task or file ownership.
 - Stay within the files assigned in your dispatch. Ask before changing another worker's files or shared interfaces.
 - Planning workers write only their assigned design document. Do not commit or push from a shared checkout.
 - Use Orca orchestration mail for peer and coordinator communication. Do not steer another worker through terminal input. End your turn when waiting for orchestration replies; do not poll.

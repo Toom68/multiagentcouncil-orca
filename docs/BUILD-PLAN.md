@@ -19,3 +19,5 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 - Review methodology planner owns `docs/design/review-methodology-proposal.md`.
 
 All three must identify tradeoffs, failure modes, an implementable first version, and evidence for host capability claims. They may exchange ideas through Orca mail. These are proposals; the primary orchestrator chooses and records the final design before implementation.
+
+The three design workers have been launched in Orca using Devin `swe-2-max`. Stage 1 remains pending until their proposals have been reviewed and integrated. The user requested bypass mode for these development workers.
