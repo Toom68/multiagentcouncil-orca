@@ -55,6 +55,11 @@ function proc(partial: Partial<ProcessResult>): ProcessResult {
 }
 
 const okEnv = (result: unknown) => proc({ stdout: JSON.stringify({ ok: true, result }) });
+/** `orca terminal` success receipt shape verified on 1.4.261: the top-level
+ *  envelope `id` is the only request evidence — there is no result.mutation
+ *  and no --full flag on terminal commands. */
+const okTerm = (result: unknown, id = 'term-rcpt-1') =>
+  proc({ stdout: JSON.stringify({ id, ok: true, result }) });
 /** Success mutation receipt shape verified on 1.4.261 (--full): top-level receipt
  *  id + result.mutation.{requestId,replayed}. */
 const okMut = (result: unknown, requestId = 'req-uuid-1') =>
@@ -309,7 +314,7 @@ describe('OrcaAdapter.createRun/createTask', () => {
 describe('OrcaAdapter.launchWorker', () => {
   const devinLaunchHandler = (): ((args: readonly string[]) => ProcessResult) => (args) => {
     const cmd = args[1];
-    if (cmd === 'create') return okMut({ terminal: { handle: 'term_new1' } }, 'req-tc-1');
+    if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
     if (cmd === 'wait') return okEnv({ idle: true });
     if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
     if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
@@ -328,6 +333,11 @@ describe('OrcaAdapter.launchWorker', () => {
 
     const create = calls[0];
     assert.deepEqual(create.slice(0, 2), ['terminal', 'create']);
+    // `orca terminal` commands have no --full (verified: invalid_argument:
+    // "Unknown flag --full") and no retry semantics — the argv must be bare.
+    for (const bad of ['--full', '--retry-request']) {
+      assert.ok(!create.includes(bad), `terminal create must not carry ${bad}`);
+    }
     const cmdArg = create.find((a) => a.startsWith('--command='));
     // Devin CLI --permission-mode accepts only auto|accept-edits|smart|dangerous
     // (verified on this host). "bypass" is user-facing config vocabulary and
@@ -335,12 +345,19 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.equal(cmdArg, '--command=devin --model swe-2-max --permission-mode dangerous');
     assert.doesNotMatch(cmdArg ?? '', /bypass/);
 
+    const wait = calls[1];
+    assert.deepEqual(wait.slice(0, 2), ['terminal', 'wait']);
+    for (const bad of ['--full', '--retry-request']) {
+      assert.ok(!wait.includes(bad), `terminal wait must not carry ${bad}`);
+    }
+
     const start = calls[2];
     assert.deepEqual(start.slice(0, 2), ['orchestration', 'worker-start']);
     for (const flag of ['--task', '--run', '--terminal', '--worktree', '--json']) {
       assert.ok(start.includes(flag), `missing ${flag}`);
     }
     assert.ok(!start.includes('--retry-request'), 'first-attempt worker-start must not carry --retry-request');
+    assert.ok(start.includes('--full'), 'orchestration mutations keep --full for requestId capture');
     assert.ok(start.includes('task_aaa'));
     assert.ok(start.includes('term_new1'));
     // LaunchResult.requestId carries the ORCA-issued request id (recovery handle).
@@ -439,7 +456,7 @@ describe('OrcaAdapter.launchWorker', () => {
         ? failMut('outcome_unknown', 'req-orca-77')
         : args[1] === 'worker-list'
           ? okEnv({ workers: [] })
-          : okMut({ terminal: { handle: 'term_x' }, idle: true }, 'req-tc-1'),
+          : okTerm({ terminal: { handle: 'term_x' }, idle: true }, 'rcpt-tc-1'),
     );
     const res = await adapter.launchWorker(launchSpec());
     assert.ok(res.ok);
@@ -524,7 +541,7 @@ describe('OrcaAdapter mutation recovery', () => {
   it('retryMutation re-issues the logged argv with --retry-request only after absent', async () => {
     const { adapter, calls } = makeAdapter((args) => {
       if (args[1] === 'request-show') return okEnv({ requestId: 'req-ws-1', state: 'absent' });
-      if (args[1] === 'create') return okMut({ terminal: { handle: 'term_r' } }, 'req-tc-1');
+      if (args[1] === 'create') return okTerm({ terminal: { handle: 'term_r' } }, 'rcpt-tc-1');
       if (args[1] === 'wait') return okEnv({ idle: true });
       if (args[1] === 'worker-start') {
         return args.includes('--retry-request')
@@ -554,7 +571,7 @@ describe('OrcaAdapter mutation recovery', () => {
         args[1] === 'request-show'
           ? okEnv({ requestId: 'req-ws-1', state })
           : args[1] === 'create'
-            ? okMut({ terminal: { handle: 'term_r' } }, 'req-tc-1')
+            ? okTerm({ terminal: { handle: 'term_r' } }, 'rcpt-tc-1')
             : args[1] === 'wait'
               ? okEnv({ idle: true })
               : okMut({ dispatchId: 'ctx_d1' }, 'req-ws-1'),

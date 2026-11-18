@@ -76,6 +76,15 @@ Terminals:
 - `terminal create [--worktree <sel>] [--title <t>] [--command <text>] --json` → result containing the terminal handle (`result.terminal.handle`/`result.handle`; adapter extracts tolerantly).
 - `terminal wait --terminal <handle> --for tui-idle [--timeout-ms n] --json` — readiness probe.
 - `terminal show / list` — handle/state inspection.
+- **`orca terminal` is a different command class than `orca orchestration`:**
+  `create`/`wait` have **no `--full`** (verified live —
+  `invalid_argument: Unknown flag --full for command: terminal create`
+  killed a launch when the flag leaked onto it) and **no `--retry-request`**
+  equivalent. Their envelope's top-level `id` (verified live:
+  `terminal create` → `{"id":"d7c3581f-…"}`) is the only request evidence;
+  it is recorded for observability but is **never** replayed. The adapter
+  scopes `mutation: true`/`--full` strictly to `orchestration` commands and
+  emits terminal argv bare.
 
 ## 3. Run binding, identity, and durable IDs
 
@@ -109,10 +118,14 @@ Verified facts:
 The lane the adapter implements (`startPhaseWorker`, lane `argv`):
 
 ```
-terminal create --worktree <sel> --title <t> --command "devin --model swe-2-max --permission-mode dangerous"
-terminal wait --terminal <term_…> --for tui-idle --timeout-ms <n>
+terminal create --worktree <sel> --title <t> --command "devin --model swe-2-max --permission-mode dangerous"   # bare — no --full
+terminal wait --terminal <term_…> --for tui-idle --timeout-ms <n>                                          # bare — no --full
 orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --terminal <term_…> --json --full
 ```
+
+The durable uncertain-outcome surface of this lane is `worker-start` (the
+orchestration mutation carrying the request id); the two `terminal` steps
+are evidence-only and are never retry-requested.
 
 - The `--command` string is assembled **only** from allowlisted tokens:
   binary ∈ `allowedAgentBinaries` (default `['devin']`), flags are fixed
@@ -150,7 +163,9 @@ orchestration worker-start --task <task_id> --run <run_id> --worktree <sel> --te
     "mutation":{"requestId":"a50e6900-…","replayed":false}},"_meta":{…}}`
     → the recovery handle is `result.mutation.requestId` (UUID). The plain
     `--json` receipt trims to `{"ok":true,"result":{"messageId":"msg_…"}}`
-    with no request id — mutations therefore always request `--full`.
+    with no request id — **orchestration** mutations therefore always
+    request `--full` (only `orchestration` commands accept it; see
+    "Terminals" above for the verified `terminal create` rejection).
   - Failure receipt (verified):
     `{"ok":false,"error":{"code":"terminal_not_found","message":"…
     Orchestration mutation request ID: ec262ac1-…","data":

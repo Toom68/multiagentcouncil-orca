@@ -185,6 +185,11 @@ export function buildAgentCommandText(tokens: readonly string[]): string {
 
 export interface OrcaEnvelope {
   ok: boolean;
+  /** Top-level receipt id. On `orca terminal` commands this is the only
+   *  request evidence (verified 1.4.261: `terminal create` returns
+   *  `{"id":"d7c3581f-…"}`); orchestration mutations additionally carry
+   *  `result.mutation.requestId`, which takes precedence. */
+  id?: string;
   result?: unknown;
   error?: { code?: string; message?: string; data?: unknown };
 }
@@ -192,9 +197,12 @@ export interface OrcaEnvelope {
 const STDERR_ERROR_RE = /(?:^|\n)\s*error:\s*([a-z_]+):\s*(.+?)\s*$/i;
 
 /**
- * Orca-issued orchestration request id from a receipt envelope.
- * Verified locations (1.4.261): success `result.mutation.requestId` (+ a
- * `replayed` flag) under `--full`; failure `error.data.orchestrationRequestId`.
+ * Orca-issued request/receipt id from a receipt envelope. Verified locations
+ * (1.4.261), in precedence order: success `result.mutation.requestId` (+ a
+ * `replayed` flag) under `--full`; failure `error.data.orchestrationRequestId`;
+ * otherwise the envelope's top-level `id` — the only evidence `orca terminal`
+ * receipts carry. Only orchestration request ids are valid `--retry-request`
+ * values; a terminal receipt id is recorded for observability, never replayed.
  */
 export function extractRequestId(env: OrcaEnvelope): string | undefined {
   const r = typeof env.result === 'object' && env.result !== null
@@ -215,6 +223,7 @@ export function extractRequestId(env: OrcaEnvelope): string | undefined {
     const v = (data as Record<string, unknown>).orchestrationRequestId;
     if (typeof v === 'string' && v.length > 0) return v;
   }
+  if (typeof env.id === 'string' && env.id.length > 0) return env.id;
   return undefined;
 }
 
@@ -357,8 +366,13 @@ export class OrcaHost {
    *
    * `mutation: true` appends `--full` so the receipt carries
    * `result.mutation.requestId` (the Orca-issued request id needed for
-   * recovery). `retryRequestId` appends `--retry-request <id>` — the ONLY
-   * legitimate use, re-issuing an earlier Orca request after request-show.
+   * recovery) and logs the argv for `retryMutation`. It is for
+   * `orchestration` commands ONLY — `orca terminal` commands have no
+   * `--full` and no retry semantics (verified 1.4.261:
+   * `invalid_argument: Unknown flag --full`), so they must run bare; their
+   * top-level envelope `id` is still captured as receipt evidence.
+   * `retryRequestId` appends `--retry-request <id>` — the ONLY legitimate
+   * use, re-issuing an earlier Orca orchestration request after request-show.
    */
   async run<T = unknown>(
     args: readonly string[],
@@ -648,6 +662,8 @@ export class OrcaHost {
       terminalHandle = handle;
     } else if (input.lane.kind === 'argv') {
       const commandText = this.validatedAgentCommand(input.lane);
+      // `orca terminal` commands take no --full and are never retry-requested;
+      // the receipt's top-level `id` is still captured via extractRequestId.
       const created = await this.run<{ handle?: string; terminal?: { handle?: string } }>([
         'terminal',
         'create',
@@ -656,7 +672,7 @@ export class OrcaHost {
         '--title=' + (input.title ?? `council-${taskId.slice(-8)}`),
         '--command=' + commandText,
         '--json',
-      ], { mutation: true });
+      ]);
       receipts.terminalCreate = created.ok ? created.value : created.error;
       if (!created.ok) {
         return {
