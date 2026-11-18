@@ -29,3 +29,27 @@ Findings should include impact, severity, confidence, supporting references (cod
 ## Initial delivery acceptance
 
 A documented installation/invocation path, real Orca worker integration, an enforceable roster approval gate, independent reviews plus actual message exchange, a separate scribe, persisted progress and artifacts, bounded resource use, failure visibility, and meaningful automated and live smoke checks. Clearly label anything deferred or unavailable.
+
+## Public-use extension requested 2026-11-19
+
+Install the capability once so an agent in an Orca project can discover the
+council instructions from a request such as “spin up a council”, without the
+user pasting a checkout-specific path. Use supported agent/Orca discovery
+mechanisms, with portable installation, update and removal instructions; do
+not invent native plugin skill contributions where Orca does not support them.
+
+Council execution is provider-neutral: the primary agent can recommend a mix
+of installed CLI agents, explicit models, and supported suppliers for individual
+seats and staff roles. This product behavior is separate from this repository's
+development-worker choice of free Devin SWE-2 Max. Do not hard-code this user's
+paths, subscription assumptions, free-model preferences or bypass posture as
+universal public settings.
+
+Honor explicit user choices and relevant chat/saved preferences. When provider
+permission, cost limits or selection preferences remain unknown, ask a short
+question before launching work that depends on them. Explain model selection
+without claiming a universally best model or inferring that an installed CLI
+is authenticated, free or approved for unlimited use. Bind actual role/seat
+choices to the run and approval; do not silently substitute a provider/model.
+Keep the organiser → roster approval → independent reviews → bounded discussion
+→ separate scribe flow and all existing recovery/resource safeguards.
