@@ -234,7 +234,10 @@ marks the run `cancelled`, and reports what is confirmed vs unverifiable.
 supervisor itself must go, `ORCA orchestration worker-stop --dispatch
 <supervisorDispatchId>`; `worker-abandon` only fences it when you must force
 abandonment. Never `terminal close` a worker terminal; `worker-release` reclaims
-settled workers.
+settled workers only when Orca confirms release. A kept-open/user-retained
+session may return `ok:true` with `state:retained`: this is not release proof.
+Respect that custody decision. Stop/release uncertainty must stay visible;
+never infer process exit from an accepted command or a quiet terminal.
 
 ## Recovery from uncertain outcomes
 
@@ -308,11 +311,12 @@ and binds you to it — restore your prior binding afterwards if you had one.
 - The product never installs this skill, changes permissions, or edits global
   config; all permission posture is chosen explicitly per launch and recorded in
   the approval.
-- Live validation status: module and acceptance tests pass; the reduced live
-  smoke (10 perspectives / 2 reviewers) is **pending** — the supervisor-recovery
-  path (child-Run rebind + one task reconciliation) was exercised live against
-  a real crashed-supervisor run, but no end-to-end run has finished yet
-  (docs/ORCA-COMPATIBILITY.md §7). Do not claim an end-to-end live run until
-  it records real receipts.
+- Live validation status: the reduced council completed the full protocol
+  (10 proposed perspectives, 2 selected reviewers, real peer discussion,
+  separate scribe), with **partial** coverage because one independent output
+  failed schema validation. Recovery through a child-Run rebind and exact
+  no-effect task reconciliation was exercised live. The 15-seat lifecycle is
+  tested with a fake host; live scale and long-run stability are unverified.
+  See docs/VERIFICATION.md for real receipts and limitations.
 - `council` commands here are the implemented CLI; `docs/USAGE.md` is the
   authoritative reference (flags, artifact paths, config keys).

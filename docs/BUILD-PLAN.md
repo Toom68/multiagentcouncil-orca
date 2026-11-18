@@ -8,9 +8,9 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 | 1 | Compare architecture and host integration options; define review quality and protocol | Complete |
 | 2 | Approve architecture, contracts, file ownership, and implementation assignments | Complete |
 | 3 | Implement durable council core and approval enforcement | Complete |
-| 4 | Implement Orca execution, agent messaging, organiser, and scribe | Pending: adapter and protocol implemented; complete live council validation outstanding |
+| 4 | Implement Orca execution, agent messaging, organiser, and scribe | Complete: real reduced council finished every phase, with partial coverage explicitly reported |
 | 5 | Implement invocation surfaces, installation, and user documentation | Complete |
-| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: 254 local tests pass, audit fixes landed, and Node 22/24 Linux CI is green; live smoke finalization outstanding |
+| 6 | Independent review, integration tests, live Orca smoke test, and fixes | Pending: final guarded-cleanup edge-case review and CI for its integration; 282 tests pass and live evidence is recorded |
 
 ## Design assignments
 
@@ -24,6 +24,6 @@ All three planning workers delivered their proposals and exchanged focused peer 
 
 The shared TypeScript interfaces, validation, storage/snapshots, protocol/claims/reports, host adapter, prompts/skill, CLI, CI definition, and acceptance fixture have been implemented and pushed. Approval includes the full proposal hash and explicit worker Run IDs. An independent lightweight Codex audit found timeout slot accounting and final-source-drift gaps; fixes are committed with tests.
 
-After the Orca crash, the primary Codex orchestrator recovered the clean checkout, reclaimed the build Run, and reran `npm test`: 223/223 passed on Windows Node 26.7.0. Linux Node 22/24 CI exposed an independence-test path assumption; the repaired test allows the reviewer's own output while rejecting peer artifacts on both path styles. Prompts and documentation now match actual commands, artifact paths, config keys, permission handling, approval wakes, and cooperative access restrictions. Updated CI results remain to be observed.
+After the Orca crash, the primary recovered the saved council through dedicated-supervisor rebinding and exact no-effect task reconciliation. Linux Node 22/24 CI passes after repairing a cross-platform independence-test assumption. Real Orca receipts drove fixes for mutation retry IDs, terminal flags, explicit settlement outcomes, and cleanup truthfulness.
 
-Actual Orca receipts exposed a settlement-state mismatch in the adapter; its repair and outcome-safety regressions are committed and pass against the saved organiser receipt. GitHub CI for commit `f13c9ec` completed successfully on Node 22 and 24. The recovered live supervisor has admitted the ten-perspective proposal and received primary-orchestrator approval for two complementary Devin seats with one discussion round. Reviewer discussion and scribe completion remain to be verified live. Worker concurrency is kept small during recovery.
+The reduced live council completed organiser, approval, independent reviews, peer challenge/response, and separate-scribe synthesis. Its report contains seven canonical claims covering all four fixture seeds and preserving dissent. Coverage is explicitly partial: one independent output failed strict schema admission, two invalid evidence snippets were excluded, and discussion bounds omitted assignments. The 15-seat lifecycle is covered by a deterministic fake-host test, not a live load test. See `docs/VERIFICATION.md` for concrete receipts, checks, and limits. Final cleanup-source integration and CI remain before stage 6 closes.

@@ -47,10 +47,13 @@ operating guide.
   discussion → scribe → report; durable journal-backed state; hash-bound
   approval invalidated by config/source drift; bounded launches/concurrency/
   deadlines/envelopes enforced by the runner.
-- **Status**: module and acceptance tests pass (`npm test`); a reduced live
-  Orca smoke (10 perspectives, 2 reviewers) is **pending** — see
-  [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Do not read this as a finished,
-  live-validated product.
+- **Status**: the reduced live Orca council completed the full protocol
+  (10 proposed perspectives, 2 selected reviewers, one discussion round and
+  a separate scribe). Its report is **partial**: one review was rejected for
+  malformed output; seven admitted findings covered all four planted defects
+  and preserved a severity disagreement. Automated tests cover the full
+  15-seat lifecycle; a 15-seat live load test remains unverified. See
+  [docs/VERIFICATION.md](docs/VERIFICATION.md) for evidence and limits.
 - **Cooperative (prompt-level, not sandboxed)**: reviewer edit restrictions,
   network/egress limits, and per-worker token/tool budgets. The runner enforces
   what it can observe; the rest is enforced by the worker prompts.
@@ -65,5 +68,6 @@ npm test               # node --test dist/test/*.test.js
 ```
 
 [docs/BRIEF.md](docs/BRIEF.md) · [docs/USAGE.md](docs/USAGE.md) ·
+[docs/VERIFICATION.md](docs/VERIFICATION.md) ·
 [docs/design/IMPLEMENTATION.md](docs/design/IMPLEMENTATION.md) ·
 [docs/design/CONTRACTS.md](docs/design/CONTRACTS.md)

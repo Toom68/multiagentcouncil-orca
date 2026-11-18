@@ -3,11 +3,12 @@
 Scope: `src/host/process.ts` (safe subprocess boundary) and `src/host/orca.ts`
 (Orca CLI adapter). Everything labeled **verified** was exercised against Orca
 **1.4.261** on Windows (`C:\Users\tomy\AppData\Local\Programs\orca\resources\bin\orca`)
-during the integration-design phase or via `--help` / live read commands.
+during integration design and the reduced live council, or via `--help` / live read commands.
 Anything not exercised live is labeled **assumed from docs/help** and carries a
-receipt-validation note in `src/host/orca.ts`. A full end-to-end council smoke
-(organiser → approval → reviewers → discussion → scribe → report) has not
-completed yet — see §7 item 9 for the stall it surfaced.
+receipt-validation note in `src/host/orca.ts`. A reduced end-to-end council
+(organiser → approval → reviewers → discussion → scribe → report) completed
+with partial review coverage. [VERIFICATION.md](VERIFICATION.md) records the
+receipts, output rejection, recovery, and cleanup caveats.
 
 ## 1. Executable and process spawning (Windows)
 
@@ -56,7 +57,7 @@ Workers:
 - `orchestration worker-read --dispatch <ctx_...> [--limit n] [--cursor <c>] [--source auto|transcript|terminal] --json` (**verified help**). Output includes agent name and model as seen by the host (e.g. "SWE-2 Max").
 - `orchestration worker-stop --dispatch <ctx>` — fences + stops supervised processes; `stop_unknown` possible (**verified help/behavior docs**).
 - `orchestration worker-abandon --dispatch <ctx>` — fence without claiming process termination.
-- `orchestration worker-release --dispatch <ctx>` — archives output then releases the terminal (settled workers only).
+- `orchestration worker-release --dispatch <ctx>` — guarded release of a reclaimable settled worker; may return `ok:true` with `state:retained` and perform no process action (verified live; see §7).
 - `orchestration worker-keep-open --dispatch <ctx>` — cancels auto-release so a terminal can receive a later-phase Task.
 - `orchestration dispatch / dispatch-show` — inspect dispatch records.
 
@@ -90,12 +91,17 @@ Terminals:
 
 ## 3. Run binding, identity, and durable IDs
 
-- A worker (this adapter) has **no bound Run** (`run-current` → `null`). The
-  primary orchestrator's Run is `run_<hex>`; the council supervisor must own a
-  **separate child Run** created with `run-create`, and every subsequent call
-  carries explicit `--run <run_id>` so the caller's binding is never assumed or
-  stolen. `gate-list`/`send`/`worker-*` without `--run` fail with
-  `run_required` — the adapter always passes it.
+- A fresh worker may have **no bound Run** (`run-current` → `null`). The
+  council runs in a **separate child Run** created by `run-create`; creating
+  it binds that caller. A dedicated supervisor preserves the primary agent's
+  binding. Manual first `advance` therefore changes its caller's binding;
+  restore the prior one as documented in USAGE. Run-scoped creation/list
+  commands carry explicit IDs; Dispatch commands carry the exact Dispatch ID
+  and still require appropriate caller custody. IDs do not grant authority.
+- A restarted dedicated supervisor uses `--as-supervisor` to verify its
+  recorded terminal identity, bind to the saved child Run, and verify that
+  binding before advancing. This recovered a real crashed-supervisor run;
+  manual mode does not issue `run-use`.
 - Durable identities the adapter persists in every result: `runId`, `taskId`,
   `dispatchId` (`ctx_…`, addressable as `dispatch:ctx_…`), `terminalHandle`
   (`term_…`), plus the Orca-issued `requestId` from each mutation receipt —
@@ -195,27 +201,31 @@ are evidence-only and are never retry-requested.
 
 ## 6. Enforcement reality
 
-- **Host-enforced (hard)**: mail isolation between dispatches, `run_required`
-  for Run-scoped commands, permission `deny`/`approve` at gates, launch/turn
-  limits on supervised workers, child-worktree write confinement, dedup by
-  `requestId`, `run_required`/`invalid_argument` argument errors.
-- **Detective (post-check)**: file-scope violations are not prevented — detect
-  via `git status`/`worker-list` receipts after the fact.
-- **Cooperative (prompt-only)**: reviewer network-egress restraint, byte/round
-  budgets enforced by the council ledger (not by Orca), persona dissent
-  quality. These cannot be enforced by the host; report them honestly.
+- **Observed host controls**: caller identity/Run custody, guarded
+  stop/release, Orca-issued mutation request replay, and command argument
+  validation. Do not infer filesystem or mail-read isolation from these.
+- **Council-enforced**: approval binding, phase order, launch/concurrency
+  limits, forwarded envelope bytes, message counts, and deadline checks when
+  `advance` runs. There is no background deadline daemon.
+- **Detective (post-check)**: snapshot re-hash detects source drift. It cannot
+  prevent changes or identify which worker made them.
+- **Cooperative (prompt-only)**: reviewer edit/peer-read/egress restrictions,
+  token/tool budgets inside sessions, and persona behavior. The dangerous
+  Devin permission mode is not a review sandbox.
 
 ## 7. Unverified / caveats
 
-1. Exact `worker-start`/`terminal create` receipt field names are extracted
+1. Local `worker-start`/`terminal create` receipts were exercised in the
+   completed smoke. Their field names are extracted
    tolerantly (`result.dispatchId | .dispatch.id | .dispatchId`,
    `result.terminal.handle | .handle`); reconcile via `worker-list --run` when
-   absent — live shapes not exercised during module work (no live launches).
+   absent. An unfamiliar success envelope is not proof of a launch.
 2. Whether a consuming `check` on a child-Run-bound terminal drains the
    original dispatch mailbox is **unverified** (testing risks deafening the
    caller's own mail). The adapter sidesteps this by never calling `check`.
-3. `terminal wait --for tui-idle` semantics for `devin` specifically are
-   assumed from generic help; a failed wait is treated as `uncertain`.
+3. `terminal wait --for tui-idle` succeeded for the pinned Devin lane in the
+   live smoke. Other CLIs and readiness under load remain unverified; a
+   failed wait is treated as `uncertain`.
 4. `--effort` values accepted per agent are not enumerated in help; adapter
    passes through allowlisted tokens only.
 5. Remote/`host != local` worker behavior is untested; `worker-list` exposes
@@ -226,13 +236,20 @@ are evidence-only and are never retry-requested.
    cooperative — Orca does not validate phase names.
 8. Long-running mailbox growth and `inbox --limit` pagination shape are
    unverified at scale.
-9. **Live-smoke settlement stall (open, fix in flight).** The first end-to-end
+9. **Live-smoke settlement stall (fixed and exercised).** The first end-to-end
    smoke surfaced a `worker-show` row reporting `state:"succeeded"`,
    `stage:"settled"`, `liveness:"unverifiable"`,
    `terminalState:"retained"` that the adapter's `mapLiveness` did not map to
    a settled outcome — the engine waited indefinitely on a finished worker.
-   The repair lands in `src/host/orca.ts` (separate owner). Until a reduced
-   smoke (10 proposed perspectives, 2 reviewer seats) records real
-   Task/Dispatch completion receipts, treat liveness reads through
-   `worker-list --run` and `request-show` reconciliation — never silence —
-   as the source of truth, and hold all live-integration claims as pending.
+   The repaired adapter requires an explicit logical verdict and keeps it
+   separate from physical session liveness. The saved run then completed all
+   phases; a settled success does not prove process exit or release.
+10. **Guarded cleanup may keep a terminal.** A live `worker-release` returned
+    `{state:"retained", reason:"user_requested", processAction:"none",
+    archive:null}` inside an `ok:true` envelope. The earlier adapter wrongly
+    logged `released:true` for that envelope. The repaired mapping requires
+    explicit release proof; retained, pending, unknown, and unfamiliar results
+    do not count as release. The original smoke journal is preserved with
+    this correction documented separately, not rewritten. Stop confirmation
+    is likewise distinct from command acceptance. The boolean release
+    contract cannot distinguish pending from refused; both remain unconfirmed.

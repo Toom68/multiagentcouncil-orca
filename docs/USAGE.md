@@ -300,9 +300,15 @@ council cancel --run <runDir> [--reason "<text>"] --json
 ```
 
 Guarded `requestStop` per live attempt (including `timed_out` ones — a deadline
-mark is not proof of death), releases retained terminals, marks the run
+mark is not proof of death), requests release of settled retained terminals, marks the run
 `cancelled`, and reports `confirmedStopped` vs `unverifiable` attempts. A
 worker that never reported is inspected, never assumed dead.
+
+Orca may keep user-retained or unreclaimable sessions open. Cleanup respects
+that decision: `released:false` means release was not confirmed; it does not
+prove process exit. Only an explicit stopped result confirms cancellation.
+Inspect the journal and host receipt for unresolved resources; never force-close
+them to make a run appear clean.
 
 ## Configuration
 
@@ -389,9 +395,12 @@ outcome recovery.
 
 - Module + acceptance tests (`npm test`) pass locally on Windows Node 26.7.0;
   the GitHub CI matrix runs the same suite on Linux Node 22.x/24.x.
-- A **reduced live smoke** (organiser → approval → `requestedPerspectives=10`,
-  `participants=2` reviewers → one challenge/response round → scribe, all on
-  Devin `swe-2-max`) is the designed validation target and is **pending** — a
-  first live run surfaced a settlement-detection stall in the host adapter
-  (see `docs/ORCA-COMPATIBILITY.md` §7); record its real receipts before
-  claiming live validation.
+- A **reduced live smoke completed the full protocol**: organiser → approval
+  of 2 seats from 10 perspectives → independent reviews → one real peer
+  challenge/response round → separate scribe → report, all on Devin
+  `swe-2-max`. The report is partial because one independent output failed
+  schema validation. Seven admitted claims covered the four fixture seeds,
+  with dissent and missing coverage preserved. This is small-scale live
+  validation; the 15-seat lifecycle is covered by fake-host tests, not a live
+  load test. [VERIFICATION.md](VERIFICATION.md) records the evidence and the
+  recovery/cleanup findings.
