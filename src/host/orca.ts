@@ -43,6 +43,7 @@ import {
   type RunProcessOptions,
   type SpawnPlan,
 } from './process.js';
+import { AGENT_CATALOG, resolveAgentLaunch } from '../catalog.js';
 
 // ---------------------------------------------------------------------------
 // Errors and result shapes
@@ -118,8 +119,14 @@ export type OrcaCommandResult<T> = OrcaCommandOk<T> | OrcaCommandFailure;
 
 /** Long-run safe ids/flags: alnum plus `.` `_` `-` `:` `/` (covers run_/task_/ctx_/dispatch:/run:/swe-2-max/repo paths). */
 const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
-/** Stricter rule for tokens joined into `terminal create --command` shell text. */
-const COMMAND_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$|^--[a-z][a-z0-9-]*$/;
+/**
+ * Stricter rule for tokens joined into `terminal create --command` shell text.
+ * Value tokens start alnum (never `-`, `@` — no option confusion, no
+ * PowerShell splat) and may carry provider/model:level selector punctuation
+ * (`:` `/` `+` `.` `_` `-`); flag tokens keep the strict `--word` shape.
+ * Whitespace, quotes, and every shell operator stay impossible.
+ */
+const COMMAND_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$|^--[a-z][a-z0-9-]*$/;
 /**
  * Paths handed to CLI flags (spec files, report paths). May be absolute or
  * relative to cwd; must not start with `-` (option confusion), must not
@@ -1005,7 +1012,9 @@ export class OrcaHost {
    * allowlisted model/permission tokens only — no caller text can appear here.
    */
   private validatedAgentCommand(lane: { kind: 'argv'; command: readonly string[] }): string {
-    const binaries = this.opts.allowedAgentBinaries ?? ['devin'];
+    // Default boundary = the shipped catalog binaries; explicit injection may
+    // narrow it further. Every token still passes COMMAND_TOKEN_RE below.
+    const binaries = this.opts.allowedAgentBinaries ?? CATALOG_BINARIES;
     assertAllowlisted('agent binary', lane.command[0], binaries);
     return buildAgentCommandText(lane.command);
   }
@@ -1392,12 +1401,18 @@ export interface AgentLaunchPolicy {
 }
 
 /**
- * Approved development lane: Devin pinned to swe-2-max via its own CLI
- * (--model is verified to accept it; worker-start --model is NOT honored for
- * devin). The all-tools-approved posture ("bypass" in council/AGENTS.md
- * vocabulary) maps to Devin CLI `--permission-mode dangerous` — the only
- * verified equivalent; "bypass" is NOT a valid CLI value and is never
- * emitted. Other postures require explicit policy.
+ * Binaries the shipped catalog may emit into `terminal create --command`.
+ * Source of truth is AGENT_CATALOG — an allowlist check, not a policy.
+ */
+const CATALOG_BINARIES: readonly string[] = [
+  ...new Set(Object.values(AGENT_CATALOG).map((e) => e.binary)),
+];
+
+/**
+ * Back-compat export for programmatic callers that injected explicit policies.
+ * The shipped default launch policy is src/catalog.ts (resolveAgentLaunch) —
+ * this constant is no longer consulted unless a caller passes
+ * OrcaAdapterOptions.agents explicitly.
  */
 export const DEFAULT_AGENT_POLICIES: Readonly<Record<string, AgentLaunchPolicy>> = {
   devin: {
@@ -1411,7 +1426,11 @@ export const DEFAULT_AGENT_POLICIES: Readonly<Record<string, AgentLaunchPolicy>>
 };
 
 export interface OrcaAdapterOptions extends OrcaHostOptions {
-  /** Launch policies keyed by Orca agent id; defaults to DEFAULT_AGENT_POLICIES. */
+  /**
+   * Launch policies keyed by Orca agent id. Omit for the shipped catalog
+   * (resolveAgentLaunch) — explicit injection is for programmatic
+   * back-compat/tests only and bypasses the catalog fingerprint story.
+   */
   agents?: Readonly<Record<string, AgentLaunchPolicy>>;
   /**
    * Council Run to address when WorkerLaunchSpec.runId is not populated
@@ -1470,10 +1489,6 @@ export class OrcaAdapter implements HostAdapter {
     this.boundRunId = options.boundRunId;
     if (this.boundRunId !== undefined) assertSafeValue('boundRunId', this.boundRunId);
     if (options.fromHandle !== undefined) assertSafeValue('fromHandle', options.fromHandle);
-  }
-
-  private policies(): Readonly<Record<string, AgentLaunchPolicy>> {
-    return this.opts.agents ?? DEFAULT_AGENT_POLICIES;
   }
 
   private councilRunId(explicit?: string): Result<OrcaRunId> {
@@ -1550,21 +1565,32 @@ export class OrcaAdapter implements HostAdapter {
     const runId = runIdRes.value;
 
     const choice = input.agent;
-    const policy = this.policies()[choice.agent];
-    if (policy === undefined) {
-      return failure(
-        unsupportedErr(
-          `no launch policy for agent ${JSON.stringify(choice.agent)}; configure OrcaAdapterOptions.agents`,
-          { agent: choice.agent },
-        ),
-      );
-    }
-
     let lane: WorkerLaunchLane;
-    try {
-      lane = buildLane(choice, policy);
-    } catch (e) {
-      return failure(e instanceof OrcaAdapterError ? unsupportedErr(e.message, { agent: choice.agent, model: choice.model }) : tokenErr(e));
+    if (this.opts.agents !== undefined) {
+      // Explicitly injected policies — programmatic/back-compat lane for
+      // callers that supply their own allowlists (tests, embedders). The
+      // shipped catalog remains the only production policy.
+      const policy = this.opts.agents[choice.agent];
+      if (policy === undefined) {
+        return failure(
+          unsupportedErr(
+            `no launch policy for agent ${JSON.stringify(choice.agent)}; configure OrcaAdapterOptions.agents`,
+            { agent: choice.agent },
+          ),
+        );
+      }
+      try {
+        lane = buildLane(choice, policy);
+      } catch (e) {
+        return failure(e instanceof OrcaAdapterError ? unsupportedErr(e.message, { agent: choice.agent, model: choice.model }) : tokenErr(e));
+      }
+    } else {
+      // Shared shipped catalog — single launch policy for CLI, engine and
+      // adapter. resolveAgentLaunch validates + templates in one pure step;
+      // an unavailable model/posture/profile fails here, never substituted.
+      const resolved = resolveAgentLaunch(choice);
+      if (!resolved.ok) return failure(resolved.error);
+      lane = { kind: 'argv', command: resolved.value.command };
     }
 
     const key = requestKey(

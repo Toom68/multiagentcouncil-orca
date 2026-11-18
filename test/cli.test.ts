@@ -22,6 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { SCHEMA_VERSION, type ProposedRoster, type ApprovedRoster } from '../src/contracts.js';
+import { CATALOG_VERSION, LAUNCH_POLICY_HASH } from '../src/catalog.js';
 import { createStore } from '../src/store.js';
 
 // dist/test/cli.test.js → dist/src/cli.js
@@ -82,7 +83,27 @@ interface InitFixture {
 }
 
 /** Run `council init` against a synthetic target; returns parsed output. */
-async function initRun(opts: { perspectives?: number; participants?: number; targetFiles?: Record<string, string> } = {}): Promise<InitFixture> {
+/** The pinned Devin development lane — one catalog-valid AgentChoice. */
+const DEVIN = { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' } as const;
+/** A complete explicit staff — fresh init refuses anything less. */
+const STAFF = { organiser: DEVIN, scribe: DEVIN, supervisor: DEVIN };
+
+/** Write a minimal complete-staff config file for direct init calls. */
+function staffConfig(dir: string, extra: Record<string, unknown> = {}): string {
+  const config = path.join(dir, 'config.json');
+  writeFileSync(config, JSON.stringify({ staff: STAFF, ...extra }));
+  return config;
+}
+
+async function initRun(
+  opts: {
+    perspectives?: number;
+    participants?: number;
+    targetFiles?: Record<string, string>;
+    /** Merged into the written config.json (e.g. staff overrides). */
+    config?: Record<string, unknown>;
+  } = {},
+): Promise<InitFixture> {
   const dir = tmp('init');
   const target = path.join(dir, 'target');
   writeTree(
@@ -99,17 +120,17 @@ async function initRun(opts: { perspectives?: number; participants?: number; tar
   const env: NodeJS.ProcessEnv = { COUNCIL_HOME: councilHome, ORCA_CLI_COMMAND: NO_ORCA };
 
   const args = ['init', '--objective', objective, '--target', target];
-  if (opts.perspectives !== undefined || opts.participants !== undefined) {
-    const config = path.join(dir, 'config.json');
-    writeFileSync(
-      config,
-      JSON.stringify({
-        ...(opts.perspectives !== undefined ? { requestedPerspectives: opts.perspectives } : {}),
-        ...(opts.participants !== undefined ? { participants: opts.participants } : {}),
-      }),
-    );
-    args.push('--config', config);
-  }
+  const config = path.join(dir, 'config.json');
+  writeFileSync(
+    config,
+    JSON.stringify({
+      ...(opts.perspectives !== undefined ? { requestedPerspectives: opts.perspectives } : {}),
+      ...(opts.participants !== undefined ? { participants: opts.participants } : {}),
+      staff: STAFF,
+      ...(opts.config ?? {}),
+    }),
+  );
+  args.push('--config', config);
   args.push('--json');
 
   const r = await cliJson(args, env);
@@ -212,7 +233,7 @@ test('init creates the documented run-dir layout', async () => {
   const councilHome = path.join(dir, 'council-home');
 
   const r = await cliJson(
-    ['init', '--objective', objective, '--target', target, '--json'],
+    ['init', '--objective', objective, '--target', target, '--config', staffConfig(dir), '--json'],
     { COUNCIL_HOME: councilHome },
   );
   assert.equal(r.code, 0, r.stdout + r.stderr);
@@ -269,7 +290,10 @@ test('init default (no COUNCIL_HOME) puts the run under <target>/.council', asyn
   writeFileSync(objective, 'Review it.\n');
   const env = { ...process.env } as NodeJS.ProcessEnv;
   delete env.COUNCIL_HOME;
-  const r = await cliJson(['init', '--objective', objective, '--target', target, '--json'], env);
+  const r = await cliJson(
+    ['init', '--objective', objective, '--target', target, '--config', staffConfig(dir), '--json'],
+    env,
+  );
   assert.equal(r.code, 0, r.stdout + r.stderr);
   const runDir = r.body.runDir as string;
   assert.equal(runDir, path.join(target, '.council', 'runs', r.body.runId as string));
@@ -288,7 +312,7 @@ test('init --config applies config and rejects invalid/under-floor values', asyn
   const env = { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA };
 
   const goodCfg = path.join(dir, 'good.json');
-  writeFileSync(goodCfg, JSON.stringify({ requestedPerspectives: 10, participants: 2, rounds: 1 }));
+  writeFileSync(goodCfg, JSON.stringify({ requestedPerspectives: 10, participants: 2, rounds: 1, staff: STAFF }));
   const ok = await cliJson(['init', '--objective', objective, '--target', target, '--config', goodCfg, '--json'], env);
   assert.equal(ok.code, 0, ok.stdout + ok.stderr);
   const cfg = ok.body.config as { participants: number; requestedPerspectives: number; maxLaunches: number };
@@ -320,7 +344,7 @@ test('init on the seeded fixture target works (read-only)', async () => {
   const objective = path.join(dir, 'objective.md');
   writeFileSync(objective, 'Review the Fieldnotes fixture.\n');
   const r = await cliJson(
-    ['init', '--objective', objective, '--target', FIXTURE_TARGET, '--json'],
+    ['init', '--objective', objective, '--target', FIXTURE_TARGET, '--config', staffConfig(dir), '--json'],
     { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA },
   );
   assert.equal(r.code, 0, r.stdout + r.stderr);
@@ -341,8 +365,14 @@ test('doctor returns structured per-check results and never fails hard', async (
   assert.equal(typeof r.body.ready, 'boolean');
   const checks = r.body.checks as { name: string; required: boolean; status: string }[];
   const names = checks.map((c) => c.name);
-  for (const expected of ['node', 'orca', 'devin', 'claude', 'codex']) {
+  for (const expected of ['node', 'orca', 'catalog.devin', 'catalog.claude', 'catalog.codex']) {
     assert.ok(names.includes(expected), `missing doctor check ${expected}`);
+  }
+  // Only host checks are required — no agent CLI is universally required.
+  assert.equal(checks.find((c) => c.name === 'node')!.required, true);
+  assert.equal(checks.find((c) => c.name === 'orca')!.required, true);
+  for (const lane of ['catalog.devin', 'catalog.claude', 'catalog.codex']) {
+    assert.equal(checks.find((c) => c.name === lane)!.required, false, `${lane} must stay informational`);
   }
   // orca.status is only probed when the executable resolves.
   const orca = checks.find((c) => c.name === 'orca')!;
@@ -350,6 +380,38 @@ test('doctor returns structured per-check results and never fails hard', async (
   const node = checks.find((c) => c.name === 'node')!;
   assert.equal(node.status, 'verified'); // the suite itself runs on >=22
   for (const c of checks) assert.ok(['verified', 'missing', 'failed'].includes(c.status));
+});
+
+test('doctor --config gates only the SELECTED staff, not every catalog CLI', async () => {
+  const dir = tmp('doctor-sel');
+  // A complete staff on the Claude lane: codex/devin presence is irrelevant.
+  const cfg = path.join(dir, 'sel.json');
+  writeFileSync(
+    cfg,
+    JSON.stringify({
+      staff: {
+        organiser: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits' },
+        scribe: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits' },
+        supervisor: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits' },
+      },
+    }),
+  );
+  const r = await cliJson(['doctor', '--config', cfg, '--json']);
+  assert.equal(r.code, 0);
+  const checks = r.body.checks as { name: string; required: boolean; status: string; detail?: string }[];
+  for (const role of ['organiser', 'scribe', 'supervisor']) {
+    const seat = checks.find((c) => c.name === `staff.${role}`)!;
+    assert.equal(seat.required, true);
+    assert.match(String(seat.detail), /claude/);
+  }
+  // An invalid choice fails visibly — never assumed or substituted.
+  const badCfg = path.join(dir, 'bad.json');
+  writeFileSync(badCfg, JSON.stringify({ staff: { ...STAFF, scribe: { agent: 'mystery', model: 'x', permissionMode: 'bypass' } } }));
+  const bad = await cliJson(['doctor', '--config', badCfg, '--json']);
+  assert.equal(bad.code, 0); // doctor reports, never throws
+  const badChecks = bad.body.checks as { name: string; status: string }[];
+  assert.equal(badChecks.find((c) => c.name === 'staff.scribe')!.status, 'failed');
+  assert.equal(bad.body.ready, false);
 });
 
 // ─── status / tail / verify (read-only) ─────────────────────────────────────
@@ -1489,7 +1551,10 @@ test('init quotes spaced supervisor command paths and refuses dangerous shell ch
   // No COUNCIL_HOME: the run dir lands under the spaced target itself.
   const env: NodeJS.ProcessEnv = { ...process.env, ORCA_CLI_COMMAND: NO_ORCA };
   delete env.COUNCIL_HOME;
-  const ok = await cliJson(['init', '--objective', objective, '--target', spacedTarget, '--json'], env);
+  const ok = await cliJson(
+    ['init', '--objective', objective, '--target', spacedTarget, '--config', staffConfig(dir), '--json'],
+    env,
+  );
   assert.equal(ok.code, 0, ok.stdout + ok.stderr);
   const cmd = ok.body.advanceCommand as string;
   // The run dir lives under the spaced target → its token is double-quoted.
@@ -1509,7 +1574,10 @@ test('init quotes spaced supervisor command paths and refuses dangerous shell ch
   writeFileSync(objective2, 'Danger.\n');
   const env2: NodeJS.ProcessEnv = { ...process.env, ORCA_CLI_COMMAND: NO_ORCA };
   delete env2.COUNCIL_HOME;
-  const evil = await cliJson(['init', '--objective', objective2, '--target', evilTarget, '--json'], env2);
+  const evil = await cliJson(
+    ['init', '--objective', objective2, '--target', evilTarget, '--config', staffConfig(dir2), '--json'],
+    env2,
+  );
   assert.equal(evil.code, 2); // config_invalid — cannot embed safely
   assert.equal((evil.body.error as Record<string, unknown>).code, 'config_invalid');
   assert.match((evil.body.error as Record<string, unknown>).message as string, /cannot be embedded safely/);
@@ -1538,4 +1606,340 @@ test('approve truncates an over-long note at the contract cap without failing', 
   // Contract cap is 128 chars; the base approver identity stays the prefix.
   assert.ok(approval.record.approver.length <= 128);
   assert.match(approval.record.approver, /^cli|^[^ ]+ — /);
+});
+
+// ─── catalog / staff / execution fingerprint ────────────────────────────────
+
+test('catalog --json reports lanes, selectors and binary presence without auth claims', async () => {
+  const r = await cliJson(['catalog', '--json']);
+  assert.equal(r.code, 0);
+  assert.equal(r.body.catalogVersion, CATALOG_VERSION);
+  assert.equal(r.body.policyHash, LAUNCH_POLICY_HASH);
+  const agents = r.body.agents as {
+    agent: string;
+    lane: string;
+    permissionModes: string[];
+    profileFlag: string | null;
+    effortFlag: string | null;
+    binary: { present: boolean; path?: string };
+    verification: string;
+  }[];
+  assert.deepEqual(agents.map((a) => a.agent).sort(), ['claude', 'codex', 'devin']);
+  for (const a of agents) {
+    assert.equal(a.lane, 'argv');
+    assert.equal(typeof a.binary.present, 'boolean');
+    assert.ok(a.permissionModes.length > 0);
+    assert.ok(['live-verified', 'help-verified', 'unverified'].includes(a.verification));
+  }
+  assert.equal(agents.find((a) => a.agent === 'codex')!.profileFlag, '--profile');
+  assert.equal(agents.find((a) => a.agent === 'claude')!.effortFlag, '--effort');
+  // Presence is PATH visibility only — never auth/approval/free/cost claims.
+  assert.match(String(r.body.note), /not imply.*authenticated|informational/i);
+  // No host calls happen at all: catalog is read-only.
+  const { env, log } = fakeOrca(tmp('cat-orca'), {}, 'term_x');
+  const r2 = await cliJson(['catalog', '--json'], env);
+  assert.equal(r2.code, 0);
+  assert.equal(orcaCalls(log).length, 0, 'catalog must never call orca');
+});
+
+test('init refuses a missing or partial staff — no defaults injected, no run created', async () => {
+  const dir = tmp('nostaff');
+  const target = path.join(dir, 'target');
+  writeTree(target, { 'a.js': 'x\n' });
+  const objective = path.join(dir, 'objective.md');
+  writeFileSync(objective, 'obj\n');
+  const env = { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA };
+
+  // No config at all → staff missing.
+  const none = await cliJson(['init', '--objective', objective, '--target', target, '--json'], env);
+  assert.equal(none.code, 2);
+  assert.equal((none.body.error as Record<string, unknown>).code, 'config_invalid');
+  assert.match((none.body.error as Record<string, unknown>).message as string, /staff|catalog/);
+
+  // Config present but staff absent → still refused.
+  const cfgPath = path.join(dir, 'no-staff.json');
+  writeFileSync(cfgPath, JSON.stringify({})); // schema-valid, staff simply absent
+  const missing = await cliJson(['init', '--objective', objective, '--target', target, '--config', cfgPath, '--json'], env);
+  assert.equal(missing.code, 2);
+  assert.match((missing.body.error as Record<string, unknown>).message as string, /staff/);
+
+  // Partial staff (organiser only) → schema-invalid config, still refused.
+  const partial = path.join(dir, 'partial.json');
+  writeFileSync(partial, JSON.stringify({ staff: { organiser: DEVIN } }));
+  const pr = await cliJson(['init', '--objective', objective, '--target', target, '--config', partial, '--json'], env);
+  assert.equal(pr.code, 2);
+  assert.equal((pr.body.error as Record<string, unknown>).code, 'config_invalid');
+
+  // Nothing was created — no run dir exists anywhere.
+  assert.equal(existsSync(path.join(dir, 'council-home')), false, 'refused init must create nothing');
+});
+
+test('init validates every staff choice against the catalog before any mutation', async () => {
+  const dir = tmp('badstaff');
+  const target = path.join(dir, 'target');
+  writeTree(target, { 'a.js': 'x\n' });
+  const objective = path.join(dir, 'objective.md');
+  writeFileSync(objective, 'obj\n');
+  const env = { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA };
+
+  for (const [name, staff] of [
+    ['unknown agent', { ...STAFF, scribe: { agent: 'mystery', model: 'm', permissionMode: 'bypass' } }],
+    ['unknown posture', { ...STAFF, supervisor: { agent: 'devin', model: 'swe-2-max', permissionMode: 'yolo' } }],
+    ['unsupported effort', { ...STAFF, organiser: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass', effort: 'high' } }],
+    ['profile on a profile-less lane', { ...STAFF, scribe: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits', profile: 'work' } }],
+    ['unsafe model token', { ...STAFF, scribe: { agent: 'devin', model: 'x; rm -rf /', permissionMode: 'bypass' } }],
+    ['leading-@ model token', { ...STAFF, scribe: { agent: 'devin', model: '@splat', permissionMode: 'bypass' } }],
+  ] as const) {
+    const cfg = path.join(dir, `${name.replace(/\W+/g, '-')}.json`);
+    writeFileSync(cfg, JSON.stringify({ staff }));
+    const r = await cliJson(['init', '--objective', objective, '--target', target, '--config', cfg, '--json'], env);
+    assert.equal(r.code !== 0, true, name);
+    assert.equal(r.body.ok, false, name);
+  }
+  assert.equal(existsSync(path.join(dir, 'council-home')), false, 'refused init must create nothing');
+});
+
+test('init captures the catalog fingerprint and refuses a mismatched supplied one', async () => {
+  const dir = tmp('fprint');
+  const target = path.join(dir, 'target');
+  writeTree(target, { 'a.js': 'x\n' });
+  const objective = path.join(dir, 'objective.md');
+  writeFileSync(objective, 'obj\n');
+  const env = { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA };
+
+  // A WRONG fingerprint (valid shape, wrong hash) is refused — never silently overwritten.
+  const bad = staffConfig(dir, { execution: { catalogVersion: 'cat_test_0', policyHash: '0'.repeat(64) } });
+  const r1 = await cliJson(['init', '--objective', objective, '--target', target, '--config', bad, '--json'], env);
+  assert.equal(r1.code, 2);
+  assert.match((r1.body.error as Record<string, unknown>).message as string, /fingerprint|match/i);
+
+  // The correct fingerprint is accepted and persisted verbatim.
+  const good = staffConfig(dir, { execution: { catalogVersion: CATALOG_VERSION, policyHash: LAUNCH_POLICY_HASH } });
+  const r2 = await cliJson(['init', '--objective', objective, '--target', target, '--config', good, '--json'], env);
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+  const state = readState(r2.body.runDir as string) as unknown as {
+    config: { staff: { supervisor: { agent: string } }; execution: { catalogVersion: string; policyHash: string } };
+  };
+  assert.equal(state.config.staff.supervisor.agent, 'devin');
+  assert.equal(state.config.execution.catalogVersion, CATALOG_VERSION);
+  assert.equal(state.config.execution.policyHash, LAUNCH_POLICY_HASH);
+});
+
+/**
+ * Tamper a run's persisted config as an EXTERNAL edit would — a drifted
+ * fingerprint can never come through saveState (the schema validator would
+ * refuse it); it arrives as a file the run must detect on READ. Values must
+ * stay schema-valid (right shapes, right lengths) so loadState still parses —
+ * the drift is policy-level, not structural.
+ */
+function mutateConfig(runDir: string, fn: (c: Record<string, unknown>) => void): void {
+  const p = path.join(runDir, 'state.json');
+  const s = JSON.parse(readFileSync(p, 'utf8')) as { config: Record<string, unknown> };
+  fn(s.config);
+  writeFileSync(p, JSON.stringify(s, null, 2));
+}
+
+test('verify reports catalog intact / drifted / legacy honestly', async () => {
+  const f = await initRun();
+  const clean = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(clean.code, 0);
+  assert.equal((clean.body.catalog as { status: string }).status, 'intact');
+  assert.equal(clean.body.verified, true);
+
+  // Tamper the recorded fingerprint — verify calls it drifted, verified false.
+  // Schema-valid shape (64-hex) so the drift is detected at READ, not at schema.
+  mutateConfig(f.runDir, (c) => {
+    (c.execution as { policyHash: string }).policyHash = '1'.repeat(64);
+  });
+  const drifted = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal((drifted.body.catalog as { status: string }).status, 'drifted');
+  assert.equal(drifted.body.verified, false);
+
+  // A legacy run (staff/execution absent) reports 'legacy' — absence stays absent.
+  const f2 = await initRun();
+  mutateConfig(f2.runDir, (c) => {
+    delete c.staff;
+    delete c.execution;
+  });
+  const legacy = await cliJson(['verify', '--run', f2.runDir, '--json'], f2.env);
+  assert.equal(legacy.code, 0);
+  assert.equal((legacy.body.catalog as { status: string }).status, 'legacy');
+  assert.equal(legacy.body.verified, true);
+});
+
+test('start-supervisor refuses BEFORE any host call when the fingerprint drifted', async () => {
+  const f = await initRun();
+  mutateConfig(f.runDir, (c) => {
+    (c.execution as { catalogVersion: string }).catalogVersion = 'cat_other';
+  });
+  const { env, log } = fakeOrca(tmp('sup-drift'), {}, 'term_primary');
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 2);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'config_invalid');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /fingerprint|catalog/i);
+  assert.equal(orcaCalls(log).length, 0, 'a drifted fingerprint must refuse before ANY host call');
+});
+
+test('start-supervisor uses the SELECTED staff supervisor lane exactly', async () => {
+  // Mixed staff: claude supervisor on the effort selector.
+  const f = await initRun({
+    config: {
+      staff: {
+        organiser: DEVIN,
+        scribe: DEVIN,
+        supervisor: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits', effort: 'high' },
+      },
+    },
+  });
+  const { env, log } = fakeOrca(
+    tmp('sup-claude'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_cl' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_cl', connected: true, agentIdentity: 'claude', agentWait: null } } },
+      ],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_cl' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  // The EXACT selected CLI argv reaches terminal create — no devin default.
+  const tc = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'terminal create')!;
+  assert.ok(tc.includes('--command=claude --model sonnet-1 --permission-mode acceptEdits --effort high'));
+  // The startup record pins the choice + fingerprint.
+  const rec = JSON.parse(readFileSync(path.join(f.runDir, 'supervisor', 'startup.json'), 'utf8')) as {
+    supervisor: { command: string; expectedAgent: string; choice: { agent: string } };
+    execution: { policyHash: string };
+    status: string;
+  };
+  assert.equal(rec.supervisor.command, 'claude --model sonnet-1 --permission-mode acceptEdits --effort high');
+  assert.equal(rec.supervisor.expectedAgent, 'claude');
+  assert.equal(rec.supervisor.choice.agent, 'claude');
+  assert.equal(rec.execution.policyHash, LAUNCH_POLICY_HASH);
+  assert.equal(rec.status, 'attached');
+});
+
+test('start-supervisor on a codex staff supervisor emits the multi-token posture + named profile', async () => {
+  const f = await initRun({
+    config: {
+      staff: {
+        organiser: DEVIN,
+        scribe: DEVIN,
+        supervisor: { agent: 'codex', model: 'gpt-x', permissionMode: 'bypass', profile: 'work' },
+      },
+    },
+  });
+  const { env, log } = fakeOrca(
+    tmp('sup-codex'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_cx' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_cx', connected: true, agentIdentity: 'codex', agentWait: null } } },
+      ],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_cx' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const tc = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'terminal create')!;
+  assert.ok(
+    tc.includes('--command=codex --model gpt-x --sandbox danger-full-access --ask-for-approval never --profile work'),
+  );
+});
+
+test('start-supervisor refuses to reuse resources after the staff choice changed', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-changed');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_t1' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      // First run: trust screen → paused with durable resources.
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_t1', connected: true, agentIdentity: 'devin', agentWait: 'workspace-trust' } } },
+      ],
+    },
+    'term_primary',
+  );
+  const r1 = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r1.body.outcome, 'paused');
+
+  // The operator changes the supervisor staff choice between runs — the
+  // recorded resources must NEVER silently serve a different supervisor.
+  mutateConfig(f.runDir, (c) => {
+    (c.staff as { supervisor: unknown }).supervisor = {
+      agent: 'claude',
+      model: 'sonnet-1',
+      permissionMode: 'accept-edits',
+    };
+  });
+  const r2 = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r2.code, 2);
+  assert.equal((r2.body.error as Record<string, unknown>).code, 'config_invalid');
+  assert.match((r2.body.error as Record<string, unknown>).message as string, /pins supervisor|changed/i);
+  assert.equal(hasCall(log, 'orchestration worker-start'), false);
+  assert.equal(readState(f.runDir).supervisor, null);
+});
+
+test('start-supervisor on a legacy (staff-less) run keeps the original Devin pin', async () => {
+  const f = await initRun();
+  // Legacy shape: staff and execution fields entirely absent — as a run saved
+  // before the catalog existed would look. Absence must stay absence.
+  mutateConfig(f.runDir, (c) => {
+    delete c.staff;
+    delete c.execution;
+  });
+  const { env, log } = fakeOrca(
+    tmp('sup-legacy'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_lg' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_lg', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_lg' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const tc = orcaCalls(log).find((a) => a.slice(0, 2).join(' ') === 'terminal create')!;
+  assert.ok(tc.includes('--command=devin --model swe-2-max --permission-mode dangerous'));
+  const rec = JSON.parse(readFileSync(path.join(f.runDir, 'supervisor', 'startup.json'), 'utf8')) as {
+    supervisor: { command: string; choice: unknown };
+    execution: unknown;
+  };
+  assert.equal(rec.supervisor.command, 'devin --model swe-2-max --permission-mode dangerous');
+  assert.equal(rec.supervisor.choice, null);
+  assert.equal(rec.execution, null);
+});
+
+test('catalog --json is honest when a supported CLI is absent from PATH', async () => {
+  // Simulate "devin absent, another lane present": PATH carries only the
+  // fixture directory, so none of the binaries resolve — and catalog must
+  // report MISSING, never assume presence or substitute a lane.
+  const { env } = fakeOrca(tmp('cat-path'), {}, 'term_x');
+  env.PATH = path.join(tmpdir(), 'definitely-empty-path-xyzzy');
+  const r = await cliJson(['catalog', '--json'], env);
+  assert.equal(r.code, 0);
+  const agents = r.body.agents as { agent: string; binary: { present: boolean } }[];
+  for (const a of agents) {
+    assert.equal(a.binary.present, false, `${a.agent} should report MISSING on an empty PATH`);
+  }
+  // Still honest data — version/hash/selectors are all reported regardless.
+  assert.equal(r.body.catalogVersion, CATALOG_VERSION);
 });

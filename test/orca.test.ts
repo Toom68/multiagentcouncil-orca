@@ -360,11 +360,11 @@ describe('OrcaAdapter.createRun/createTask', () => {
 });
 
 describe('OrcaAdapter.launchWorker', () => {
-  const devinLaunchHandler = (): ((args: readonly string[]) => ProcessResult) => (args) => {
+  const devinLaunchHandler = (agent = 'devin'): ((args: readonly string[]) => ProcessResult) => (args) => {
     const cmd = args[1];
     if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
     if (cmd === 'wait') return okEnv({ idle: true });
-    if (cmd === 'show') return okTerm(readyTerm('term_new1'), 'rcpt-ts-1');
+    if (cmd === 'show') return okTerm(readyTerm('term_new1', agent), 'rcpt-ts-1');
     if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
     if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
     return failEnv('unexpected_command', String(cmd));
@@ -439,23 +439,113 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.equal(calls.length, 0);
   });
 
-  it('rejects non-allowlisted model/permission values — no config fallback', async () => {
-    const { adapter, calls } = makeAdapter(() => okEnv({}));
-    const badModel = await adapter.launchWorker(
-      launchSpec({ agent: { agent: 'devin', model: 'swe-2-lightning', permissionMode: 'bypass' } }),
-    );
-    assert.equal(badModel.ok, false);
-    if (!badModel.ok) assert.equal(badModel.error.code, 'unsupported');
+  it('catalog lane: explicit models pass through; postures/selectors outside the map refuse', async () => {
+    // Model selection is caller-explicit — any SAFE token is emitted verbatim
+    // (an unavailable model fails at launch visibly, never substituted). This
+    // includes provider/model:level selector syntax and unverified ids.
+    for (const model of ['swe-2-lightning', 'provider/model:level', 'gpt-x+y']) {
+      const { adapter, calls } = makeAdapter(devinLaunchHandler());
+      const res = await adapter.launchWorker(
+        launchSpec({ agent: { agent: 'devin', model, permissionMode: 'bypass' } }),
+      );
+      assert.ok(res.ok, model);
+      const cmdArg = calls[0].find((a) => a.startsWith('--command=')) ?? '';
+      assert.equal(cmdArg, `--command=devin --model ${model} --permission-mode dangerous`);
+    }
 
-    // Valid Devin CLI modes that are NOT the approved council posture are
-    // rejected too — the allowlist is the approval boundary.
-    for (const pm of ['yolo', 'auto', 'smart', 'accept-edits']) {
+    // Postures outside the shipped map refuse — never an ambient default.
+    for (const pm of ['yolo', 'default', 'plan', 'read-only']) {
+      const { adapter, calls } = makeAdapter(() => okEnv({}));
       const badPerm = await adapter.launchWorker(
         launchSpec({ agent: { agent: 'devin', model: 'swe-2-max', permissionMode: pm } }),
       );
       assert.equal(badPerm.ok, false, pm);
+      if (!badPerm.ok) assert.equal(badPerm.error.code, 'unsupported');
+      assert.equal(calls.length, 0, pm);
     }
-    assert.equal(calls.length, 0);
+
+    // Documented devin postures other than bypass map to their fixed argv.
+    for (const pm of ['auto', 'smart', 'accept-edits', 'dangerous']) {
+      const { adapter, calls } = makeAdapter(devinLaunchHandler());
+      const res = await adapter.launchWorker(
+        launchSpec({ agent: { agent: 'devin', model: 'swe-2-max', permissionMode: pm } }),
+      );
+      assert.ok(res.ok, pm);
+      const cmdArg = calls[0].find((a) => a.startsWith('--command=')) ?? '';
+      assert.equal(cmdArg, `--command=devin --model swe-2-max --permission-mode ${pm}`);
+    }
+  });
+
+  it('catalog lane: unsupported effort/profile selectors refuse rather than being ignored', async () => {
+    // devin has no verified effort selector and no named-profile selector.
+    for (const choice of [
+      { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass', effort: 'high' },
+      { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass', profile: 'work' },
+      { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits', profile: 'work' },
+      { agent: 'codex', model: 'gpt-x', permissionMode: 'bypass', effort: 'high' },
+      { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits', effort: 'extreme' },
+    ]) {
+      const { adapter, calls } = makeAdapter(() => okEnv({}));
+      const res = await adapter.launchWorker(launchSpec({ agent: choice }));
+      assert.equal(res.ok, false, JSON.stringify(choice));
+      if (!res.ok) assert.equal(res.error.code, 'unsupported');
+      assert.equal(calls.length, 0, JSON.stringify(choice));
+    }
+  });
+
+  it('catalog lane: claude effort and codex named profile reach the exact argv', async () => {
+    // Claude --effort is a documented selector.
+    {
+      const handler = devinLaunchHandler('claude');
+      const { adapter, calls } = makeAdapter(handler);
+      const res = await adapter.launchWorker(
+        launchSpec({
+          agent: { agent: 'claude', model: 'sonnet-1', effort: 'high', permissionMode: 'accept-edits' },
+        }),
+      );
+      assert.ok(res.ok);
+      const cmdArg = calls[0].find((a) => a.startsWith('--command=')) ?? '';
+      assert.equal(cmdArg, '--command=claude --model sonnet-1 --permission-mode acceptEdits --effort high');
+      // Readiness expects the SELECTED cli's identity, not devin.
+      assert.ok(res.value.outcome === 'started');
+    }
+    // Codex posture is a fixed --sandbox + --ask-for-approval pair; --profile
+    // is the only named-profile selector in the catalog.
+    {
+      const handler = devinLaunchHandler('codex');
+      const { adapter, calls } = makeAdapter(handler);
+      const res = await adapter.launchWorker(
+        launchSpec({
+          agent: { agent: 'codex', model: 'gpt-x', permissionMode: 'bypass', profile: 'work' },
+        }),
+      );
+      assert.ok(res.ok);
+      const cmdArg = calls[0].find((a) => a.startsWith('--command=')) ?? '';
+      assert.equal(
+        cmdArg,
+        '--command=codex --model gpt-x --sandbox danger-full-access --ask-for-approval never --profile work',
+      );
+      assert.ok(res.value.outcome === 'started');
+    }
+  });
+
+  it('catalog lane: a terminal reporting the WRONG agent identity is not ready', async () => {
+    // Launched as claude but the terminal reports devin — refuse, never start.
+    const { adapter, calls } = makeAdapter((args) => {
+      const cmd = args[1];
+      if (cmd === 'create') return okTerm({ terminal: { handle: 'term_w' } }, 'rcpt-tc-1');
+      if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'show') return okTerm(readyTerm('term_w', 'devin'));
+      return failEnv('unexpected_command', String(cmd));
+    });
+    const res = await adapter.launchWorker(
+      launchSpec({ agent: { agent: 'claude', model: 'sonnet-1', permissionMode: 'accept-edits' } }),
+    );
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.match(res.value.detail ?? '', /recognized|agent/i);
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
   });
 
   it('maps user-facing "bypass" to CLI "dangerous", and accepts "dangerous" directly', async () => {

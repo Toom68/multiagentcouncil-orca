@@ -35,6 +35,7 @@ import {
   type WorkerLaunchSpec,
   type WorkerObservation,
 } from '../src/contracts.js';
+import { CATALOG_EXECUTION_POLICY } from '../src/catalog.js';
 import { createEngine } from '../src/engine.js';
 import { createPromptBuilder } from '../src/prompts.js';
 import { createStore } from '../src/store.js';
@@ -251,7 +252,16 @@ async function initRun(): Promise<Ctx> {
   const objective = path.join(dir, 'objective.md');
   writeFileSync(objective, 'Review the target for correctness and isolation defects.\n');
   const config = path.join(dir, 'config.json');
-  writeFileSync(config, JSON.stringify({ requestedPerspectives: 10, participants: 2, rounds: 1 }));
+  // Fresh init requires an explicit complete staff — the pinned Devin lane.
+  writeFileSync(
+    config,
+    JSON.stringify({
+      requestedPerspectives: 10,
+      participants: 2,
+      rounds: 1,
+      staff: { organiser: AGENT, scribe: AGENT, supervisor: AGENT },
+    }),
+  );
   const env = { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA };
 
   const r = await cli(['init', '--objective', objective, '--target', target, '--config', config, '--json'], env);
@@ -261,7 +271,14 @@ async function initRun(): Promise<Ctx> {
 
   const store = createStore({ runDir: body.runDir });
   const host = new FakeHost();
-  const engine = createEngine({ store, host, prompts: createPromptBuilder() });
+  // Runs init'd by the CLI carry config.execution — the engine gate requires
+  // the matching injected policy, exactly as the CLI injects it.
+  const engine = createEngine({
+    store,
+    host,
+    prompts: createPromptBuilder(),
+    execution: CATALOG_EXECUTION_POLICY,
+  });
   return { runId: body.runId, runDir: body.runDir, target, env, store, host, engine };
 }
 

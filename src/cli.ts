@@ -26,6 +26,7 @@ import { parseArgs } from 'node:util';
 import {
   SCHEMA_VERSION,
   type AdvanceResult,
+  type AgentChoice,
   type ApprovedRoster,
   type CouncilConfig,
   type CouncilError,
@@ -37,8 +38,17 @@ import {
   type Result,
   type Store,
 } from './contracts.js';
+import {
+  CATALOG_EXECUTION_POLICY,
+  CATALOG_VERSION,
+  LAUNCH_POLICY_HASH,
+  describeCatalog,
+  resolveAgentLaunch,
+  validateAgentChoice,
+} from './catalog.js';
 import { createEngine } from './engine.js';
 import {
+  buildAgentCommandText,
   extractDispatchInfo,
   extractRequestId,
   createOrcaAdapter,
@@ -271,6 +281,7 @@ function makeEngine(runDir: string) {
     store,
     host: lazyHost(),
     prompts: createPromptBuilder(),
+    execution: CATALOG_EXECUTION_POLICY,
   });
   return { store, engine };
 }
@@ -506,6 +517,45 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
   if (!cfg.ok) fail('config_invalid', 'invalid council config', { issues: cfg.issues });
   const config = cfg.value;
 
+  // Fresh runs carry an explicit, complete staff — no silent Devin/bypass
+  // defaults. Every choice is validated against the shipped catalog and the
+  // catalog execution fingerprint is captured (or an identical supplied one
+  // verified) before any run state is created. Legacy runs keep absence.
+  if (config.staff === undefined) {
+    fail(
+      'config_invalid',
+      'fresh runs require an explicit complete staff in --config: ' +
+        '"staff": {"organiser": <AgentChoice>, "scribe": <AgentChoice>, "supervisor": <AgentChoice>} ' +
+        'with agent/model/permissionMode (+ optional effort/profile). ' +
+        'Run `council catalog --json` for the supported lanes, postures and selectors.',
+      { details: { reason: 'staff_missing' } },
+    );
+  }
+  for (const role of ['organiser', 'scribe', 'supervisor'] as const) {
+    const bad = validateAgentChoice(config.staff[role]);
+    if (!bad.ok) {
+      fail(bad.error.code, `staff.${role}: ${bad.error.message}`, {
+        details: { reason: 'staff_invalid', role, choice: config.staff[role] },
+      });
+    }
+  }
+  if (config.execution !== undefined) {
+    if (
+      config.execution.catalogVersion !== CATALOG_VERSION ||
+      config.execution.policyHash !== LAUNCH_POLICY_HASH
+    ) {
+      fail(
+        'config_invalid',
+        `supplied execution fingerprint ${config.execution.catalogVersion}/${config.execution.policyHash} ` +
+          `does not match the shipped catalog ${CATALOG_VERSION}/${LAUNCH_POLICY_HASH} — refusing ` +
+          `rather than silently overwriting it`,
+        { details: { reason: 'execution_fingerprint_mismatch', supplied: config.execution } },
+      );
+    }
+  } else {
+    config.execution = { catalogVersion: CATALOG_VERSION, policyHash: LAUNCH_POLICY_HASH };
+  }
+
   const snap = unwrap(await captureSnapshot(targetAbs));
   const snapshot = snap;
 
@@ -619,7 +669,10 @@ async function checkCli(
 }
 
 async function cmdDoctor(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
-  parseFlags('doctor', argv, {});
+  const v = parseFlags('doctor', argv, {
+    config: { type: 'string' },
+    run: { type: 'string' },
+  });
   const checks: DoctorCheck[] = [];
 
   const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
@@ -676,16 +729,95 @@ async function cmdDoctor(argv: readonly string[]): Promise<{ payload: Record<str
     }
   }
 
-  checks.push(await checkCli('devin', 'devin', ['--version'], true));
-  checks.push(await checkCli('claude', 'claude', ['--version'], false));
-  checks.push(await checkCli('codex', 'codex', ['--version'], false));
+  // Catalog lanes — informational only. No agent CLI is universally required;
+  // what matters is whether the SELECTED staff's binaries are present. Binary
+  // presence says nothing about authentication, approval, free or unlimited
+  // usage — it is PATH visibility, nothing more.
+  for (const entry of describeCatalog()) {
+    let detail: string;
+    let status: DoctorCheck['status'];
+    try {
+      detail = resolveExecutable(entry.binary);
+      status = 'verified';
+    } catch (e) {
+      detail = `not on PATH: ${e instanceof Error ? e.message : String(e)}`;
+      status = 'missing';
+    }
+    checks.push({
+      name: `catalog.${entry.agent}`,
+      required: false,
+      status,
+      detail: `${detail} (postures: ${entry.permissionModes.join('/')}; verification: ${entry.verification})`,
+    });
+  }
+
+  // Selection readiness — optional --config file or --run directory narrows
+  // "ready" to the staff actually chosen. Each role's choice is validated
+  // against the shipped catalog; only the selected CLI binaries are required.
+  const configPath = optStr(v, 'config');
+  const runDir = optStr(v, 'run');
+  if (configPath !== undefined && runDir !== undefined) {
+    fail('config_invalid', '--config and --run are mutually exclusive');
+  }
+  let selectedConfig: CouncilConfig | undefined;
+  if (runDir !== undefined) {
+    const { store } = makeEngine(runDir);
+    selectedConfig = (await loadRun(store)).config;
+  } else if (configPath !== undefined) {
+    const raw = await readJsonFile(configPath, 'config file');
+    const cfg = resolveConfig(raw);
+    if (!cfg.ok) fail('config_invalid', 'invalid council config', { issues: cfg.issues });
+    selectedConfig = cfg.value;
+  }
+  if (selectedConfig !== undefined) {
+    if (selectedConfig.staff === undefined) {
+      checks.push({
+        name: 'staff',
+        required: false,
+        status: 'verified',
+        detail: 'no staff configured — legacy run (pre-staff Devin lane)',
+      });
+    } else {
+      for (const role of ['organiser', 'scribe', 'supervisor'] as const) {
+        const choice = selectedConfig.staff[role];
+        const valid = validateAgentChoice(choice);
+        if (!valid.ok) {
+          checks.push({
+            name: `staff.${role}`,
+            required: true,
+            status: 'failed',
+            detail: valid.error.message,
+          });
+          continue;
+        }
+        let binaryStatus: DoctorCheck['status'] = 'verified';
+        let detail: string;
+        try {
+          detail = `${choice.agent} binary: ${resolveExecutable(choice.agent)}`;
+        } catch {
+          binaryStatus = 'missing';
+          detail = `${choice.agent} binary not on PATH — seat cannot launch until installed`;
+        }
+        checks.push({
+          name: `staff.${role}`,
+          required: true,
+          status: binaryStatus,
+          detail,
+        });
+      }
+    }
+  }
 
   const ready = checks.every((c) => !c.required || c.status === 'verified');
   return {
     payload: {
       ready,
+      catalog: { catalogVersion: CATALOG_VERSION, policyHash: LAUNCH_POLICY_HASH },
       checks,
-      note: 'missing optional agent CLIs only narrow roster choices; required checks gate real worker launches',
+      note:
+        'host checks (node, orca) are always required; catalog.* lanes are informational ' +
+        'presence only — not authentication, approval, free or unlimited usage. ' +
+        'With --config/--run, staff.* checks gate only the SELECTED seats',
     },
     human: [
       `environment: ${ready ? 'READY' : 'NOT READY'}`,
@@ -693,6 +825,52 @@ async function cmdDoctor(argv: readonly string[]): Promise<{ payload: Record<str
         (c) =>
           `  ${c.status.padEnd(8)} ${c.name}${c.required ? ' (required)' : ''}${c.version ? ` — ${c.version}` : ''}${c.detail ? ` — ${c.detail}` : ''}`,
       ),
+    ].join('\n'),
+  };
+}
+
+// ─── council catalog ─────────────────────────────────────────────────────────
+
+/**
+ * Read-only catalog report: version, launch-policy fingerprint, supported
+ * argv lanes, posture/profile/model/effort selectors and ACTUAL local binary
+ * presence. It launches nothing, contacts no model, inspects no credentials
+ * and changes no account settings. Binary presence is PATH visibility only —
+ * it does NOT imply the account is authenticated, approved, free, or that
+ * usage is unlimited.
+ */
+async function cmdCatalog(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
+  parseFlags('catalog', argv, {});
+  const agents = describeCatalog().map((entry) => {
+    let binary: { present: boolean; path?: string };
+    try {
+      binary = { present: true, path: resolveExecutable(entry.binary) };
+    } catch {
+      binary = { present: false };
+    }
+    return { ...entry, binary };
+  });
+  return {
+    payload: {
+      catalogVersion: CATALOG_VERSION,
+      policyHash: LAUNCH_POLICY_HASH,
+      agents,
+      note:
+        'binary presence is informational only — it does not imply the account is ' +
+        'authenticated, approved, free, or that usage is unlimited',
+    },
+    human: [
+      `catalog ${CATALOG_VERSION} (policy ${LAUNCH_POLICY_HASH.slice(0, 12)}…)`,
+      ...agents.map(
+        (a) =>
+          `  ${a.agent.padEnd(6)} binary ${a.binary} ${a.binary.present ? 'present' : 'MISSING'} — ` +
+          `postures ${a.permissionModes.join('/')}; ` +
+          `explicit model via ${a.modelFlag}` +
+          `${a.effortFlag !== null ? `; ${a.effortFlag} ${(a.effortValues ?? []).join('/')}` : ''}` +
+          `${a.profileFlag !== null ? `; ${a.profileFlag} <name>` : ''} ` +
+          `[${a.verification}]`,
+      ),
+      '  note: presence ≠ authenticated/approved/free/unlimited — verify the account before relying on a seat',
     ].join('\n'),
   };
 }
@@ -1436,15 +1614,39 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
   } else {
     approval.reason = appr.error.message;
   }
+  // Catalog execution fingerprint — legacy runs (pre-staff/pre-execution)
+  // report "legacy"; execution-configured runs must match the shipped
+  // catalog exactly or the run is drifted and launches must refuse.
+  const execution = state.config.execution;
+  const catalog: Record<string, unknown> = {
+    shippedCatalogVersion: CATALOG_VERSION,
+    shippedPolicyHash: LAUNCH_POLICY_HASH,
+  };
+  let catalogIntact = true;
+  if (execution === undefined) {
+    catalog.status = 'legacy';
+    catalog.detail = 'no execution fingerprint — pre-catalog run; original semantics preserved';
+  } else {
+    catalogIntact =
+      execution.catalogVersion === CATALOG_VERSION && execution.policyHash === LAUNCH_POLICY_HASH;
+    catalog.status = catalogIntact ? 'intact' : 'drifted';
+    catalog.recorded = execution;
+    if (!catalogIntact) {
+      catalog.detail = 'recorded fingerprint differs from the shipped catalog — refuse launches until reconciled';
+    }
+  }
   const verified =
-    drift.drift === false && (bindingIntact === null ? true : bindingIntact && stateHashMatch !== false);
+    drift.drift === false &&
+    catalogIntact &&
+    (bindingIntact === null ? true : bindingIntact && stateHashMatch !== false);
   return {
     payload: {
       runId: state.runId,
       verified,
       snapshot: { drift: drift.drift, changed: drift.changed, snapshotId: state.snapshotId },
       approval,
-      note: 'reports only — a drifted tree or mismatched binding means re-snapshot and re-approve are required before any launch',
+      catalog,
+      note: 'reports only — a drifted tree, mismatched binding, or catalog drift means re-snapshot/re-approve/reconcile are required before any launch',
     },
     human: [
       `run ${state.runId}: ${verified ? 'VERIFIED' : 'INTEGRITY ISSUES'}`,
@@ -1453,6 +1655,7 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
       appr.ok
         ? `  approval: binding ${bindingIntact === true ? 'intact' : 'MISMATCH'}${stateHashMatch === false ? ', state hash differs' : ''}`
         : `  approval: none (${appr.error.message})`,
+      `  catalog: ${catalog.status}${catalog.detail !== undefined ? ` — ${catalog.detail}` : ''}`,
     ].join('\n'),
   };
 }
@@ -1461,6 +1664,52 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
 
 const SUPERVISOR_COMMAND = 'devin --model swe-2-max --permission-mode dangerous';
 const SUPERVISOR_STARTUP_ARTIFACT = 'supervisor/startup.json';
+
+/**
+ * Resolve the supervisor launch lane for this run. A run WITH staff resolves
+ * config.staff.supervisor through the shipped catalog — the exact choice
+ * (agent/model/posture/effort/profile) becomes fixed argv tokens only, with
+ * the catalog's expectedAgent driving readiness. A run WITHOUT staff is a
+ * legacy pre-catalog run and keeps the original pinned Devin command —
+ * nothing silently defaults on a new run because init refuses staff-less
+ * configs before this code path can exist.
+ *
+ * A stored execution fingerprint that differs from the shipped catalog
+ * refuses here — before ANY host call — rather than launching under a
+ * changed or drifted policy.
+ */
+function resolveSupervisorLane(config: CouncilConfig): {
+  command: string;
+  expectedAgent: string;
+  choice: AgentChoice | null;
+} {
+  const exec = config.execution;
+  if (
+    exec !== undefined &&
+    (exec.catalogVersion !== CATALOG_VERSION || exec.policyHash !== LAUNCH_POLICY_HASH)
+  ) {
+    fail(
+      'config_invalid',
+      `run's recorded execution fingerprint ${exec.catalogVersion}/${exec.policyHash} does not ` +
+        `match the shipped catalog ${CATALOG_VERSION}/${LAUNCH_POLICY_HASH} — refusing before any host call; ` +
+        `inspect the run config and reconcile catalog drift`,
+      { details: { reason: 'execution_fingerprint_mismatch', recorded: exec } },
+    );
+  }
+  if (config.staff === undefined) {
+    // Legacy pre-staff run: the original pinned Devin supervisor, unchanged.
+    return { command: SUPERVISOR_COMMAND, expectedAgent: 'devin', choice: null };
+  }
+  const resolved = resolveAgentLaunch(config.staff.supervisor);
+  if (!resolved.ok) {
+    throw new CliError(resolved.error);
+  }
+  return {
+    command: buildAgentCommandText(resolved.value.command),
+    expectedAgent: resolved.value.expectedAgent,
+    choice: config.staff.supervisor,
+  };
+}
 
 /**
  * Durable record of the supervisor startup attempt — persisted under the run
@@ -1475,6 +1724,15 @@ interface SupervisorStartup {
   schemaVersion: 1;
   runId: string;
   specSha256: string;
+  /** The exact resolved supervisor identity pinned at resource creation. */
+  supervisor: {
+    command: string;
+    expectedAgent: string;
+    /** The staff choice (null on a legacy pre-staff run). */
+    choice: AgentChoice | null;
+  };
+  /** The catalog fingerprint the record was created under (null = legacy). */
+  execution: { catalogVersion: string; policyHash: string } | null;
   lane: 'task-under-caller-run' | 'implicit-run';
   boundRunId: string | null;
   taskId: string | null;
@@ -1636,6 +1894,11 @@ async function startSupervisorUnderLock(
     );
   }
 
+  // Resolve the supervisor lane BEFORE any host call: staff runs go through
+  // the shipped catalog (a recorded fingerprint mismatch refuses here, never
+  // launching under drifted policy); staff-less legacy runs keep the pin.
+  const lane = resolveSupervisorLane(state.config);
+
   const specSha256 = createHash('sha256').update(await fsp.readFile(specPath)).digest('hex');
   const fromArgs =
     process.env.ORCA_TERMINAL_HANDLE !== undefined ? ['--from', process.env.ORCA_TERMINAL_HANDLE] : [];
@@ -1737,10 +2000,38 @@ async function startSupervisorUnderLock(
         { details: { record: p } },
       );
     }
+    // The pinned supervisor identity must still resolve to the same command —
+    // a changed staff choice, catalog fingerprint, or a pre-pin record must
+    // never silently reuse resources created for a different supervisor.
+    const pinned = asRec(p.supervisor);
+    const pinnedExec = asRec(p.execution);
+    if (
+      pinned === undefined ||
+      pinned.command !== lane.command ||
+      pinned.expectedAgent !== lane.expectedAgent ||
+      (pinnedExec === undefined
+        ? lane.choice !== null || state.config.execution !== undefined
+        : pinnedExec.catalogVersion !== state.config.execution?.catalogVersion ||
+          pinnedExec.policyHash !== state.config.execution?.policyHash)
+    ) {
+      fail(
+        'config_invalid',
+        `${SUPERVISOR_STARTUP_ARTIFACT} pins supervisor ${JSON.stringify(pinned?.command ?? '(unpinned)')} but the ` +
+          `config now resolves ${JSON.stringify(lane.command)} — the staff choice or catalog fingerprint changed; ` +
+          `inspect the record and reconcile manually rather than reusing another supervisor's resources`,
+        { details: { record: p, resolved: lane } },
+      );
+    }
     rec = {
       schemaVersion: 1,
       runId: state.runId,
       specSha256,
+      supervisor: {
+        command: lane.command,
+        expectedAgent: lane.expectedAgent,
+        choice: lane.choice,
+      },
+      execution: state.config.execution ?? null,
       lane: p.lane === 'implicit-run' ? 'implicit-run' : 'task-under-caller-run',
       boundRunId: typeof p.boundRunId === 'string' ? p.boundRunId : null,
       taskId: typeof p.taskId === 'string' ? p.taskId : null,
@@ -1796,6 +2087,12 @@ async function startSupervisorUnderLock(
       schemaVersion: 1,
       runId: state.runId,
       specSha256,
+      supervisor: {
+        command: lane.command,
+        expectedAgent: lane.expectedAgent,
+        choice: lane.choice,
+      },
+      execution: state.config.execution ?? null,
       lane: boundRunId !== null ? 'task-under-caller-run' : 'implicit-run',
       boundRunId,
       taskId: null,
@@ -1867,7 +2164,7 @@ async function startSupervisorUnderLock(
         '--worktree',
         'active',
         '--title=council-supervisor',
-        `--command=${SUPERVISOR_COMMAND}`,
+        `--command=${lane.command}`,
         '--json',
       ]);
     } catch (e) {
@@ -1904,7 +2201,7 @@ async function startSupervisorUnderLock(
   const rec2 = rec!; // rec is non-null on every path below
 
   // ── Readiness: one bounded wait + one documented show — never auto-accept ─
-  const ready = await proveTerminalReady(rec2.terminalHandle!, SUPERVISOR_COMMAND.split(' ')[0], waitMs);
+  const ready = await proveTerminalReady(rec2.terminalHandle!, lane.expectedAgent, waitMs);
   if (ready.state !== 'ready') {
     return pause(
       rec2,
@@ -2143,6 +2440,7 @@ const COMMANDS: Record<
 > = {
   init: cmdInit,
   doctor: cmdDoctor,
+  catalog: cmdCatalog,
   supervise: cmdSupervise,
   reconcile: cmdReconcile,
   approve: cmdApprove,
@@ -2158,11 +2456,17 @@ const HELP = `council — Multiagent Council CLI (docs/USAGE.md)
 usage: council <command> [flags] [--json]
 
 commands:
-  init      --objective <file> --target <path> [--config <file>]
+  init      --objective <file> --target <path> --config <file>
             create <target>/.council/runs/<crun_id>/ (COUNCIL_HOME relocates),
-            snapshot the target, write the supervisor spec
+            snapshot the target, write the supervisor spec; the config must
+            carry an explicit complete staff {organiser,scribe,supervisor}
+            of catalog AgentChoices — nothing defaults silently
+  catalog                       list supported agent lanes, postures/selectors
+                                and local binary presence (read-only; presence
+                                never implies auth/approval/free usage)
   start-supervisor --run <runDir>
-            launch the dedicated supervisor worker (Orca task + Devin terminal)
+            launch the dedicated supervisor worker using the run's
+            staff.supervisor catalog lane (legacy runs keep the Devin pin)
   supervise --run <runDir> --advance [--as-supervisor]
             one bounded, idempotent engine step; prints {state, action, note}.
             --as-supervisor is the dedicated supervisor's own mode: it binds
@@ -2176,9 +2480,12 @@ commands:
             record the hash-bound roster approval (does not wake the supervisor)
   status    --run <runDir>          phase, per-seat health, budgets, quorum
   tail      --run <runDir> [--lines N]   last N journal events (read-only)
-  verify    --run <runDir>          snapshot drift + approval binding integrity
+  verify    --run <runDir>          snapshot drift + approval binding +
+                                    catalog fingerprint integrity
   cancel    --run <runDir> [--reason <text>]   guarded stop of live workers
-  doctor                          environment check (node/orca/agent CLIs)
+  doctor    [--config <file> | --run <runDir>]
+            host check (node/orca) + informational catalog-lane presence;
+            with a selection, only the chosen staff's binaries gate readiness
 
 all commands accept --json for machine-readable output.
 `;
