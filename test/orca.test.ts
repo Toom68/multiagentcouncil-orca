@@ -519,6 +519,25 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.ok(start?.includes('--terminal') && start.includes('term_keep'));
     assert.ok(calls.every((a) => a[1] !== 'create'), 'reuse lane must not create a terminal');
   });
+
+  it('reuses a terminal whose settled dispatch still shows a live retained session', async () => {
+    // worker-list row shaped like the observed 1.4.261 worker-show receipt:
+    // state carries the settlement while the retained session stays 'live'
+    // with no outcome field — the old liveness check kept it 'busy' forever.
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', state: 'succeeded', liveness: 'live', terminalState: 'retained' }] })
+        : args[1] === 'worker-start'
+          ? okEnv({ dispatchId: 'ctx_d3' })
+          : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'started');
+    const start = calls.find((a) => a[1] === 'worker-start');
+    assert.ok(start?.includes('--terminal') && start.includes('term_keep'));
+  });
 });
 
 describe('OrcaAdapter mutation recovery', () => {
@@ -595,6 +614,156 @@ describe('OrcaAdapter mutation recovery', () => {
     if (!res.ok) return;
     assert.equal(res.value.state, 'refused');
     assert.ok(calls.every((a) => !a.includes('--retry-request')));
+  });
+});
+
+describe('OrcaAdapter.observeWorker settled dispatches', () => {
+  // Exact worker-show receipt captured on Orca 1.4.261 after the failed live
+  // smoke: the organiser Task had finished and written roster.proposed.json,
+  // yet observation reported 'idle' because only terminalState 'retained' was
+  // recognized — the engine never admitted the artifact.
+  const REAL_SETTLED_RECEIPT = {
+    dispatchId: 'ctx_0c5cc9ffa889',
+    taskId: 'task_4e757dfde09e',
+    runId: 'run_29e9a8ec4853',
+    state: 'succeeded',
+    stage: 'settled',
+    liveness: 'unverifiable',
+    terminal: 'term_2432b953-4baa-4c55-9dfa-c568878ec198',
+    terminalState: 'retained',
+    workspace: 'C:\\orca\\worktrees\\wt',
+    attention: ['unverifiable'],
+    waitingOnHuman: 'unknown',
+  };
+
+  it('admits the real 1.4.261 receipt: state succeeded + retained terminal → finished/succeeded', async () => {
+    const { adapter, calls } = makeAdapter(() => okEnv(REAL_SETTLED_RECEIPT));
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'finished');
+    assert.equal(res.value.taskStatus, 'succeeded');
+    assert.equal(res.value.terminalState, 'retained');
+    assert.deepEqual(calls[0].slice(0, 2), ['orchestration', 'worker-show']);
+  });
+
+  it('reports a failed settlement as finished with the exact taskStatus', async () => {
+    const { adapter } = makeAdapter(() =>
+      okEnv({ ...REAL_SETTLED_RECEIPT, state: 'failed' }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'finished');
+    assert.equal(res.value.taskStatus, 'failed');
+  });
+
+  it('preserves a failed verdict behind a generic settled state', async () => {
+    // worker-list-style row: `state` is the lifecycle marker, `outcome` the
+    // verdict — taskStatus must carry 'failed', not 'settled'.
+    const { adapter } = makeAdapter(() =>
+      okEnv({ ...REAL_SETTLED_RECEIPT, state: 'settled', outcome: 'failed' }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'finished');
+    assert.equal(res.value.taskStatus, 'failed');
+  });
+
+  it('treats a stage-only settled marker as unverifiable — no verdict, no guessed success', async () => {
+    const { state: _dropped, ...rec } = REAL_SETTLED_RECEIPT;
+    const { adapter } = makeAdapter(() => okEnv(rec));
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'unverifiable');
+    assert.equal(res.value.taskStatus, undefined);
+  });
+
+  it('treats physical death / release without a verdict as unverifiable', async () => {
+    for (const rec of [
+      { dispatchId: 'ctx_p1', liveness: 'exited', terminalState: 'retained' },
+      { dispatchId: 'ctx_p2', liveness: 'dead' },
+      { dispatchId: 'ctx_p3', terminalState: 'released', stage: 'settled' },
+      { dispatchId: 'ctx_p4', terminalState: 'release_pending' },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.observeWorker({ dispatchId: 'ctx_p1' });
+      assert.ok(res.ok);
+      if (!res.ok) return;
+      assert.equal(res.value.liveness, 'unverifiable', JSON.stringify(rec));
+    }
+  });
+
+  it('flags contradictory decisive fields instead of picking a verdict', async () => {
+    const { adapter } = makeAdapter(() =>
+      okEnv({ ...REAL_SETTLED_RECEIPT, state: 'succeeded', outcome: 'failed' }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'unverifiable');
+    assert.match(res.value.detail ?? '', /conflict/i);
+    assert.equal(res.value.taskStatus, undefined);
+  });
+
+  it('lets an explicit outcome verdict win over a non-decisive state', async () => {
+    const { adapter } = makeAdapter(() =>
+      okEnv({ ...REAL_SETTLED_RECEIPT, state: 'in_progress', outcome: 'succeeded' }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'finished');
+    assert.equal(res.value.taskStatus, 'succeeded');
+  });
+
+  it('lets logical settlement win over a still-live retained session', async () => {
+    const { adapter } = makeAdapter(() =>
+      okEnv({ ...REAL_SETTLED_RECEIPT, liveness: 'live', waitingOnHuman: 'no' }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_0c5cc9ffa889' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'finished');
+    assert.equal(res.value.taskStatus, 'succeeded');
+  });
+
+  it('keeps genuinely in-progress work working — settlement priority cannot turn live work done', async () => {
+    const { adapter } = makeAdapter(() =>
+      okEnv({
+        dispatchId: 'ctx_live1',
+        taskId: 'task_live1',
+        state: 'in_progress',
+        stage: 'active',
+        liveness: 'live',
+        terminal: 'term_live1',
+        terminalState: 'active',
+        waitingOnHuman: 'no',
+      }),
+    );
+    const res = await adapter.observeWorker({ dispatchId: 'ctx_live1' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.liveness, 'working');
+    assert.equal(res.value.taskStatus, 'in_progress');
+    assert.equal(res.value.terminalState, 'active');
+  });
+
+  it('stays honest on wrong/missing/unknown fields — unverifiable, never a guess', async () => {
+    for (const rec of [
+      {},
+      { state: 'unknown', stage: '???', liveness: 'unverifiable' },
+      { dispatchId: 'ctx_x', something: 'else' },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.observeWorker({ dispatchId: 'ctx_u1' });
+      assert.ok(res.ok);
+      if (!res.ok) return;
+      assert.equal(res.value.liveness, 'unverifiable', JSON.stringify(rec));
+      assert.match(res.value.detail ?? '', /decisive/);
+    }
   });
 });
 
@@ -698,8 +867,30 @@ describe('mapLiveness', () => {
     assert.equal(mapLiveness({ outcome: 'in_progress' }), 'working');
     assert.equal(mapLiveness({ outcome: 'succeeded' }), 'finished');
     assert.equal(mapLiveness({ state: 'stopped' }), 'finished');
+    // Logical settlement beats a retained session's physical signals
+    // (1.4.261 worker-show: state 'succeeded' + terminalState 'retained').
+    assert.equal(mapLiveness({ state: 'succeeded' }), 'finished');
+    assert.equal(mapLiveness({ state: 'failed' }), 'finished');
+    assert.equal(mapLiveness({ state: 'cancelled' }), 'finished');
+    assert.equal(mapLiveness({ state: 'abandoned' }), 'finished');
+    assert.equal(mapLiveness({ outcome: 'failed', state: 'settled' }), 'finished');
+    assert.equal(
+      mapLiveness({ state: 'succeeded', liveness: 'live', terminalState: 'retained' }),
+      'finished',
+    );
+    // No verdict → no 'finished': physical death, release transitions, and
+    // verdict-less settled/done markers are not proof of success.
+    assert.equal(mapLiveness({ stage: 'settled' }), 'unverifiable');
+    assert.equal(mapLiveness({ state: 'settled' }), 'unverifiable');
+    assert.equal(mapLiveness({ liveness: 'dead' }), 'unverifiable');
+    assert.equal(mapLiveness({ liveness: 'exited' }), 'unverifiable');
+    assert.equal(mapLiveness({ terminalState: 'released' }), 'unverifiable');
+    assert.equal(mapLiveness({ state: 'succeeded', outcome: 'failed' }), 'unverifiable');
+    assert.equal(mapLiveness({ state: 'in_progress', terminalState: 'retained' }), 'working');
     assert.equal(mapLiveness({ waitReason: 'permission prompt open' }), 'waiting_human');
     assert.equal(mapLiveness({ liveness: 'idle' }), 'idle');
+    assert.equal(mapLiveness({ terminalState: 'retained' }), 'idle');
+    assert.equal(mapLiveness({ state: 'unknown' }), 'unverifiable');
     assert.equal(mapLiveness({ something: 'else' }), 'unverifiable');
     assert.equal(mapLiveness({}), 'unverifiable');
   });

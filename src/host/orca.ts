@@ -817,15 +817,20 @@ export class OrcaHost {
     if (!listed.ok) {
       return { ok: false, uncertain: listed.uncertain, error: listed.error };
     }
+    // A retained terminal stays 'live' after its dispatch ends; a logical
+    // end state in state/outcome vetoes the liveness signal (1.4.261).
     const active = listed.value.workers.find(
       (w) =>
         w.terminal === handle &&
+        !isEndedDispatchState(w.outcome) &&
+        !isEndedDispatchState(w.state) &&
         (w.outcome === 'in_progress' ||
           w.state === 'dispatched' ||
           w.state === 'ready' ||
-          (w.liveness === 'live' &&
-            w.outcome !== 'succeeded' &&
-            w.outcome !== 'failed')),
+          w.state === 'in_progress' ||
+          w.state === 'working' ||
+          w.state === 'running' ||
+          w.liveness === 'live'),
     );
     if (active) {
       return {
@@ -1097,6 +1102,57 @@ function firstString(...vals: unknown[]): string | undefined {
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return undefined;
+}
+
+/**
+ * Explicit dispatch verdicts: a record carrying one of these in `outcome`
+ * (worker-list) or `state` (worker-show, verified 1.4.261: 'succeeded')
+ * proves the Task logically ended WITH that result. Generic lifecycle
+ * markers ('settled', 'done', 'released'), stage fields, and physical
+ * signals (dead/exited liveness, released terminals) say a session ended
+ * but carry NO verdict — never proof of successful completion.
+ */
+const DECISIVE_OUTCOMES = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'abandoned',
+  'stopped',
+]);
+
+function isDecisiveOutcome(v: unknown): v is string {
+  return typeof v === 'string' && DECISIVE_OUTCOMES.has(v);
+}
+
+/**
+ * Logical Dispatch end states — the dispatch is provably over regardless of
+ * whether a verdict was reported. Used ONLY for resource-ownership questions
+ * (terminal reuse), never for success/failure judgment.
+ */
+const DISPATCH_ENDED = new Set([...DECISIVE_OUTCOMES, 'settled', 'done', 'released']);
+
+function isEndedDispatchState(v: unknown): boolean {
+  return typeof v === 'string' && DISPATCH_ENDED.has(v);
+}
+
+/**
+ * The explicit verdict a dispatch record carries. `outcome` (worker-list) is
+ * the authoritative verdict field; worker-show `state` can carry one too —
+ * a generic lifecycle state ('settled', 'in_progress', …) is NOT a verdict.
+ * Two decisive fields that disagree are a conflict, never silently resolved.
+ */
+function dispatchVerdict(rec: Record<string, unknown>): {
+  verdict?: string;
+  conflict?: { outcome: string; state: string };
+} {
+  const outcome = firstString(rec.outcome, asRecord(rec.result)?.outcome);
+  const state = firstString(rec.state);
+  const dOutcome = isDecisiveOutcome(outcome) ? outcome : undefined;
+  const dState = isDecisiveOutcome(state) ? state : undefined;
+  if (dOutcome !== undefined && dState !== undefined && dOutcome !== dState) {
+    return { conflict: { outcome: dOutcome, state: dState } };
+  }
+  return { verdict: dOutcome ?? dState };
 }
 
 /**
@@ -1436,17 +1492,27 @@ export class OrcaAdapter implements HostAdapter {
         dispatchId: input.dispatchId,
         liveness: mapLiveness(rec),
       };
-      const taskStatus = firstString(
-        rec.state,
-        asRecord(rec.task)?.state,
-        asRecord(rec.task)?.status,
-      );
+      // taskStatus carries the explicit verdict first — a generic
+      // state:'settled' must never mask a decisive outcome:'failed'.
+      const { verdict, conflict } = dispatchVerdict(rec);
+      const taskStatus =
+        verdict ??
+        (conflict === undefined
+          ? firstString(
+              rec.state,
+              rec.outcome,
+              asRecord(rec.task)?.state,
+              asRecord(rec.task)?.status,
+            )
+          : undefined);
       if (taskStatus !== undefined) obs.taskStatus = taskStatus;
       const ts = firstString(rec.terminalState, asRecord(rec.terminal)?.state);
       if (ts !== undefined && TERMINAL_STATES.has(ts)) {
         obs.terminalState = ts as WorkerObservation['terminalState'];
       }
-      if (obs.liveness === 'unverifiable') {
+      if (conflict !== undefined) {
+        obs.detail = `conflicting decisive fields: outcome='${conflict.outcome}' state='${conflict.state}' — refusing to pick a verdict`;
+      } else if (obs.liveness === 'unverifiable') {
         obs.detail = 'worker record did not expose a decisive liveness/outcome field';
       }
       return { ok: true, value: obs };
@@ -1692,13 +1758,46 @@ function describeLaunchFailure(started: PhaseWorkerStart): string {
 /**
  * Map an Orca dispatch record to contract liveness. Field names are read
  * tolerantly; ambiguity collapses to 'unverifiable', never a guessed state.
+ *
+ * Only an explicit logical verdict (DECISIVE_OUTCOMES in `outcome`/`state`)
+ * proves the Task finished: a retained session survives its Task and keeps
+ * reporting live/idle/wait-menu liveness after the dispatch settled
+ * (verified 1.4.261: state 'succeeded', stage 'settled', liveness
+ * 'unverifiable', terminalState 'retained'). Physical death, released
+ * resources, and verdict-less 'settled'/'done' markers are NOT completion
+ * proof — claiming 'finished' on them would let the engine record a
+ * guessed success. Contradictory verdicts are unverifiable, not a coin flip.
  */
 export function mapLiveness(rec: Record<string, unknown>): WorkerLiveness {
   const outcome = firstString(rec.outcome, asRecord(rec.result)?.outcome);
   const liveness = firstString(rec.liveness);
   const state = firstString(rec.state);
-  const wait = firstString(rec.waitReason, rec.blockedOn, asRecord(rec.wait)?.reason);
+  const stage = firstString(rec.stage);
+  const terminalState = firstString(rec.terminalState);
+  const wait = firstString(
+    rec.waitReason,
+    rec.blockedOn,
+    rec.waitingOnHuman,
+    asRecord(rec.wait)?.reason,
+  );
 
+  const { verdict, conflict } = dispatchVerdict(rec);
+  if (verdict !== undefined) return 'finished';
+  if (conflict !== undefined) return 'unverifiable';
+  // End-of-life signals without a verdict: the session died, was released,
+  // or a settled/done marker fired — the Task outcome is unproven, and it is
+  // certainly not 'idle' (nothing is parked to resume).
+  if (
+    liveness === 'dead' ||
+    liveness === 'exited' ||
+    terminalState === 'released' ||
+    terminalState === 'release_pending' ||
+    terminalState === 'release_unknown' ||
+    stage === 'settled' ||
+    stage === 'done'
+  ) {
+    return 'unverifiable';
+  }
   if (wait !== undefined && /permission|approval|human|input|gate/i.test(wait)) {
     return 'waiting_human';
   }
@@ -1706,23 +1805,23 @@ export function mapLiveness(rec: Record<string, unknown>): WorkerLiveness {
     outcome === 'in_progress' ||
     liveness === 'live' ||
     state === 'dispatched' ||
-    state === 'working'
+    state === 'working' ||
+    state === 'in_progress' ||
+    state === 'running' ||
+    stage === 'dispatched' ||
+    stage === 'active' ||
+    stage === 'working' ||
+    stage === 'in_progress' ||
+    stage === 'running'
   ) {
     return 'working';
   }
   if (
-    outcome === 'succeeded' ||
-    outcome === 'failed' ||
-    state === 'stopped' ||
-    state === 'settled' ||
-    state === 'done' ||
-    state === 'released' ||
-    liveness === 'dead' ||
-    liveness === 'exited'
+    liveness === 'idle' ||
+    state === 'idle' ||
+    terminalState === 'retained' ||
+    terminalState === 'reclaimable'
   ) {
-    return 'finished';
-  }
-  if (liveness === 'idle' || state === 'idle' || rec.terminalState === 'retained') {
     return 'idle';
   }
   return 'unverifiable';
