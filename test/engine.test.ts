@@ -22,6 +22,7 @@ import {
   type CouncilError,
   type CouncilState,
   type Engine,
+  type ExecutionPolicy,
   type HostAdapter,
   type JournalEvent,
   type LaunchResult,
@@ -312,7 +313,10 @@ interface Env {
   clock: { t: number };
 }
 
-function makeEnv(config: CouncilConfig, opts: { liveSource?: Record<string, string> } = {}): Env {
+function makeEnv(
+  config: CouncilConfig,
+  opts: { liveSource?: Record<string, string>; execution?: ExecutionPolicy } = {},
+): Env {
   const targetRoot = mkdtempSync(join(tmpdir(), 'council-target-'));
   const liveSource = opts.liveSource ?? {};
   for (const [p, c] of Object.entries(liveSource)) {
@@ -351,7 +355,13 @@ function makeEnv(config: CouncilConfig, opts: { liveSource?: Record<string, stri
   const store = new FakeStore(db);
   const host = new FakeHost();
   const prompts = new FakePrompts();
-  const engine = createEngine({ store, host, prompts, now: () => new Date(clock.t) });
+  const engine = createEngine({
+    store,
+    host,
+    prompts,
+    now: () => new Date(clock.t),
+    ...(opts.execution !== undefined ? { execution: opts.execution } : {}),
+  });
   return { engine, store, host, prompts, db, clock };
 }
 
@@ -1206,4 +1216,156 @@ test('drift injected after the last launch is journaled and marked on the emitte
   const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
   assert.equal(report.coverage.partial, true, 'drifted report is visibly partial');
   assert.ok(report.limitations.some((l) => /drift/i.test(l)), 'drift noted in report limitations');
+});
+
+// ─── Execution policy boundary (PUBLIC-USE) ─────────────────────────────────
+
+const POLICY_HASH = 'a'.repeat(64);
+const execCfg = (hash = POLICY_HASH) => ({ catalogVersion: '1.0.0', policyHash: hash });
+
+/** Fake synchronous policy: accepts choices matching `accept`, records every call. */
+function mkPolicy(
+  hash: string,
+  accept: (c: AgentChoice) => boolean,
+): ExecutionPolicy & { seen: AgentChoice[] } {
+  const seen: AgentChoice[] = [];
+  return {
+    policyHash: hash,
+    seen,
+    validateChoice: (c: AgentChoice) => {
+      seen.push({ ...c });
+      return accept(c)
+        ? ok(undefined)
+        : failRes(err('unsupported', `rejected choice ${c.agent}/${c.model}/${c.permissionMode}`));
+    },
+  };
+}
+
+const CATALOG_AGENTS = new Set(['devin', 'claude', 'codex']);
+const acceptCatalog = (c: AgentChoice): boolean => CATALOG_AGENTS.has(c.agent) && c.model !== 'bad-model';
+
+const STAFF: { organiser: AgentChoice; scribe: AgentChoice; supervisor: AgentChoice } = {
+  organiser: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' },
+  scribe: { agent: 'claude', model: 'claude-sonnet-4-6', permissionMode: 'auto', effort: 'high' },
+  supervisor: { agent: 'codex', model: 'gpt-6-astra', permissionMode: 'auto', profile: 'ops' },
+};
+
+function assertZeroHostCalls(env: Env) {
+  assert.equal(env.host.createRunCalls, 0, 'createRun must not be called');
+  assert.equal(env.host.createTaskCalls, 0, 'createTask must not be called');
+  assert.equal(env.host.launches.length, 0, 'no worker launches');
+  assert.equal(env.host.notifications.length, 0, 'no notifications');
+  assert.equal(env.host.stops.length, 0, 'no stops');
+}
+
+test('mismatched policy hash blocks before ANY host mutation', async () => {
+  const env = makeEnv(configWith({ execution: execCfg(POLICY_HASH) }), {
+    execution: mkPolicy('b'.repeat(64), acceptCatalog),
+  });
+  const r = await env.engine.advance();
+  assert.ok(r.ok);
+  assert.equal(r.value.action, 'blocked');
+  assert.match((r.value as { note?: string }).note ?? '', /hash mismatch/);
+  assertZeroHostCalls(env);
+});
+
+test('omitted EngineDeps.execution cannot bypass a fingerprint-bound config', async () => {
+  const env = makeEnv(configWith({ execution: execCfg() }));
+  const r = await env.engine.advance();
+  assert.ok(r.ok);
+  assert.equal(r.value.action, 'blocked');
+  assertZeroHostCalls(env);
+
+  // The same gate binds the approval entry path on a state already at the gate.
+  const env2 = makeEnv(configWith({ execution: execCfg() }));
+  env2.db.state.status = 'awaiting_approval';
+  env2.db.proposed = mkProposal(15);
+  const ap = await env2.engine.approve({ roster: mkApprovedRoster(env2, ['persp_1', 'persp_2']), approver: 'x' });
+  assert.ok(!ap.ok);
+  assert.equal(ap.error.code, 'config_invalid');
+  assert.equal(env2.db.approval, null);
+  assert.equal(env2.db.state.approvalHash, null);
+  assertZeroHostCalls(env2);
+});
+
+test('invalid staff choice blocks the run at init — zero host calls', async () => {
+  for (const role of ['organiser', 'scribe', 'supervisor'] as const) {
+    const staff = structuredClone(STAFF);
+    staff[role] = { agent: 'devin', model: 'bad-model', permissionMode: 'bypass' };
+    const env = makeEnv(
+      configWith({ staff, execution: execCfg() }),
+      { execution: mkPolicy(POLICY_HASH, acceptCatalog) },
+    );
+    const r = await env.engine.advance();
+    assert.ok(r.ok);
+    assert.equal(r.value.action, 'blocked', `${role} rejection must block`);
+    assert.match((r.value as { note?: string }).note ?? '', new RegExp(`staff\\.${role}`));
+    assertZeroHostCalls(env);
+  }
+});
+
+test('policy-rejected reviewer seat fails approval before artifacts/wake', async () => {
+  const env = makeEnv(configWith({ staff: STAFF, execution: execCfg(), participants: 2, requestedPerspectives: 10 }), {
+    execution: mkPolicy(POLICY_HASH, acceptCatalog),
+  });
+  await driveToApproval(env);
+
+  const bad = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  bad.seats[1]!.agent = { agent: 'claude', model: 'bad-model', permissionMode: 'auto' };
+  const ap = await env.engine.approve({ roster: bad, approver: 'o' });
+  assert.ok(!ap.ok);
+  assert.equal(ap.error.code, 'roster_invalid');
+  assert.match(ap.error.message, /rev_2/);
+  // Nothing persisted, nothing notified, approval stays unbound.
+  assert.equal(env.db.approval, null);
+  assert.equal(env.db.approved, null);
+  assert.equal(env.db.state.approvalHash, null);
+  assert.equal(env.host.notifications.length, 0);
+
+  // Same roster with a policy-valid seat approves and launches normally.
+  const good = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  good.seats[0]!.agent = { agent: 'claude', model: 'claude-sonnet-4-6', permissionMode: 'plan' };
+  assert.ok((await env.engine.approve({ roster: good, approver: 'o' })).ok);
+});
+
+test('valid mixed-provider config drives the full lifecycle with staff agents', async () => {
+  const policy = mkPolicy(POLICY_HASH, acceptCatalog);
+  const env = makeEnv(configWith({ staff: STAFF, execution: execCfg(), participants: 3, requestedPerspectives: 10 }), {
+    execution: policy,
+  });
+  await driveToApproval(env);
+  // Organiser launched as the configured devin staff member.
+  assert.equal(env.host.launches[0]!.spec.phase, 'organiser');
+  assert.deepEqual(env.host.launches[0]!.spec.agent, STAFF.organiser);
+
+  const roster = mkApprovedRoster(env, ['persp_1', 'persp_2', 'persp_3']);
+  roster.seats[1]!.agent = { agent: 'claude', model: 'claude-sonnet-4-6', permissionMode: 'auto', effort: 'low' };
+  roster.seats[2]!.agent = { agent: 'codex', model: 'gpt-6-astra', permissionMode: 'read-only', profile: 'ops' };
+  assert.ok((await env.engine.approve({ roster, approver: 'o' })).ok);
+
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  // Scribe launched as the configured claude staff member in both phases.
+  const scribeLaunches = env.host.launches.filter((l) => l.spec.participantId === 'scribe');
+  assert.equal(scribeLaunches.length, 2);
+  assert.ok(scribeLaunches.every((l) => l.spec.agent.agent === 'claude'));
+  // Every launched choice passed through validateChoice (staff + reviewers).
+  const launchedAgents = env.host.launches.map((l) => l.spec.agent.agent);
+  assert.ok(launchedAgents.includes('codex'), 'codex reviewer launched');
+  assert.ok(policy.seen.some((c) => c.agent === 'devin'), 'organiser staff validated');
+  assert.ok(policy.seen.some((c) => c.agent === 'codex' && c.profile === 'ops'));
+});
+
+test('legacy run without execution/staff is an unchanged fixed point', async () => {
+  // No execution dep injected at all — identical to pre-extension engines.
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  // The legacy Devin pin still carries staff work.
+  assert.deepEqual(env.host.launches[0]!.spec.agent, AGENT);
+  assert.equal('staff' in env.db.state.config, false);
+  assert.equal('execution' in env.db.state.config, false);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal(env.db.state.status, 'reported');
 });

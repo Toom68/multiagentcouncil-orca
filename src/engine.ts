@@ -37,6 +37,7 @@ import {
   type Engine,
   type EngineDeps,
   type EngineStatus,
+  type ExecutionPolicy,
   type FindingsFile,
   type JournalEvent,
   type JournalEventType,
@@ -128,6 +129,15 @@ const SLOT_HOLDING_ATTEMPT = new Set(['intent_recorded', 'dispatched', 'working'
 
 const ok = <T>(value: T): Result<T> => ({ ok: true, value });
 const failRes = (error: CouncilError): Result<never> => ({ ok: false, error });
+
+// ─── Execution policy boundary (PUBLIC-USE) ──────────────────────────────────
+// A run whose config binds an execution fingerprint MUST be driven by an
+// injected ExecutionPolicy whose hash matches the approved fingerprint —
+// enforced synchronously before every host mutation on every entry path
+// (run-create, approval, launch). Stops/observes/releases stay ungated so a
+// blocked run can never strand live workers. Runs without config.execution
+// keep the legacy path: no policy required, no validation added, identical
+// approval hashes. The engine never loads a catalog and knows nothing of Orca.
 
 // ─── Per-step working context ────────────────────────────────────────────────
 
@@ -485,6 +495,44 @@ export function createEngine(deps: EngineDeps): Engine {
     return false;
   };
 
+  // ── Execution policy gate (see module-level boundary note) ─────────────────
+
+  /**
+   * Returns the injected policy when the run binds a fingerprint, `null` on
+   * the legacy path, or an error that MUST stop the caller before any host
+   * mutation.
+   */
+  const executionPolicy = (state: CouncilState): Result<ExecutionPolicy | null> => {
+    if (state.config.execution === undefined) return ok(null);
+    const pol = deps.execution;
+    if (pol === undefined) {
+      return failRes(
+        err('config_invalid', 'config binds an execution fingerprint but no EngineDeps.execution was injected — refusing all host mutations'),
+      );
+    }
+    if (pol.policyHash !== state.config.execution.policyHash) {
+      return failRes(
+        err('config_invalid', `execution policy hash mismatch: config binds ${state.config.execution.policyHash}, injected policy is ${pol.policyHash} — refusing all host mutations`),
+      );
+    }
+    return ok(pol);
+  };
+
+  /** The effective staff AgentChoice for a role — explicit staff, else the legacy Devin pin. */
+  const staffAgent = (state: CouncilState, role: 'organiser' | 'scribe' | 'supervisor'): AgentChoice =>
+    state.config.staff?.[role] ?? COUNCIL_STAFF_AGENT;
+
+  /** Every staff role's effective choice must be policy-launchable before any host mutation. */
+  const validateStaff = (state: CouncilState, pol: ExecutionPolicy): Result<void> => {
+    for (const role of ['organiser', 'scribe', 'supervisor'] as const) {
+      const v = pol.validateChoice(staffAgent(state, role));
+      if (!v.ok) {
+        return failRes(err('config_invalid', `staff.${role} rejected by execution policy: ${v.error.message}`));
+      }
+    }
+    return ok(undefined);
+  };
+
   // ── Approval revalidation (before every launch past the gate) ─────────────
 
   /**
@@ -647,7 +695,7 @@ export function createEngine(deps: EngineDeps): Engine {
   };
 
   interface LaunchOutcome {
-    kind: 'launched' | 'failed' | 'unknown' | 'task_error' | 'budget' | 'approval' | 'concurrency';
+    kind: 'launched' | 'failed' | 'unknown' | 'task_error' | 'budget' | 'approval' | 'concurrency' | 'policy';
     error?: CouncilError;
     note?: string;
   }
@@ -664,6 +712,15 @@ export function createEngine(deps: EngineDeps): Engine {
     opts: { isFreshFallback?: boolean } = {},
   ): Promise<LaunchOutcome> => {
     const { state } = ctx;
+    // Execution-policy gate precedes EVERY host mutation: the fingerprinted
+    // policy must be present, hash-matched, and must accept this exact
+    // participant's approved AgentChoice before intent is even recorded.
+    const gate = executionPolicy(state);
+    if (!gate.ok) return { kind: 'policy', error: gate.error };
+    if (gate.value !== null) {
+      const v = gate.value.validateChoice(p.agent);
+      if (!v.ok) return { kind: 'policy', error: v.error };
+    }
     if (state.consumption.launches >= state.config.maxLaunches) {
       return {
         kind: 'budget',
@@ -1105,6 +1162,9 @@ export function createEngine(deps: EngineDeps): Engine {
     if (lo.kind === 'concurrency') {
       return advanceResult('wait', ctx.state.status, 'concurrency slots held by unresolved workers');
     }
+    if (lo.kind === 'policy') {
+      return blocked(ctx.state.status, lo.error?.message ?? 'execution policy refused the launch');
+    }
     if (lo.kind === 'approval') {
       const stale = lo.error?.code === 'approval_stale' || lo.error?.code === 'snapshot_drift';
       return stale
@@ -1118,6 +1178,16 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const stepInitialized = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
+    // Fingerprint-bound runs must prove the injected policy before the very
+    // first host mutation (run-create) — and every staff role's choice must
+    // be policy-launchable. Nothing is created, launched, or persisted on
+    // failure.
+    const gate = executionPolicy(state);
+    if (!gate.ok) return blocked(state.status, gate.error.message);
+    if (gate.value !== null) {
+      const sv = validateStaff(state, gate.value);
+      if (!sv.ok) return blocked(state.status, sv.error.message);
+    }
     if (state.orcaRunId === null) {
       if (ctx.runCreateUnresolved) {
         return blocked(state.status, 'run-create was attempted but its outcome was never confirmed; reconcile the retained intent (see journal launch.intent scope=run) before retrying — never auto-retry a missing receipt');
@@ -1134,7 +1204,7 @@ export function createEngine(deps: EngineDeps): Engine {
       state.orcaRunId = run.value.runId;
       emit(ctx, 'task.created', { scope: 'run', orcaRunId: run.value.runId });
     }
-    const organiser = makeParticipant(ORGANISER_PID, 'organiser', COUNCIL_STAFF_AGENT, null, null);
+    const organiser = makeParticipant(ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
     state.participants.push(organiser);
     addPlannedAttempt(organiser, 'organiser', null);
     state.status = 'organising';
@@ -1279,7 +1349,7 @@ export function createEngine(deps: EngineDeps): Engine {
     emit(ctx, 'artifact.written', { path: paths.ledger, claims: build.ledger.claims.length });
 
     // Enter scribe-notes phase with a fresh, distinct scribe participant.
-    const scribe = makeParticipant(SCRIBE_PID, 'scribe', COUNCIL_STAFF_AGENT, null, null);
+    const scribe = makeParticipant(SCRIBE_PID, 'scribe', staffAgent(state, 'scribe'), null, null);
     state.participants.push(scribe);
     addPlannedAttempt(scribe, 'scribe_notes', null);
     state.status = 'scribe_notes';
@@ -1907,6 +1977,12 @@ export function createEngine(deps: EngineDeps): Engine {
             err('invalid_transition', `cannot approve in status ${state.status}${state.approvalHash !== null ? ' (already approved)' : ''}`),
           );
         }
+        // Execution-policy gate precedes roster admission AND the approval
+        // write/wake — a fingerprint-bound run cannot be approved under a
+        // missing or mismatched policy, and every admitted seat + staff
+        // choice must be policy-launchable before anything is persisted.
+        const gate = executionPolicy(state);
+        if (!gate.ok) return failRes(gate.error);
         const proposedR = await store.readProposedRoster();
         if (!proposedR.ok) {
           return failRes(err('approval_required', 'no proposed roster on record; organiser must finish first'));
@@ -1920,6 +1996,18 @@ export function createEngine(deps: EngineDeps): Engine {
           return failRes(err('roster_invalid', 'approved roster failed validation', { issues: parsed.issues }));
         }
         const roster = parsed.value;
+        if (gate.value !== null) {
+          const sv = validateStaff(state, gate.value);
+          if (!sv.ok) return failRes(sv.error);
+          for (const seat of roster.seats) {
+            const v = gate.value.validateChoice(seat.agent);
+            if (!v.ok) {
+              return failRes(
+                err('roster_invalid', `seat ${seat.participantId} agent rejected by execution policy: ${v.error.message}`),
+              );
+            }
+          }
+        }
         if (reapproval && !seatsMatchLaunchedReviewers(state, roster)) {
           return failRes(
             err('roster_invalid', 're-approval must reproduce the exact launched seats/agents; start a new run to change the roster'),

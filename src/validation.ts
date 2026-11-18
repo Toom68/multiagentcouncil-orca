@@ -52,6 +52,8 @@ import type {
   SourceSnapshot,
   ValidationIssue,
   ClaimStatus,
+  CouncilStaff,
+  ExecutionConfig,
   FindingKind,
   ParticipantStatus,
   AttemptStatus,
@@ -450,6 +452,38 @@ export function resolveConfig(raw: unknown): ParseResult<CouncilConfig> {
     }
   }
 
+  // Optional PUBLIC-USE fields. Presence is preserved exactly — absent stays
+  // absent so legacy configs/approvals keep their canonical hash — while a
+  // present field must fully validate: `staff` requires ALL THREE roles as
+  // explicit AgentChoices (a partial staff object is a config error), and
+  // `execution` requires both fingerprint members.
+  const staffRaw = (r as Record<string, unknown>).staff;
+  let staff: CouncilStaff | undefined;
+  if (staffRaw !== undefined) {
+    const s = reqObj(staffRaw, 'config.staff', issues);
+    if (s !== null) {
+      const organiser = parseAgentChoice(s.organiser, 'config.staff.organiser', issues);
+      const scribe = parseAgentChoice(s.scribe, 'config.staff.scribe', issues);
+      const supervisor = parseAgentChoice(s.supervisor, 'config.staff.supervisor', issues);
+      if (organiser !== null && scribe !== null && supervisor !== null) {
+        staff = { organiser, scribe, supervisor };
+      }
+    }
+  }
+
+  const execRaw = (r as Record<string, unknown>).execution;
+  let execution: ExecutionConfig | undefined;
+  if (execRaw !== undefined) {
+    const e = reqObj(execRaw, 'config.execution', issues);
+    if (e !== null) {
+      const catalogVersion = reqStr(e.catalogVersion, 'config.execution.catalogVersion', issues, { max: 64 });
+      const policyHash = reqSha256(e.policyHash, 'config.execution.policyHash', issues);
+      if (catalogVersion !== null && policyHash !== null) {
+        execution = { catalogVersion, policyHash };
+      }
+    }
+  }
+
   const schemaVersion = (r as Record<string, unknown>).schemaVersion;
   if (schemaVersion !== undefined && !reqVersion(schemaVersion, 'config.schemaVersion', issues)) {
     // issue already recorded
@@ -471,6 +505,8 @@ export function resolveConfig(raw: unknown): ParseResult<CouncilConfig> {
     maxMailPerParticipant,
     maxTextChars,
     deadlines,
+    ...(staff !== undefined ? { staff } : {}),
+    ...(execution !== undefined ? { execution } : {}),
   });
 }
 
@@ -486,9 +522,14 @@ function parseAgentChoice(u: unknown, path: string, issues: ValidationIssue[]): 
   if (o.effort !== undefined && o.effort !== null) {
     effort = reqToken(o.effort, `${path}.effort`, issues) ?? undefined;
   }
+  let profile: string | undefined;
+  if (o.profile !== undefined && o.profile !== null) {
+    profile = reqToken(o.profile, `${path}.profile`, issues) ?? undefined;
+  }
   if (agent === null || model === null || permissionMode === null) return null;
   const out: AgentChoice = { agent, model, permissionMode };
   if (effort !== undefined) out.effort = effort;
+  if (profile !== undefined) out.profile = profile;
   return out;
 }
 

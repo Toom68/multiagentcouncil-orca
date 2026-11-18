@@ -509,3 +509,134 @@ test('parseScribeNotesFile and parseReportFile validate structure', () => {
   assert.ok(r.ok, issues(r));
   assert.equal(r.value.coverage.partial, true);
 });
+
+// ─── PUBLIC-USE: AgentChoice.profile ─────────────────────────────────────────
+
+test('seat agent accepts optional named profile token and round-trips it', () => {
+  const cfg = resolveConfig({ requestedPerspectives: 10, participants: 1 });
+  assert.ok(cfg.ok);
+  const seat = {
+    seatId: 's0', perspectiveId: 'p0', participantId: 'rev0',
+    agent: { agent: 'codex', model: 'gpt-6-astra', permissionMode: 'auto', profile: 'work' },
+  };
+  const r = parseApprovedRoster({ schemaVersion: 1, runId: RUN, seats: [seat] },
+    { runId: RUN, proposed: mkProposal(10), config: cfg.value });
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.seats[0]!.agent.profile, 'work');
+});
+
+test('seat agent rejects an unsafe profile token and absent profile stays absent', () => {
+  const cfg = resolveConfig({ requestedPerspectives: 10, participants: 1 });
+  assert.ok(cfg.ok);
+  const bad = {
+    seatId: 's0', perspectiveId: 'p0', participantId: 'rev0',
+    agent: { agent: 'codex', model: 'm', permissionMode: 'auto', profile: '../x' },
+  };
+  const r = parseApprovedRoster({ schemaVersion: 1, runId: RUN, seats: [bad] },
+    { runId: RUN, proposed: mkProposal(10), config: cfg.value });
+  assert.ok(!r.ok);
+  assert.ok(hasCode(r, 'bad_token'));
+  const good = parseApprovedRoster(mkApproved(1), { runId: RUN, proposed: mkProposal(10), config: cfg.value });
+  assert.ok(good.ok, issues(good));
+  assert.equal('profile' in good.value.seats[0]!.agent, false);
+});
+
+// ─── PUBLIC-USE: config.staff ────────────────────────────────────────────────
+
+const mkChoice = (over: Record<string, unknown> = {}) => ({
+  agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass', ...over,
+});
+
+test('resolveConfig accepts a complete staff object with mixed agents', () => {
+  const r = resolveConfig({
+    staff: {
+      organiser: mkChoice(),
+      scribe: mkChoice({ agent: 'claude', model: 'claude-sonnet-4-6', permissionMode: 'auto', effort: 'high' }),
+      supervisor: mkChoice({ agent: 'codex', model: 'gpt-6-astra', permissionMode: 'auto', profile: 'ops' }),
+    },
+  });
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.staff!.scribe.agent, 'claude');
+  assert.equal(r.value.staff!.supervisor.profile, 'ops');
+  // round-trip: re-resolving the resolved config is a fixed point
+  const again = resolveConfig(r.value);
+  assert.ok(again.ok, issues(again));
+  assert.deepEqual(again.value.staff, r.value.staff);
+});
+
+test('resolveConfig rejects partial staff (all three roles required)', () => {
+  assert.ok(hasCode(resolveConfig({ staff: { organiser: mkChoice(), scribe: mkChoice() } }), 'type'));
+  assert.ok(hasCode(resolveConfig({ staff: 'devin' }), 'type'));
+  assert.ok(hasCode(resolveConfig({ staff: {} }), 'type'));
+});
+
+test('resolveConfig rejects explicit null staff/execution while preserving absence', () => {
+  assert.ok(hasCode(resolveConfig({ staff: null }), 'type'));
+  assert.ok(hasCode(resolveConfig({ execution: null }), 'type'));
+  const absent = resolveConfig({});
+  assert.ok(absent.ok);
+  assert.equal('staff' in absent.value, false);
+  assert.equal('execution' in absent.value, false);
+});
+
+test('resolveConfig rejects an invalid choice inside staff', () => {
+  const r = resolveConfig({
+    staff: {
+      organiser: mkChoice(),
+      scribe: mkChoice({ permissionMode: 'bad mode!' }),
+      supervisor: mkChoice(),
+    },
+  });
+  assert.ok(!r.ok);
+  assert.ok(hasCode(r, 'bad_token'));
+});
+
+// ─── PUBLIC-USE: config.execution ────────────────────────────────────────────
+
+test('resolveConfig accepts a valid execution fingerprint and round-trips it', () => {
+  const execution = { catalogVersion: '1.0.0', policyHash: 'a'.repeat(64) };
+  const r = resolveConfig({ execution });
+  assert.ok(r.ok, issues(r));
+  assert.deepEqual(r.value.execution, execution);
+  const again = resolveConfig(r.value);
+  assert.ok(again.ok);
+  assert.deepEqual(again.value.execution, execution);
+});
+
+test('resolveConfig rejects malformed execution fingerprint', () => {
+  assert.ok(hasCode(resolveConfig({ execution: { catalogVersion: '1.0.0' } }), 'type'));
+  assert.ok(hasCode(resolveConfig({ execution: { catalogVersion: '1.0.0', policyHash: 'zz' } }), 'bad_hash'));
+  assert.ok(hasCode(resolveConfig({ execution: 'sha256:abc' }), 'type'));
+});
+
+// ─── PUBLIC-USE: legacy absence is preserved ─────────────────────────────────
+
+test('resolveConfig keeps staff/execution ABSENT on legacy configs', () => {
+  const r = resolveConfig({ participants: 2, requestedPerspectives: 10 });
+  assert.ok(r.ok);
+  assert.equal('staff' in r.value, false);
+  assert.equal('execution' in r.value, false);
+});
+
+test('legacy approval binding keeps its canonical hash (no injected fields)', () => {
+  // mkBinding() builds a config with no staff/execution — identical canonical
+  // form to pre-extension bindings. The literal pins it against regressions.
+  const b = mkBinding();
+  assert.equal(canonicalApprovalHash(b), '02dc767b6df915ea2f1d32c19a8c0f5f1c452842b8fc5ff39eacbb522d2d1f6a');
+});
+
+test('approval hash covers staff/execution/profile when present (approval-bound)', () => {
+  const base = mkBinding();
+  const h = canonicalApprovalHash(base);
+  const withStaff = mkBinding({
+    config: { ...base.config, staff: { organiser: mkChoice(), scribe: mkChoice(), supervisor: mkChoice() } as never },
+  });
+  assert.notEqual(canonicalApprovalHash(withStaff), h);
+  const withExec = mkBinding({
+    config: { ...base.config, execution: { catalogVersion: '1.0.0', policyHash: 'e'.repeat(64) } },
+  });
+  assert.notEqual(canonicalApprovalHash(withExec), h);
+  const seatProfile = mkBinding();
+  seatProfile.seats[0]!.agent.profile = 'work';
+  assert.notEqual(canonicalApprovalHash(seatProfile), h);
+});

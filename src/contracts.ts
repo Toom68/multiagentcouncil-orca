@@ -124,6 +124,38 @@ export interface CouncilConfig {
   maxTextChars: number;
   /** Per-phase wall-clock deadlines (ms). Checked on advance, not in real time. */
   deadlines: PhaseDeadlines;
+  /**
+   * Optional explicit staff choices (PUBLIC-USE.md): when present, ALL three
+   * roles carry an AgentChoice — partial staff objects are rejected. Absent
+   * on legacy runs, which retain their original behavior. Included in the
+   * approval hash through `config`.
+   */
+  staff?: CouncilStaff;
+  /**
+   * Optional launch-catalog fingerprint captured at init: the shipped
+   * catalog version and policy hash. Absent on legacy runs. Included in the
+   * approval hash through `config`.
+   */
+  execution?: ExecutionConfig;
+}
+
+/** Explicit staff choices — organiser, scribe and supervisor roles. */
+export interface CouncilStaff {
+  organiser: AgentChoice;
+  scribe: AgentChoice;
+  supervisor: AgentChoice;
+}
+
+/**
+ * Launch-catalog fingerprint captured at run init. A later catalog change
+ * (version/hash drift) must block launches until re-approval — policy edits
+ * must not silently change an approved launch.
+ */
+export interface ExecutionConfig {
+  /** Shipped catalog version string (src/catalog.ts CATALOG_VERSION). */
+  catalogVersion: string;
+  /** sha256 hex fingerprint of the shipped launch policy templates. */
+  policyHash: string;
 }
 
 export interface PhaseDeadlines {
@@ -155,6 +187,12 @@ export interface AgentChoice {
   effort?: string;
   /** Approved permission posture token, e.g. "bypass". */
   permissionMode: string;
+  /**
+   * Optional named CLI profile token (e.g. Codex `--profile`). Honored only
+   * where the launch catalog documents a named-profile selector; never a
+   * config-file path. Approval-bound like every other field.
+   */
+  profile?: string;
 }
 
 // ─── Perspectives and roster ─────────────────────────────────────────────────
@@ -999,11 +1037,28 @@ export interface Engine {
   cancel(input: { reason: string }): Promise<Result<void>>;
 }
 
+/**
+ * Optional execution-policy dependency (PUBLIC-USE.md): the loaded launch
+ * catalog's fingerprint plus a synchronous validator for one AgentChoice.
+ * Pure — the engine core holds no Orca or catalog-file knowledge; the CLI
+ * and host adapter inject the concrete implementation from src/catalog.ts.
+ * Runs whose resolved config carries `execution` require this dependency;
+ * legacy runs without it never consult it.
+ */
+export interface ExecutionPolicy {
+  /** Fingerprint of the shipped launch policy (catalog LAUNCH_POLICY_HASH). */
+  policyHash: string;
+  /** Synchronously validate one explicit choice against the shipped catalog. */
+  validateChoice: (choice: AgentChoice) => Result<void>;
+}
+
 export interface EngineDeps {
   store: Store;
   host: HostAdapter;
   prompts: PromptBuilder;
   now?: () => Date;
+  /** Optional execution policy; required by runs whose config.execution exists. */
+  execution?: ExecutionPolicy;
 }
 
 /**
