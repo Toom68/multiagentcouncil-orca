@@ -21,3 +21,5 @@ The primary orchestrator integrates and pushes completed stages. Planning worker
 All three must identify tradeoffs, failure modes, an implementable first version, and evidence for host capability claims. They may exchange ideas through Orca mail. These are proposals; the primary orchestrator chooses and records the final design before implementation.
 
 The three design workers have been launched in Orca using Devin `swe-2-max`. Stage 1 remains pending until their proposals have been reviewed and integrated. The user requested bypass mode for these development workers.
+
+The review methodology proposal has been delivered and reviewed. Architecture and Orca integration proposals are still pending. The orchestrator accepts independent review before bounded peer challenges and preservation of evidence and dissent; the final design must distinguish verified defects from supported risks and hard access restrictions from cooperative prompt rules.
