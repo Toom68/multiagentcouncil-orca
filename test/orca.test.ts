@@ -834,6 +834,195 @@ describe('OrcaAdapter.observeWorker/sendNotification/stop/release', () => {
     if (res.ok) assert.equal(res.value.released, true);
     assert.deepEqual(calls[0].slice(0, 2), ['orchestration', 'worker-release']);
   });
+
+  it('does NOT claim release on the observed retained release receipt (1.4.261)', async () => {
+    // Exact worker-release receipt from the completed council diagnostic:
+    // ok:true but state 'retained' — nothing was released.
+    const { adapter } = makeAdapter(() =>
+      okMut({
+        dispatchId: 'ctx_c032111e1e93',
+        state: 'retained',
+        reason: 'user_requested',
+        processAction: 'none',
+        archive: null,
+      }, 'req-rel-1'),
+    );
+    const res = await adapter.releaseWorker({ dispatchId: 'ctx_c032111e1e93' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.released, false);
+  });
+
+  it('claims released only on explicit release proof', async () => {
+    for (const rec of [
+      { dispatchId: 'ctx_r1', state: 'released', archive: 'receipts/ctx_r1.json' },
+      { released: true },
+      { terminalState: 'released' },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.releaseWorker({ dispatchId: 'ctx_r' });
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.released, true, JSON.stringify(rec));
+    }
+  });
+
+  it('treats release_pending/unknown/refused/malformed release receipts as NOT released', async () => {
+    for (const rec of [
+      { dispatchId: 'ctx_u1', state: 'release_pending' },
+      { dispatchId: 'ctx_u2', state: 'release_unknown' },
+      { dispatchId: 'ctx_u3', state: 'refused' },
+      { released: false },
+      {},
+      { something: 'else' },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.releaseWorker({ dispatchId: 'ctx_u' });
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.released, false, JSON.stringify(rec));
+    }
+  });
+
+  it('refuses release on CONFLICTING markers — unambiguous proof required', async () => {
+    for (const rec of [
+      { released: true, state: 'retained' },
+      { released: false, state: 'released' },
+      { state: 'released', terminalState: 'retained' },
+      { released: true, terminalState: 'active' },
+      { state: 'released', status: 'pending' },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.releaseWorker({ dispatchId: 'ctx_c' });
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.released, false, JSON.stringify(rec));
+    }
+    // Consistent positive markers still confirm.
+    const { adapter } = makeAdapter(() => okEnv({ released: true, state: 'released' }));
+    const res = await adapter.releaseWorker({ dispatchId: 'ctx_ok' });
+    assert.ok(res.ok);
+    if (res.ok) assert.equal(res.value.released, true);
+  });
+
+  it('keeps release command failures as errors with the uncertain flag preserved', async () => {
+    const { adapter } = makeAdapter(() => failEnv('release_unknown', 'fence unsure'));
+    const res = await adapter.releaseWorker({ dispatchId: 'ctx_1' });
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.details?.uncertain, true);
+  });
+
+  it('claims stopped only on a confirmed stopped result', async () => {
+    const { adapter } = makeAdapter(() => okEnv({ state: 'stopped' }));
+    const res = await adapter.requestStop({ dispatchId: 'ctx_s', reason: 'cancel' });
+    assert.ok(res.ok);
+    if (res.ok) assert.equal(res.value.outcome, 'stopped');
+  });
+
+  it('maps explicit surviving/ended stop-receipt states to refused, ambiguous ones to unknown', async () => {
+    for (const [rec, expected] of [
+      [{ state: 'in_progress', processAction: 'none' }, 'refused'],
+      [{ state: 'retained', reason: 'user_requested' }, 'refused'],
+      [{ stopped: false }, 'refused'],
+      [{ state: 'settled' }, 'refused'],
+      [{ state: 'refused' }, 'refused'],
+      [{ refused: true }, 'refused'],
+      [{}, 'unknown'],
+      [{ state: 'unknown' }, 'unknown'],
+    ] as const) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.requestStop({ dispatchId: 'ctx_x', reason: 'cancel' });
+      assert.ok(res.ok);
+      if (res.ok) assert.equal(res.value.outcome, expected, JSON.stringify(rec));
+    }
+  });
+
+  it('keeps unfamiliar/pending stop states and contradictory markers unknown', async () => {
+    for (const rec of [
+      { state: 'release_pending' },
+      { state: 'pending' },
+      { state: 'stop_unknown' },
+      { state: 'some_future_state' },
+      { stopped: true, state: 'in_progress' },
+      { state: 'stopped', stopped: false },
+      { state: 'stopped', refused: true },
+      // A stopped vote must be unambiguous across EVERY supported field —
+      // status/worker.state contradictions and unfamiliar states veto.
+      { state: 'stopped', status: 'pending' },
+      { stopped: true, state: 'stop_unknown' },
+      { state: 'stopped', status: 'in_progress' },
+      { state: 'stopped', worker: { state: 'in_progress' } },
+    ]) {
+      const { adapter } = makeAdapter(() => okEnv(rec));
+      const res = await adapter.requestStop({ dispatchId: 'ctx_x', reason: 'cancel' });
+      assert.ok(res.ok);
+      if (res.ok) assert.equal(res.value.outcome, 'unknown', JSON.stringify(rec));
+    }
+    // Consistent stopped markers across fields still confirm.
+    const { adapter } = makeAdapter(() => okEnv({ state: 'stopped', status: 'stopped' }));
+    const res = await adapter.requestStop({ dispatchId: 'ctx_ok', reason: 'cancel' });
+    assert.ok(res.ok);
+    if (res.ok) assert.equal(res.value.outcome, 'stopped');
+  });
+
+  it('notes unconfirmed retention when keep-open does not prove it', async () => {
+    const { adapter } = makeAdapter((args) => {
+      const cmd = args[1];
+      if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
+      if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+      if (cmd === 'worker-keep-open') return okMut({ state: 'released' }, 'req-ko-1'); // did NOT retain
+      return failEnv('unexpected_command', String(cmd));
+    });
+    const res = await adapter.launchWorker(launchSpec({ retainTerminal: true }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'started');
+    assert.match(res.value.detail ?? '', /did not confirm retention/);
+  });
+
+  it('warns on conflicting keep-open markers and stays silent on consistent proof', async () => {
+    for (const koReceipt of [
+      { kept: true, state: 'released' },
+      { kept: false, state: 'retained' },
+      { kept: true, state: 'active' },
+      { kept: true, terminalState: 'released' },
+      { kept: true, terminal: { state: 'active' } },
+      {},
+    ]) {
+      const { adapter } = makeAdapter((args) => {
+        const cmd = args[1];
+        if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
+        if (cmd === 'wait') return okEnv({ idle: true });
+        if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+        if (cmd === 'worker-keep-open') return okMut(koReceipt, 'req-ko-1');
+        return failEnv('unexpected_command', String(cmd));
+      });
+      const res = await adapter.launchWorker(launchSpec({ retainTerminal: true }));
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.match(res.value.detail ?? '', /did not confirm retention/, JSON.stringify(koReceipt));
+    }
+    // Consistent positive markers confirm — no advisory detail.
+    for (const koReceipt of [
+      { kept: true, state: 'retained' },
+      { kept: true, state: 'retained', terminalState: 'retained' },
+    ]) {
+      const { adapter } = makeAdapter((args) => {
+        const cmd = args[1];
+        if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
+        if (cmd === 'wait') return okEnv({ idle: true });
+        if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+        if (cmd === 'worker-keep-open') return okMut(koReceipt, 'req-ko-1');
+        return failEnv('unexpected_command', String(cmd));
+      });
+      const res = await adapter.launchWorker(launchSpec({ retainTerminal: true }));
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.detail, undefined, JSON.stringify(koReceipt));
+    }
+  });
 });
 
 describe('adapter invariants', () => {

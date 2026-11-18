@@ -1462,6 +1462,9 @@ export class OrcaAdapter implements HostAdapter {
         base.detail = `worker started; worker-keep-open ${
           kept.uncertain ? 'outcome unknown' : `refused (${kept.error.code})`
         } — terminal may not survive settle`;
+      } else if (!keepOpenConfirmed(kept.value)) {
+        base.detail =
+          'worker started; worker-keep-open did not confirm retention — terminal may not survive settle';
       }
     }
     return { ok: true, value: base };
@@ -1599,7 +1602,9 @@ export class OrcaAdapter implements HostAdapter {
         if (res.uncertain) return { ok: true, value: { outcome: 'unknown' } };
         return { ok: true, value: { outcome: 'refused' } };
       }
-      return { ok: true, value: { outcome: 'stopped' } };
+      // ok:true is not stop proof — claim cancellation only on a confirmed
+      // stopped result (recovery-and-cleanup reference).
+      return { ok: true, value: { outcome: mapStopReceipt(res.value) } };
     } catch (e) {
       return failure(tokenErr(e));
     }
@@ -1618,7 +1623,12 @@ export class OrcaAdapter implements HostAdapter {
           adapterErr(res.error.code, res.error.message, { uncertain: res.uncertain }),
         );
       }
-      return { ok: true, value: { released: true } };
+      // ok:true is not release proof — observed 1.4.261: worker-release can
+      // return state 'retained' (reason 'user_requested') with nothing
+      // released. Only an explicit released marker may claim released; a
+      // retained/refused/release_pending/release_unknown or unrecognized
+      // envelope reports released:false — custody stays with the terminal.
+      return { ok: true, value: { released: releaseConfirmed(res.value) } };
     } catch (e) {
       return failure(tokenErr(e));
     }
@@ -1825,6 +1835,132 @@ export function mapLiveness(rec: Record<string, unknown>): WorkerLiveness {
     return 'idle';
   }
   return 'unverifiable';
+}
+
+/**
+ * Collect every explicit state-like marker on a receipt. Each one is a
+ * signed vote: `positive` when it equals a `positives` value; `negative`
+ * when `negatives` is omitted (any other explicit value is a veto) or when
+ * it is listed (a definitive negative); `unfamiliar` when `negatives` is
+ * given and the value matches neither vocabulary — an unfamiliar state can
+ * never prove either side, but it does veto positive confirmation.
+ */
+function markerVotes(
+  v: Record<string, unknown>,
+  fields: readonly (string | readonly string[])[],
+  positives: readonly string[],
+  negatives?: readonly string[],
+): { positive: boolean; negative: boolean; unfamiliar: boolean } {
+  let positive = false;
+  let negative = false;
+  let unfamiliar = false;
+  const pos = new Set(positives);
+  const neg = negatives === undefined ? undefined : new Set(negatives);
+  for (const f of fields) {
+    // A tuple is a nested path (['terminal','state'] → v.terminal.state).
+    let cur: unknown = v;
+    const path = typeof f === 'string' ? [f] : f;
+    for (const k of path) cur = asRecord(cur)?.[k];
+    const s = firstString(cur);
+    if (s === undefined) continue;
+    if (pos.has(s)) positive = true;
+    else if (neg === undefined || neg.has(s)) negative = true;
+    else unfamiliar = true;
+  }
+  return { positive, negative, unfamiliar };
+}
+
+/**
+ * Confirmed retention needs UNAMBIGUOUS positive proof in a worker-keep-open
+ * receipt: kept:true / keptOpen:true or a 'retained'/'kept' state, with no
+ * contradicting marker. {kept:true, state:'released'} or
+ * {kept:false, state:'retained'} stay unconfirmed.
+ */
+function keepOpenConfirmed(receipt: unknown): boolean {
+  const v = asRecord(receipt);
+  if (v === undefined) return false;
+  const { positive, negative, unfamiliar } = markerVotes(
+    v,
+    ['state', 'status', 'terminalState', ['terminal', 'state']],
+    ['retained', 'kept'],
+  );
+  return (
+    (positive || v.kept === true || v.keptOpen === true) &&
+    !negative &&
+    !unfamiliar &&
+    v.kept !== false &&
+    v.keptOpen !== false
+  );
+}
+
+/**
+ * Explicit release proof in a worker-release receipt: released:true or a
+ * 'released' state/terminalState/status, with no contradicting marker.
+ * Anything else — 'retained', 'release_pending', 'release_unknown',
+ * 'refused', a mixed receipt, or a shape this adapter does not recognize —
+ * must not imply released.
+ */
+function releaseConfirmed(receipt: unknown): boolean {
+  const v = asRecord(receipt);
+  if (v === undefined) return false;
+  const { positive, negative } = markerVotes(
+    v,
+    ['state', 'status', 'terminalState', ['terminal', 'state']],
+    ['released'],
+  );
+  return (positive || v.released === true) && !negative && v.released !== false;
+}
+
+/**
+ * Definitive non-stopped states on a worker-stop receipt: a still-surviving
+ * or already-ended dispatch means the stop did not apply → 'refused'.
+ * Values outside this vocabulary (pending, stop_unknown, novel states) are
+ * NOT a refusal — they stay 'unknown'.
+ */
+const STOP_REFUSED_STATES = new Set([
+  'in_progress',
+  'working',
+  'running',
+  'dispatched',
+  'ready',
+  'live',
+  'active',
+  'retained',
+  'reclaimable',
+  'idle',
+  'succeeded',
+  'failed',
+  'cancelled',
+  'abandoned',
+  'settled',
+  'done',
+  'released',
+  'refused',
+]);
+
+/**
+ * Conservative worker-stop receipt mapping (recovery-and-cleanup: claim
+ * cancellation only on a confirmed stopped result). UNAMBIGUOUS stopped
+ * proof across every state-like field (state, status, worker.state) →
+ * 'stopped'; a definitive surviving/ended state, stopped:false, or
+ * refused:true → 'refused'; contradictory markers, unfamiliar/pending
+ * states, or an unrecognized envelope → 'unknown'.
+ */
+function mapStopReceipt(receipt: unknown): StopOutcome {
+  const v = asRecord(receipt);
+  if (v === undefined) return 'unknown';
+  const { positive, negative, unfamiliar } = markerVotes(
+    v,
+    ['state', 'status', ['worker', 'state']],
+    ['stopped'],
+    [...STOP_REFUSED_STATES],
+  );
+  const positiveStop = positive || v.stopped === true;
+  const negativeStop = negative || v.stopped === false || v.refused === true;
+  if (positiveStop) return negativeStop || unfamiliar ? 'unknown' : 'stopped';
+  if (unfamiliar) return 'unknown';
+  if (negativeStop) return 'refused';
+  return 'unknown';
 }
 
 /** Validate a mail target like "dispatch:ctx_…", "run:run_…", or a raw term_/orca_ handle. */
