@@ -50,3 +50,31 @@ This is the protocol/reporting foundation. Engine routing records, complete
 strength rejection diagnostics, export provenance and new reviewer prompts
 require the subsequent integration stage. Progress delivery, artifact custody
 and operator recovery still require independent audits and end-to-end checks.
+
+## Stage 3: host custody and complete ledgers
+
+Mutations with unknown errors remain uncertain. Terminal-create intent/receipt
+callbacks preserve returned identity even if persistence throws, and local argv
+validation precedes any recorded mutation. Retained-terminal checks normalize
+supported terminal identities and refuse unreadable custody. Worker listings
+follow bounded cursors and validate complete cumulative totals, row overlap,
+scope and metadata types; incomplete or contradictory listings never mean an
+empty ledger. A start without dispatch identity reports uncertainty.
+
+The primary tested an isolated snapshot based on `f0b9885` containing only
+`src/host/orca.ts` and `test/orca.test.ts` changes: **591 tests passed, 0 failed,
+0 skipped**. All **64 independent audit checks** pass, plus eight malformed
+metadata probes. Two recorded probe adjustments preserve their intent: cursor
+cycle fixtures use distinct rows so the new overlap guard cannot mask that
+test, and totals smaller than delivered rows now require rejection.
+
+Read-only compatibility verification used the real Orca CLI: the strict adapter
+accepted **37 worker rows across four pages** with a requested page size of 10,
+and **31 task rows**. This verifies listing compatibility; it launches no worker
+and is not a new live council. Exact tested bytes, probe adaptations and logs
+remain in the ignored local verification directory.
+
+Engine/CLI custody callback integration and progress recovery continue in the
+next stage. The frozen pre-progress-fix integration snapshot passed 693 tests;
+independent probes still found notification recovery gaps, which are being
+fixed before release verification and the bounded live run.

@@ -31,6 +31,9 @@ import type {
   Result,
   StopOutcome,
   TaskId,
+  TerminalCreateIntent,
+  TerminalCreateReceipt,
+  TerminalCustodyHooks,
   TerminalHandle,
   WorkerLaunchSpec,
   WorkerLiveness,
@@ -302,6 +305,57 @@ const UNCERTAIN_CODES = new Set([
 ]);
 
 /**
+ * Orca error codes that PROVE a mutation was refused before ANY effect.
+ * Deliberately minimal — only codes whose no-effect semantics are verified
+ * or structurally pre-execution on this host:
+ *
+ * `invalid_argument` — argv-parse refusal. Verified pre-effect on
+ * `terminal create` ("Unknown flag --full" killed a launch BEFORE any
+ * resource existed) and on send ("--retry-request must be the UUID…").
+ * Argument validation precedes command execution on every command.
+ *
+ * Everything else stays out on purpose: even familiar families
+ * (`*_not_found`, `*_denied`, `busy`, `conflict`, `already_exists`) may
+ * follow PARTIAL resource creation — a dispatch created before its terminal
+ * attach failed is an effect, not a refusal. Unknown/future codes and
+ * unverified familiar ones are uncertainty on mutations, never a guessed
+ * clean failure (clm_0028).
+ */
+const NO_EFFECT_REFUSAL_CODES = new Set(['invalid_argument']);
+
+/**
+ * Additional no-effect refusals proven on a specific command ("<verb>
+ * <subcommand>" of the caller args). A code belongs here only with recorded
+ * evidence that, on THIS command, it is issued before any effect.
+ */
+const NO_EFFECT_REFUSAL_BY_COMMAND: Readonly<Record<string, ReadonlySet<string>>> = {
+  // Verified: worker-stop on an already-settled dispatch refuses
+  // `invalid_state` — a state-precondition check before the stop applies.
+  'orchestration worker-stop': new Set(['invalid_state']),
+};
+
+export function isNoEffectRefusal(args: readonly string[], code: string): boolean {
+  if (NO_EFFECT_REFUSAL_CODES.has(code)) return true;
+  const scoped = NO_EFFECT_REFUSAL_BY_COMMAND[`${args[0] ?? ''} ${args[1] ?? ''}`];
+  return scoped !== undefined && scoped.has(code);
+}
+
+/**
+ * Classify a failed command's `uncertain` flag. A failure on a MUTATING
+ * command is uncertain BY DEFAULT — the mutation may have landed before the
+ * refusal vocabulary existed — unless the code is a proven no-effect
+ * refusal on this command. A failed READ can treat any non-uncertain code
+ * as a clean failure: nothing was mutated, so there is nothing to
+ * reconcile. (clm_0028: an unknown code on a mutation was previously
+ * classified definitive-failure, which could authorize a duplicate launch.)
+ */
+export function isUncertainFailure(args: readonly string[], code: string, mayMutate: boolean): boolean {
+  if (UNCERTAIN_CODES.has(code)) return true;
+  if (!mayMutate) return false;
+  return !isNoEffectRefusal(args, code);
+}
+
+/**
  * Orca error codes that DEFINITIVELY prove a terminal handle no longer
  * resolves in this runtime. Handles are runtime-scoped — an Orca restart
  * invalidates them (docs/design/orca-integration-proposal.md §5, verified
@@ -312,6 +366,15 @@ const UNCERTAIN_CODES = new Set([
  * uncertainty, never a guessed "gone".
  */
 const STALE_TERMINAL_CODES = new Set(['terminal_handle_stale']);
+
+/**
+ * The closed definitive stale-handle vocabulary, exported for the CLI's
+ * guarded supervisor paths so the two call sites cannot drift. Codes enter
+ * this set only with recorded live evidence.
+ */
+export function isStaleTerminalCode(code: string): boolean {
+  return STALE_TERMINAL_CODES.has(code);
+}
 
 // ---------------------------------------------------------------------------
 // OrcaHost — bounded operations over the `orca` CLI
@@ -349,6 +412,13 @@ export type WorkerLaunchLane =
   | { kind: 'agent'; agent: string; model?: string; effort?: string }
   | { kind: 'argv'; command: readonly string[]; readinessTimeoutMs?: number };
 
+// ---------------------------------------------------------------------------
+// Terminal-create custody hooks — contract types live in contracts.ts
+// (ledger-report owns them). The adapter invokes TerminalCustodyHooks
+// around the argv-lane `terminal create` ONLY: the agent lane and
+// retained-terminal reuse perform no create.
+// ---------------------------------------------------------------------------
+
 export interface StartPhaseWorkerInput {
   runId: string;
   taskId: string;
@@ -358,6 +428,13 @@ export interface StartPhaseWorkerInput {
   requestKey: string;
   /** Reuse a proven settled worker's terminal for a new phase Task. */
   retainedTerminal?: { handle: string };
+  /** Seat/staff participant the launch serves — carried into custody intent. */
+  participantId?: string;
+  /**
+   * Optional journal hooks around the argv-lane `terminal create`
+   * (WorkerLaunchSpec.custody contract). Absent ⇒ legacy behavior.
+   */
+  custody?: TerminalCustodyHooks;
   title?: string;
   terminalWaitTimeoutMs?: number;
 }
@@ -421,10 +498,17 @@ export class OrcaHost {
    * top-level envelope `id` is still captured as receipt evidence.
    * `retryRequestId` appends `--retry-request <id>` — the ONLY legitimate
    * use, re-issuing an earlier Orca orchestration request after request-show.
+   *
+   * `mayMutate` marks a command that can apply a change on the host even
+   * though it is not an `orchestration` mutation (verified: `orca terminal`
+   * commands take no `--full` and must run bare — `terminal create` still
+   * allocates a real resource). `mutation: true` implies it. The flag only
+   * changes failure classification: a mutating command's unknown error code
+   * is `uncertain`, never a guessed clean failure.
    */
   async run<T = unknown>(
     args: readonly string[],
-    opts: { timeoutMs?: number; mutation?: boolean; retryRequestId?: string } = {},
+    opts: { timeoutMs?: number; mutation?: boolean; mayMutate?: boolean; retryRequestId?: string } = {},
   ): Promise<OrcaCommandResult<T>> {
     const timeoutMs = opts.timeoutMs ?? this.opts.commandTimeoutMs;
     const runner = this.opts.spawnFn ?? runProcess;
@@ -433,6 +517,7 @@ export class OrcaHost {
     if (opts.retryRequestId !== undefined) {
       argv.push('--retry-request', assertSafeValue('retryRequestId', opts.retryRequestId));
     }
+    const mayMutate = opts.mutation === true || opts.mayMutate === true;
     const proc = await runner({ file: this.plan.file, args: argv }, { timeoutMs, cwd: this.opts.cwd });
 
     if (proc.reason === 'timed_out') {
@@ -487,7 +572,9 @@ export class OrcaHost {
           ...(data === undefined ? {} : { data }),
         },
         ...(requestId === undefined ? {} : { requestId }),
-        uncertain: UNCERTAIN_CODES.has(code),
+        // Mutations: unknown/future codes are uncertain unless a proven
+        // no-effect refusal applies — never a guessed definitive failure.
+        uncertain: isUncertainFailure(args, code, mayMutate),
         exitCode: proc.exitCode,
         timedOut: false,
       };
@@ -497,7 +584,7 @@ export class OrcaHost {
       return {
         ok: false,
         error: parsed.error,
-        uncertain: UNCERTAIN_CODES.has(parsed.error.code),
+        uncertain: isUncertainFailure(args, parsed.error.code, mayMutate),
         exitCode: proc.exitCode,
         timedOut: false,
       };
@@ -690,7 +777,13 @@ export class OrcaHost {
     let terminalHandle: string | undefined;
     const expectedAgent =
       input.lane.kind === 'argv' ? input.lane.command[0] : input.lane.agent;
-
+    // True once a host mutation may have been issued: a generic exception
+    // past this point is UNCERTAIN (an effect may have landed), never a
+    // definite token error that could authorize a duplicate (clm_0028).
+    let effectPossible = false;
+    /** Last mutation receipt id retained for uncertain-outcome evidence. */
+    let issuedRequestId: string | undefined;
+    try {
     if (input.retainedTerminal) {
       const handle = assertSafeValue('retainedTerminal.handle', input.retainedTerminal.handle);
       // Prove the previous assignment on this terminal settled before reuse.
@@ -754,19 +847,129 @@ export class OrcaHost {
       }
       terminalHandle = handle;
     } else if (input.lane.kind === 'argv') {
-      const commandText = this.validatedAgentCommand(input.lane);
+      const title = input.title ?? `council-${taskId.slice(-8)}`;
+      // Audit F2: the WHOLE terminal-create argv is validated BEFORE the
+      // custody intent is journaled and before effectPossible — a
+      // deterministic local refusal (unsafe worktree/title/command token)
+      // is a clean 'failed' with zero calls and no dangling create intent,
+      // never 'uncertain'.
+      let commandText: string;
+      let createArgv: string[];
+      try {
+        commandText = this.validatedAgentCommand(input.lane);
+        createArgv = [
+          'terminal',
+          'create',
+          '--worktree',
+          assertSafeValue('worktree', input.worktree),
+          '--title=' + title,
+          '--command=' + commandText,
+          '--json',
+        ];
+      } catch (e) {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'failed',
+          failedStage: 'create_argv',
+          error: {
+            code: e instanceof OrcaAdapterError ? e.code : 'invalid_argument',
+            message: `terminal create argv rejected by local validation — nothing was issued: ${e instanceof Error ? e.message : String(e)}`,
+          },
+          receipts,
+        };
+      }
+      const createIntent: TerminalCreateIntent = {
+        intentId: `${requestKey}:terminal-create`,
+        ...(input.participantId === undefined ? {} : { participantId: input.participantId }),
+        taskId,
+        runId,
+        worktree: input.worktree,
+        title,
+        command: commandText,
+        createdAt: new Date().toISOString(),
+      };
+      // Journal the create intent BEFORE the mutation: a crash after the
+      // terminal lands leaves a durable intent, never an invisible
+      // pre-attach resource. A persistence failure aborts BEFORE any
+      // mutation — 'failed' (not 'uncertain'): provably nothing was issued.
+      const persistedIntent = await input.custody?.beforeTerminalCreate?.(createIntent);
+      if (persistedIntent !== undefined && !persistedIntent.ok) {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'failed',
+          failedStage: 'custody_intent',
+          error: {
+            code: 'custody_journal_failed',
+            message: `terminal-create intent could not be journaled (${persistedIntent.error.message}) — refusing to create without durable custody`,
+            data: { custodyError: persistedIntent.error },
+          },
+          receipts,
+        };
+      }
+      effectPossible = true; // the create may land from here on
       // `orca terminal` commands take no --full and are never retry-requested;
       // the receipt's top-level `id` is still captured via extractRequestId.
-      const created = await this.run<{ handle?: string; terminal?: { handle?: string } }>([
-        'terminal',
-        'create',
-        '--worktree',
-        assertSafeValue('worktree', input.worktree),
-        '--title=' + (input.title ?? `council-${taskId.slice(-8)}`),
-        '--command=' + commandText,
-        '--json',
-      ]);
+      // mayMutate: create allocates a resource, so an unknown error code is
+      // uncertain — never a guessed clean failure.
+      const created = await this.run<{ handle?: string; terminal?: { handle?: string } }>(createArgv, { mayMutate: true });
       receipts.terminalCreate = created.ok ? created.value : created.error;
+      const createdHandle = created.ok
+        ? created.value?.terminal?.handle ?? created.value?.handle ?? undefined
+        : undefined;
+      if (created.requestId !== undefined) issuedRequestId = created.requestId;
+      // Retain the observed identity IMMEDIATELY: a throwing custody hook or
+      // any later exception must still surface this handle/request evidence
+      // in the outer catch — the terminal may be live and unjournaled.
+      terminalHandle = createdHandle ?? terminalHandle;
+      // Journal the resolved identity in EVERY direction — created handle,
+      // definitive refusal, or ambiguous outcome — before anything else.
+      // A persistence failure (non-ok OR a thrown hook) stops ALL further
+      // mutation (no wait/show/worker-start): the terminal may exist
+      // unjournaled → 'uncertain', and an ambiguous create is never
+      // auto-repeated.
+      let persistedReceipt: Result<void> | undefined;
+      try {
+        persistedReceipt = await input.custody?.afterTerminalCreate?.({
+          intentId: createIntent.intentId,
+          taskId,
+          outcome: !created.ok
+            ? (created.uncertain ? 'uncertain' : 'refused')
+            : (createdHandle === undefined ? 'uncertain' : 'created'),
+          ...(createdHandle === undefined ? {} : { terminalHandle: createdHandle }),
+          ...(created.requestId === undefined ? {} : { requestId: created.requestId }),
+          ...(created.ok ? {} : { detail: `${created.error.code}: ${created.error.message}`.slice(0, 512) }),
+          observedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        persistedReceipt = {
+          ok: false,
+          error: {
+            code: 'adapter_error',
+            message: `afterTerminalCreate hook threw: ${e instanceof Error ? e.message : String(e)}`,
+          },
+        };
+      }
+      if (persistedReceipt !== undefined && !persistedReceipt.ok) {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'uncertain',
+          failedStage: 'custody_receipt',
+          ...(createdHandle === undefined ? {} : { terminalHandle: createdHandle }),
+          ...(created.requestId === undefined ? {} : { requestId: created.requestId }),
+          error: {
+            code: 'custody_journal_failed',
+            message: `terminal-create receipt could not be journaled (${persistedReceipt.error.message}) — the terminal may exist unjournaled; reconcile before retry`,
+            data: { custodyError: persistedReceipt.error },
+          },
+          receipts,
+        };
+      }
       if (!created.ok) {
         return {
           taskId,
@@ -778,14 +981,15 @@ export class OrcaHost {
           receipts,
         };
       }
-      terminalHandle =
-        created.value?.terminal?.handle ?? created.value?.handle ?? undefined;
       if (terminalHandle === undefined) {
         return {
           taskId,
           runId,
           requestKey,
           outcome: 'uncertain',
+          // A malformed/partial create receipt still carries request evidence
+          // — retain it for reconciliation of the possibly-created terminal.
+          ...(created.requestId === undefined ? {} : { requestId: created.requestId }),
           error: {
             code: 'missing_terminal_handle',
             message: 'terminal create returned no handle; inspect the worktree before retrying',
@@ -891,8 +1095,10 @@ export class OrcaHost {
     }
     args.push('--json');
 
+    effectPossible = true; // the worker-start may land from here on
     const started = await this.run<Record<string, unknown>>(args, { mutation: true });
     receipts.workerStart = started.ok ? started.value : started.error;
+    if (started.requestId !== undefined) issuedRequestId = started.requestId;
     if (!started.ok) {
       return {
         taskId,
@@ -918,6 +1124,28 @@ export class OrcaHost {
       ...(started.requestId === undefined ? {} : { requestId: started.requestId }),
       receipts,
     };
+    } catch (e) {
+      if (!effectPossible) throw e; // pre-mutation — a clean validation refusal
+      // A generic exception after a mutation may have landed is UNCERTAIN,
+      // never a definite token error: reconcile the possibly-live resource
+      // instead of authorizing a duplicate (clm_0028).
+      return {
+        taskId,
+        runId,
+        requestKey,
+        outcome: 'uncertain',
+        failedStage: 'unexpected',
+        ...(terminalHandle === undefined ? {} : { terminalHandle }),
+        ...(issuedRequestId === undefined ? {} : { requestId: issuedRequestId }),
+        error: {
+          code: 'unexpected_after_mutation',
+          message:
+            `unexpected adapter exception after a mutation may have landed: ` +
+            `${e instanceof Error ? e.message : String(e)} — reconcile before retry`,
+        },
+        receipts,
+      };
+    }
   }
 
   /**
@@ -932,28 +1160,57 @@ export class OrcaHost {
     if (!listed.ok) {
       return { ok: false, uncertain: listed.uncertain, error: listed.error };
     }
-    // A retained terminal stays 'live' after its dispatch ends; a logical
-    // end state in state/outcome vetoes the liveness signal (1.4.261).
-    const active = listed.value.workers.find(
-      (w) =>
-        w.terminal === handle &&
-        !isEndedDispatchState(w.outcome) &&
-        !isEndedDispatchState(w.state) &&
-        (w.outcome === 'in_progress' ||
-          w.state === 'dispatched' ||
-          w.state === 'ready' ||
-          w.state === 'in_progress' ||
-          w.state === 'working' ||
-          w.state === 'running' ||
-          w.liveness === 'live'),
+    // The supervisor custody convention (cli.ts start-supervisor): only a
+    // ledger row carrying an EXPLICIT verdict frees the terminal. A
+    // verdict-less row is custody_unproven — never silently "free". A
+    // retained terminal stays 'live' after its dispatch ends, so physical
+    // liveness alone is not an owner either: only a verdict-less row with
+    // active markers is.
+    //
+    // Terminal identity is normalized across flat `terminal`, flat
+    // `terminalHandle`, and nested `terminal.handle` spellings (audit F3) —
+    // an active row blocks reuse under ANY of them. A row whose claimed
+    // identity is unreadable or self-contradictory cannot prove WHERE it is
+    // parked; a verdict-less one therefore also makes custody unproven.
+    const mine: WorkerListRow[] = [];
+    const unplaced: WorkerListRow[] = [];
+    for (const w of listed.value.workers) {
+      const ids = workerRowTerminalIdentities(w as Record<string, unknown>);
+      if (ids.identities.includes(handle)) {
+        mine.push(w);
+      } else if (ids.unproven !== undefined) {
+        unplaced.push(w);
+      }
+    }
+    const owner = mine.find(
+      (w) => dispatchVerdict(w).verdict === undefined && isActiveWorkerRow(w),
     );
-    if (active) {
+    if (owner !== undefined) {
       return {
         ok: false,
         error: {
           code: 'terminal_busy',
-          message: `dispatch ${active.dispatchId} still owns terminal ${handle}`,
-          data: active,
+          message: `dispatch ${firstString(owner.dispatchId) ?? '(unidentified)'} still owns terminal ${handle}`,
+          data: owner,
+        },
+      };
+    }
+    const ambiguous =
+      mine.find((w) => dispatchVerdict(w).verdict === undefined) ??
+      unplaced.find((w) => dispatchVerdict(w).verdict === undefined);
+    if (ambiguous !== undefined) {
+      const ids = workerRowTerminalIdentities(ambiguous as Record<string, unknown>);
+      return {
+        ok: false,
+        error: {
+          code: 'custody_unproven',
+          message:
+            (ids.unproven !== undefined
+              ? `a worker-list row claims a ${ids.unproven} terminal identity — its placement cannot be proven and `
+              : `a worker-list row on terminal ${handle} `) +
+            `it carries no explicit verdict ` +
+            `(${JSON.stringify(ambiguous.outcome ?? ambiguous.state ?? 'none')}) — safe reuse is unproven`,
+          data: ambiguous,
         },
       };
     }
@@ -1095,26 +1352,114 @@ export class OrcaHost {
     return this.run(args);
   }
 
+  /**
+   * Read-only worker ledger (`orchestration worker-list --run`). STRICT:
+   * the receipt must expose a real row array, every row must carry an
+   * identity the custody checks can use (dispatchId or terminal), and the
+   * ledger must be COMPLETE — a missing/renamed/truncated array is an
+   * error, never a fake [] that could authorize custody recovery
+   * (clm_0029). Verified 1.4.263: worker-list paginates (≤100 rows/page,
+   * `--limit`, `--cursor`, `page.{hasMore,nextCursor,total}` under
+   * `--full`), so the strict read passes `--full --limit` and follows
+   * `nextCursor` for a bounded number of pages; a host that refuses the
+   * newer flags gets ONE legacy-argv retry (reads are idempotent) and the
+   * full default page without page markers is treated as unproven.
+   */
   async listWorkers(
     runId: string,
     opts: { terminalState?: string; limit?: number } = {},
   ): Promise<OrcaCommandResult<{ workers: WorkerListRow[] }>> {
-    const args = [
-      'orchestration',
-      'worker-list',
-      '--run',
-      assertSafeValue('runId', runId),
-    ];
-    if (opts.terminalState) args.push('--terminal-state', assertSafeValue('terminalState', opts.terminalState));
-    if (opts.limit !== undefined) args.push('--limit', String(opts.limit));
-    args.push('--json');
-    const res = await this.run<{ workers?: WorkerListRow[] }>(args);
-    if (!res.ok) return res;
+    const rid = assertSafeValue('runId', runId);
+    const limit = Math.min(Math.max(1, Math.trunc(opts.limit ?? WORKER_LIST_LIMIT)), WORKER_LIST_LIMIT);
+    const buildArgs = (strict: boolean, cursor?: string): string[] => {
+      const a = ['orchestration', 'worker-list', '--run', rid];
+      if (opts.terminalState !== undefined) {
+        a.push('--terminal-state', assertSafeValue('terminalState', opts.terminalState));
+      }
+      if (strict) {
+        // --full exposes page.{hasMore,nextCursor,total}; --limit bounds the
+        // page (documented max 100, verified 1.4.263 help).
+        a.push('--full', '--limit', String(limit));
+      }
+      if (cursor !== undefined) a.push('--cursor', cursor);
+      a.push('--json');
+      return a;
+    };
+    let strict = true;
+    let cursor: string | undefined;
+    const rows: WorkerListRow[] = [];
+    const seenCursors = new Set<string>();
+    const seenDispatchIds = new Set<string>();
+    let priorTotal: number | undefined;
+    for (let page = 0; page < WORKER_LIST_MAX_PAGES; page += 1) {
+      let res = await this.run<Record<string, unknown>>(buildArgs(strict, cursor));
+      if (!res.ok && strict && cursor === undefined && res.error.code === 'invalid_argument') {
+        // Older hosts (1.4.261-era shape) may not accept --full/--limit on
+        // worker-list: ONE bounded fallback to the documented legacy argv.
+        // Only an exact invalid_argument authorizes the retry — any other
+        // failure stays a failure, and mutations never get this path.
+        strict = false;
+        res = await this.run<Record<string, unknown>>(buildArgs(false, undefined));
+      }
+      if (!res.ok) return res;
+      const parsed = workerLedgerRows(res.value, {
+        runId: rid,
+        limit,
+        delivered: rows.length,
+        seenDispatchIds,
+        ...(priorTotal === undefined ? {} : { priorTotal }),
+      });
+      if (!parsed.ok) {
+        return {
+          ok: false,
+          error: { code: parsed.code, message: parsed.message, data: res.value },
+          // A deterministically malformed read is a clean failure — the
+          // custody caller refuses reuse, but nothing was ever mutated.
+          uncertain: false,
+          exitCode: res.exitCode,
+          timedOut: false,
+        };
+      }
+      rows.push(...parsed.rows);
+      for (const r of parsed.rows) {
+        if (typeof r.dispatchId === 'string' && r.dispatchId.length > 0) {
+          seenDispatchIds.add(r.dispatchId);
+        }
+      }
+      if (parsed.pageTotal !== undefined) priorTotal = parsed.pageTotal;
+      if (parsed.nextCursor === undefined) {
+        return {
+          ok: true,
+          value: { workers: rows },
+          exitCode: res.exitCode,
+          truncated: res.truncated,
+        };
+      }
+      if (seenCursors.has(parsed.nextCursor)) {
+        return {
+          ok: false,
+          error: {
+            code: 'worker_list_pagination_cycle',
+            message: `worker-list cursor repeated — ledger completeness unproven`,
+            data: res.value,
+          },
+          uncertain: false,
+          exitCode: res.exitCode,
+          timedOut: false,
+        };
+      }
+      seenCursors.add(parsed.nextCursor);
+      cursor = parsed.nextCursor;
+    }
     return {
-      ok: true,
-      value: { workers: res.value?.workers ?? [] },
-      exitCode: res.exitCode,
-      truncated: res.truncated,
+      ok: false,
+      error: {
+        code: 'truncated_worker_list',
+        message: `worker-list exceeded ${WORKER_LIST_MAX_PAGES} pages without completing — the ledger is unproven`,
+      },
+      uncertain: false,
+      exitCode: null,
+      timedOut: false,
     };
   }
 
@@ -1240,7 +1585,7 @@ export class OrcaHost {
    * task-create.
    */
   async listTasks(runId: string): Promise<OrcaCommandResult<{ tasks: Record<string, unknown>[] }>> {
-    const res = await this.run<{ tasks?: unknown; items?: unknown }>([
+    const res = await this.run<Record<string, unknown>>([
       'orchestration',
       'task-list',
       '--run',
@@ -1250,6 +1595,20 @@ export class OrcaHost {
     ]);
     if (!res.ok) return res;
     const raw = res.value;
+    const scopeCheck = strictLedgerScope(raw, runId, 'task-list');
+    if (!scopeCheck.ok) {
+      return {
+        ok: false,
+        error: {
+          code: scopeCheck.inconsistent ? 'inconsistent_task_list' : 'malformed_task_list',
+          message: scopeCheck.message,
+          data: raw,
+        },
+        uncertain: false,
+        exitCode: res.exitCode,
+        timedOut: false,
+      };
+    }
     const list = raw?.tasks ?? raw?.items ?? (Array.isArray(raw) ? raw : undefined);
     if (!Array.isArray(list)) {
       return {
@@ -1284,6 +1643,37 @@ export class OrcaHost {
           timedOut: false,
         };
       }
+    }
+    // Completeness: a task ledger advertising more rows (hasMore/nextCursor/
+    // page.total) that we did not exhaust is truncated — never a complete [].
+    // Metadata itself must be well-typed: a malformed flag/cursor/count fails
+    // closed instead of being silently dropped (same rule as worker-list).
+    const meta = strictPageMetadata(raw, 'task-list');
+    if (!meta.ok) {
+      return {
+        ok: false,
+        error: {
+          code: meta.inconsistent ? 'inconsistent_task_list' : 'malformed_task_list',
+          message: meta.message,
+          data: raw,
+        },
+        uncertain: false,
+        exitCode: res.exitCode,
+        timedOut: false,
+      };
+    }
+    if (meta.hasMore === true || meta.nextCursor !== undefined || (meta.pageTotal !== undefined && meta.pageTotal > list.length)) {
+      return {
+        ok: false,
+        error: {
+          code: 'truncated_task_list',
+          message: `task-list for Run ${runId} reports more rows than it returned — the ledger is incomplete`,
+          data: raw,
+        },
+        uncertain: false,
+        exitCode: res.exitCode,
+        timedOut: false,
+      };
     }
     return {
       ok: true,
@@ -1363,6 +1753,318 @@ export interface WorkerListRow {
   [k: string]: unknown;
 }
 
+/**
+ * All terminal identities a worker-list row claims, normalized across the
+ * tolerated shapes — flat `terminal` string, `terminalHandle`, and nested
+ * `terminal.handle` (audit F3: `terminalIsFree` must see the same identity
+ * the row-identity rule and receipt extractors already tolerate). A present
+ * field that cannot be read (non-string `terminal`, a `terminal` object
+ * without a usable `handle`, a non-string `terminalHandle`) marks the row
+ * `unproven:'unreadable'`; two present fields disagreeing marks
+ * `unproven:'contradictory'` — either way the row's terminal placement is
+ * unproven and custody must fail closed, never guess.
+ */
+export function workerRowTerminalIdentities(w: Record<string, unknown>): {
+  identities: string[];
+  unproven?: 'unreadable' | 'contradictory';
+} {
+  const ids: string[] = [];
+  let unreadable = false;
+  const take = (v: unknown) => {
+    if (v === undefined || v === null) return;
+    if (typeof v === 'string' && v.length > 0) {
+      if (!ids.includes(v)) ids.push(v);
+      return;
+    }
+    unreadable = true;
+  };
+  const t = w.terminal;
+  if (typeof t === 'object' && t !== null) {
+    const handle = asRecord(t)?.handle;
+    if (handle === undefined) unreadable = true;
+    else take(handle);
+  } else {
+    take(t);
+  }
+  take(w.terminalHandle);
+  const unproven = unreadable ? 'unreadable' : ids.length > 1 ? 'contradictory' : undefined;
+  return { identities: ids, ...(unproven === undefined ? {} : { unproven }) };
+}
+
+/** worker-list page bound: documented `--limit <1-100>` (verified help 1.4.263). */
+const WORKER_LIST_LIMIT = 100;
+/** Bounded pagination: follow at most this many nextCursor pages. */
+const WORKER_LIST_MAX_PAGES = 10;
+
+/**
+ * STRICT pagination/completeness metadata for ledger reads (worker-list and
+ * task-list). Custody decisions depend on these fields being trustworthy: a
+ * supplied-but-unreadable flag, cursor or count can never be silently dropped
+ * by firstString/asRecord defaults — that would let a malformed receipt pose
+ * as a complete final page and authorize absence.
+ *
+ * Rules (audit follow-up): every SUPPLIED `hasMore`/`nextCursor`/`total` —
+ * top-level or inside `page` — must be a real boolean / non-empty string /
+ * finite non-negative integer; `null`/`undefined` means absent (the
+ * documented final-page shape). Two supplied positions that disagree are
+ * contradictory — inconsistent, never a preference. A supplied `page` must
+ * be a plain object. Cursor bytes stay opaque: no encoding or character
+ * allowlist.
+ */
+function strictPageMetadata(
+  raw: Record<string, unknown> | undefined,
+  label: string,
+):
+  | { ok: true; hasMore?: boolean; nextCursor?: string; pageTotal?: number }
+  | { ok: false; inconsistent: boolean; message: string } {
+  const bad = (message: string) => ({ ok: false as const, inconsistent: false, message });
+  const contra = (message: string) => ({ ok: false as const, inconsistent: true, message });
+  let page: Record<string, unknown> | undefined;
+  const pageV = raw?.page;
+  if (pageV !== undefined && pageV !== null) {
+    if (typeof pageV !== 'object' || Array.isArray(pageV)) {
+      return bad(`${label} page must be an object — malformed completeness metadata`);
+    }
+    page = pageV as Record<string, unknown>;
+  }
+  const moreVals: boolean[] = [];
+  for (const v of [raw?.hasMore, page?.hasMore]) {
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'boolean') {
+      return bad(`${label} hasMore must be a boolean, got ${JSON.stringify(v)} — malformed completeness metadata`);
+    }
+    moreVals.push(v);
+  }
+  if (new Set(moreVals).size > 1) {
+    return contra(`${label} hasMore disagrees between positions — contradictory completeness metadata`);
+  }
+  const cursorVals: string[] = [];
+  for (const v of [raw?.nextCursor, page?.nextCursor]) {
+    if (v === undefined || v === null) continue; // documented absent = final page
+    if (typeof v !== 'string' || v.length === 0) {
+      return bad(`${label} nextCursor must be a non-empty string, got ${JSON.stringify(v)} — malformed completeness metadata`);
+    }
+    cursorVals.push(v);
+  }
+  if (new Set(cursorVals).size > 1) {
+    return contra(`${label} nextCursor disagrees between positions — contradictory completeness metadata`);
+  }
+  const totalVals: number[] = [];
+  for (const v of [raw?.total, page?.total]) {
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      return bad(`${label} total must be a non-negative integer, got ${typeof v === 'number' ? String(v) : JSON.stringify(v)} — malformed completeness metadata`);
+    }
+    totalVals.push(v);
+  }
+  if (new Set(totalVals).size > 1) {
+    return contra(`${label} total disagrees between positions — contradictory completeness metadata`);
+  }
+  return {
+    ok: true,
+    ...(moreVals[0] === undefined ? {} : { hasMore: moreVals[0] }),
+    ...(cursorVals[0] === undefined ? {} : { nextCursor: cursorVals[0] }),
+    ...(totalVals[0] === undefined ? {} : { pageTotal: totalVals[0] }),
+  };
+}
+
+/**
+ * STRICT scope metadata for ledger reads. A `scope` that is supplied but
+ * unreadable cannot prove the ledger is ours — fail closed rather than
+ * silently dropping it (which would let a wrong-scope ledger pass as
+ * unscoped). Run-identity fields supplied at any position must be non-empty
+ * strings and must agree with each other and with the requested Run.
+ */
+function strictLedgerScope(
+  raw: Record<string, unknown> | undefined,
+  runId: string | undefined,
+  label: string,
+): { ok: true } | { ok: false; inconsistent: boolean; message: string } {
+  const bad = (message: string) => ({ ok: false as const, inconsistent: false, message });
+  const contra = (message: string) => ({ ok: false as const, inconsistent: true, message });
+  const scopeV = raw?.scope;
+  let scope: Record<string, unknown> | undefined;
+  if (scopeV !== undefined && scopeV !== null) {
+    if (typeof scopeV !== 'object' || Array.isArray(scopeV)) {
+      return bad(`${label} scope must be an object — refusing to treat the ledger as ours`);
+    }
+    scope = scopeV as Record<string, unknown>;
+  }
+  const runs: string[] = [];
+  for (const v of [scope?.run, scope?.runId, scope?.run_id, raw?.runId]) {
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'string' || v.length === 0) {
+      return bad(`${label} scope run id must be a non-empty string, got ${JSON.stringify(v)} — refusing to treat the ledger as ours`);
+    }
+    runs.push(v);
+  }
+  const distinct = new Set(runs);
+  if (distinct.size > 1) {
+    return contra(`${label} scope run ids disagree (${[...distinct].map((r) => JSON.stringify(r)).join(' vs ')}) — contradictory scope metadata`);
+  }
+  const scopedRun = runs[0];
+  if (runId !== undefined && scopedRun !== undefined && scopedRun !== runId) {
+    return bad(
+      `${label} scope ${JSON.stringify(scopedRun)} does not match requested Run ${runId} — refusing to treat the ledger as ours`,
+    );
+  }
+  return { ok: true };
+}
+
+/**
+ * STRICT worker-ledger rows: the receipt must expose a real array and every
+ * row must carry an identity the custody checks can use — a `dispatchId` or
+ * a terminal identity (`terminal`/`terminalHandle`/nested `terminal.handle`).
+ * A missing, renamed or truncated ledger is an error, NEVER a fake []
+ * (clm_0029): custody checks depend on a COMPLETE ledger, so continuation
+ * markers (nextCursor/hasMore) surface through `nextCursor` for the caller
+ * to follow bounded, and a marker-less full default page is unproven too.
+ *
+ * `page.total` is the LEDGER-WIDE advertised count, not a per-page length
+ * (audit F1): it is compared against cumulative delivered rows
+ * (`opts.delivered + list.length`), so a multi-page ledger whose final page
+ * is smaller than the total completes normally. Metadata that contradicts
+ * the delivered rows — a total below what was already seen, a total that
+ * changes between pages, or a dispatchId that repeats across the snapshot —
+ * fails closed as `inconsistent_worker_list`: an inconsistent ledger cannot
+ * prove custody either way.
+ *
+ * `opts.delivered` = rows already accumulated from previous pages;
+ * `opts.seenDispatchIds` = dispatchIds from previous pages (overlap check);
+ * `opts.priorTotal` = last advertised page.total (drift check). Exported for
+ * the CLI's supervisor custody read so the two cannot drift.
+ */
+export function workerLedgerRows(
+  result: unknown,
+  opts: {
+    runId?: string;
+    limit?: number;
+    delivered?: number;
+    seenDispatchIds?: ReadonlySet<string>;
+    priorTotal?: number;
+  } = {},
+): { ok: true; rows: WorkerListRow[]; nextCursor?: string; pageTotal?: number } | { ok: false; code: string; message: string } {
+  const fail = (code: string, message: string) => ({ ok: false as const, code, message });
+  const raw = asRecord(result);
+  const scopeCheck = strictLedgerScope(raw, opts.runId, 'worker-list');
+  if (!scopeCheck.ok) {
+    return fail(scopeCheck.inconsistent ? 'inconsistent_worker_list' : 'malformed_worker_list', scopeCheck.message);
+  }
+  const list = raw?.workers ?? raw?.items ?? (Array.isArray(result) ? result : undefined);
+  if (!Array.isArray(list)) {
+    return fail(
+      'malformed_worker_list',
+      'worker-list returned no workers array — the ledger is unreadable or incomplete',
+    );
+  }
+  const meta = strictPageMetadata(raw, 'worker-list');
+  if (!meta.ok) {
+    return fail(meta.inconsistent ? 'inconsistent_worker_list' : 'malformed_worker_list', meta.message);
+  }
+  const nextCursor = meta.nextCursor;
+  const hasMore = meta.hasMore === true;
+  const pageTotal = meta.pageTotal;
+  const pageDispatchIds = new Set<string>();
+  for (const row of list) {
+    const identifiable =
+      typeof row === 'object' &&
+      row !== null &&
+      (firstString((row as WorkerListRow).dispatchId) !== undefined ||
+        workerRowTerminalIdentities(row as WorkerListRow).identities.length > 0);
+    if (!identifiable) {
+      return fail(
+        'incomplete_worker_list',
+        'worker-list contains a row with no dispatch id and no terminal identity — the ledger is incomplete',
+      );
+    }
+    const dispatchId =
+      typeof row === 'object' && row !== null
+        ? firstString((row as WorkerListRow).dispatchId)
+        : undefined;
+    if (dispatchId !== undefined) {
+      if (pageDispatchIds.has(dispatchId) || opts.seenDispatchIds?.has(dispatchId)) {
+        return fail(
+          'inconsistent_worker_list',
+          `worker-list repeats dispatch ${dispatchId} — the ledger snapshot moved mid-read; custody completeness is unproven`,
+        );
+      }
+      pageDispatchIds.add(dispatchId);
+    }
+  }
+  const cumulative = (opts.delivered ?? 0) + list.length;
+  if (pageTotal !== undefined && pageTotal < cumulative) {
+    return fail(
+      'inconsistent_worker_list',
+      `worker-list page.total ${pageTotal} is below the ${cumulative} rows already delivered — contradictory ledger metadata`,
+    );
+  }
+  if (pageTotal !== undefined && opts.priorTotal !== undefined && pageTotal !== opts.priorTotal) {
+    return fail(
+      'inconsistent_worker_list',
+      `worker-list page.total changed between pages (${opts.priorTotal} → ${pageTotal}) — the snapshot moved mid-read`,
+    );
+  }
+  if (hasMore || nextCursor !== undefined) {
+    if (nextCursor === undefined) {
+      return fail(
+        'truncated_worker_list',
+        'worker-list reports more rows but exposes no nextCursor — the ledger is incomplete',
+      );
+    }
+    return { ok: true, rows: list as WorkerListRow[], nextCursor, ...(pageTotal === undefined ? {} : { pageTotal }) };
+  }
+  // Final page: the last advertised total (this page's or a prior page's) is
+  // the completeness claim — rows delivered short of it are unfollowable.
+  const advertisedTotal = pageTotal ?? opts.priorTotal;
+  if (advertisedTotal !== undefined && advertisedTotal > cumulative) {
+    return fail(
+      'truncated_worker_list',
+      `worker-list advertised ${advertisedTotal} rows but delivered ${cumulative} with no cursor — the ledger is incomplete`,
+    );
+  }
+  // No affirmative completeness evidence at all (no hasMore/nextCursor/total
+  // on a receipt that fills the requested page) — a hidden row is unproven.
+  // An explicit `hasMore:false` DOES count: it is a valid completeness claim.
+  const hasMarkers =
+    meta.hasMore !== undefined || meta.nextCursor !== undefined || meta.pageTotal !== undefined;
+  if (!hasMarkers && list.length >= (opts.limit ?? WORKER_LIST_LIMIT)) {
+    return fail(
+      'truncated_worker_list',
+      `worker-list returned ${list.length} rows with no page markers — ledger completeness is unproven`,
+    );
+  }
+  return { ok: true, rows: list as WorkerListRow[], ...(pageTotal === undefined ? {} : { pageTotal }) };
+}
+
+/**
+ * Verdict-less active markers on a worker-list row — the row claims live
+ * work but carries no explicit decisive verdict. Used with dispatchVerdict:
+ * only `verdict === undefined && isActiveWorkerRow(row)` is an owner; a
+ * verdict-less row WITHOUT active markers stays custody_unproven.
+ */
+export function isActiveWorkerRow(w: Record<string, unknown>): boolean {
+  if (firstString(w.liveness) === 'live') return true;
+  const o = firstString(w.outcome);
+  const s = firstString(w.state, w.status);
+  return (
+    (o !== undefined && ACTIVE_WORKER_MARKERS.has(o)) ||
+    (s !== undefined && ACTIVE_WORKER_MARKERS.has(s))
+  );
+}
+
+/** Markers that mean a verdict-less row still claims live work. */
+const ACTIVE_WORKER_MARKERS = new Set([
+  'in_progress',
+  'dispatched',
+  'dispatching',
+  'ready',
+  'working',
+  'running',
+  'queued',
+  'assigned',
+  'active',
+]);
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : undefined;
 }
@@ -1390,7 +2092,7 @@ const DECISIVE_OUTCOMES = new Set([
   'stopped',
 ]);
 
-function isDecisiveOutcome(v: unknown): v is string {
+export function isDecisiveOutcome(v: unknown): v is string {
   return typeof v === 'string' && DECISIVE_OUTCOMES.has(v);
 }
 
@@ -1401,7 +2103,7 @@ function isDecisiveOutcome(v: unknown): v is string {
  */
 const DISPATCH_ENDED = new Set([...DECISIVE_OUTCOMES, 'settled', 'done', 'released']);
 
-function isEndedDispatchState(v: unknown): boolean {
+export function isEndedDispatchState(v: unknown): boolean {
   return typeof v === 'string' && DISPATCH_ENDED.has(v);
 }
 
@@ -1411,7 +2113,7 @@ function isEndedDispatchState(v: unknown): boolean {
  * a generic lifecycle state ('settled', 'in_progress', …) is NOT a verdict.
  * Two decisive fields that disagree are a conflict, never silently resolved.
  */
-function dispatchVerdict(rec: Record<string, unknown>): {
+export function dispatchVerdict(rec: Record<string, unknown>): {
   verdict?: string;
   conflict?: { outcome: string; state: string };
 } {
@@ -1441,11 +2143,24 @@ export function extractDispatchInfo(receipt: unknown): {
   const dispatch = asRecord(r.dispatch) ?? asRecord(r.worker) ?? asRecord(r.result);
   const launch = asRecord(r.launch);
   const outcome = asRecord(launch?.outcome) ?? asRecord(r.outcome);
+  // A `dispatch:<id>` address carries the dispatch id itself — an explicit
+  // workerAddress/address field is a supported identity carrier (audit F4),
+  // so a receipt that names no dispatchId but publishes a dispatch-scoped
+  // address still identifies its worker. `dispatch:` is the only prefix
+  // unwrapped; other schemes are addresses, not ids.
+  const dispatchAddressId = (v: unknown): string | undefined => {
+    const s = firstString(v);
+    return s === undefined ? undefined : /^dispatch:(.+)$/.exec(s)?.[1];
+  };
   const dispatchId = firstString(
     r.dispatchId,
     dispatch?.dispatchId,
     dispatch?.id,
     r.dispatch_id,
+    dispatchAddressId(r.workerAddress),
+    dispatchAddressId(dispatch?.workerAddress),
+    dispatchAddressId(r.address),
+    dispatchAddressId(dispatch?.address),
   );
   const terminalHandle = firstString(
     r.terminal,
@@ -1759,6 +2474,8 @@ export class OrcaAdapter implements HostAdapter {
         worktree: input.worktree,
         lane,
         requestKey: key,
+        participantId: input.participantId,
+        ...(input.custody === undefined ? {} : { custody: input.custody }),
         retainedTerminal: input.reuseTerminal ? { handle: input.reuseTerminal } : undefined,
         title: input.taskTitle,
         terminalWaitTimeoutMs: this.opts.readinessTimeoutMs,
@@ -1782,24 +2499,50 @@ export class OrcaAdapter implements HostAdapter {
       return { ok: true, value: base };
     }
 
+    // Audit F4: worker-start returned success but the receipt carried NO
+    // usable dispatch identity — a worker was dispatched that the engine
+    // cannot observe, stop, or address by id, and an unidentifiable dispatch
+    // must never be kept open or reported 'started'. The launch landed, so
+    // this is 'unknown' custody (never a silent success), with terminal and
+    // request evidence retained for reconciliation. This adapter never
+    // retries or duplicates a worker-start whose outcome is unproven.
+    if (started.dispatchId === undefined) {
+      base.outcome = 'unknown';
+      base.detail =
+        'worker-start returned success but no dispatch identity — the worker landed but cannot be observed or stopped by id' +
+        (input.retainTerminal
+          ? '; requested terminal retention was NOT applied (worker-keep-open requires the dispatch id)'
+          : '') +
+        '; reconcile through the worker-list ledger — never blindly retry';
+      return { ok: true, value: base };
+    }
+
     base.outcome = 'started';
-    if (started.dispatchId !== undefined) base.dispatchId = started.dispatchId;
+    base.dispatchId = started.dispatchId;
 
     // Retention: mark the dispatch so its terminal survives settle. A refused
     // keep-open is recorded in detail, not fatal — reuse will verify settled
     // state before the next phase and fail clearly if the terminal is gone.
-    if (input.retainTerminal && started.dispatchId !== undefined) {
-      const kept = await this.host.keepWorkerOpen(
-        started.dispatchId,
-        requestKey('keep', started.dispatchId),
-      );
-      if (!kept.ok) {
-        base.detail = `worker started; worker-keep-open ${
-          kept.uncertain ? 'outcome unknown' : `refused (${kept.error.code})`
-        } — terminal may not survive settle`;
-      } else if (!keepOpenConfirmed(kept.value)) {
-        base.detail =
-          'worker started; worker-keep-open did not confirm retention — terminal may not survive settle';
+    if (input.retainTerminal) {
+      try {
+        const kept = await this.host.keepWorkerOpen(
+          started.dispatchId,
+          requestKey('keep', started.dispatchId),
+        );
+        if (!kept.ok) {
+          base.detail = `worker started; worker-keep-open ${
+            kept.uncertain ? 'outcome unknown' : `refused (${kept.error.code})`
+          } — terminal may not survive settle`;
+        } else if (!keepOpenConfirmed(kept.value)) {
+          base.detail =
+            'worker started; worker-keep-open did not confirm retention — terminal may not survive settle';
+        }
+      } catch (e) {
+        // The launch LANDED — a keep-open exception must not erase the
+        // 'started' result into a definite error that could authorize a
+        // duplicate launch on resume (clm_0028). Report the start honestly
+        // and note the unproven retention.
+        base.detail = `worker started; worker-keep-open threw (${e instanceof Error ? e.message : String(e)}) — terminal may not survive settle`;
       }
     }
     return { ok: true, value: base };
