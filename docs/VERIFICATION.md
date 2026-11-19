@@ -416,3 +416,22 @@ admission and the previously dropped useful-output fields are exercised with
 actual Devin outputs. This does not replace the missing five perspectives.
 A separate scribe-notes worker launched; discussion and final synthesis remain
 pending.
+
+
+### Live retained-terminal preflight blocker
+
+After scribe notes were admitted, the first challenge phase attempted to reuse a
+reviewer terminal destroyed by the Orca restart. `terminal show` returned
+`terminal_handle_stale` during the read-only readiness check; no worker-start
+receipt/request/dispatch existed for the challenge. The adapter nevertheless
+classified this preflight as uncertain, so the engine conservatively blocked
+rather than taking its known-failure fresh-session fallback. The journal records
+that block at event 177. This is additional live evidence and a new adapter fix;
+it is not a successful discussion or a completed acceptance run.
+
+The primary cancelled this interrupted run without rewriting its evidence or
+approval. Cancellation retained one explicitly unverifiable challenge attempt
+(no dispatch ID); it did not claim the process was stopped. A Devin SWE-2 Max
+worker is assigned a narrow retained-terminal preflight classification fix with
+regressions that keep transport errors, human prompts and newly-created-terminal
+ambiguity conservative. A fresh live validation follows after that fix.
