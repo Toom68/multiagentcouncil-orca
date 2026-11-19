@@ -12,6 +12,7 @@ import type {
   AgentChoice,
   ApprovalBinding,
   ApprovalRecord,
+  ApprovedRoster,
   AuthorResponse,
   Challenge,
   ChallengeAssignment,
@@ -1344,6 +1345,30 @@ function sha256Canonical(v: unknown): string {
  */
 export function canonicalApprovalHash(binding: ApprovalBinding): string {
   return sha256Canonical(binding);
+}
+
+/**
+ * Construct the canonical ApprovalBinding payload for a run. Single source of
+ * truth shared by the engine (approve/revalidate) and the CLI `verify` path —
+ * the exact field set the approval hash covers, byte-compatible with the
+ * payload the engine built inline before this helper existed.
+ */
+export function buildApprovalBinding(
+  state: CouncilState,
+  roster: ApprovedRoster,
+  proposed: ProposedRoster,
+  snapshot: SourceSnapshot,
+): ApprovalBinding {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    runId: state.runId,
+    objective: state.objective,
+    seats: roster.seats,
+    proposedRosterHash: canonicalRosterHash(proposed),
+    config: state.config,
+    snapshotId: snapshot.snapshotId,
+    snapshotHeadHash: snapshot.headHash,
+  };
 }
 
 /**

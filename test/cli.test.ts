@@ -16,7 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -481,9 +481,181 @@ test('verify reports snapshot drift and approval integrity', async () => {
   const drift = await cliJson(['verify', '--run', runDir, '--json'], env);
   assert.equal(drift.code, 0);
   assert.equal(drift.body.verified, false);
-  const snapshot = drift.body.snapshot as { drift: boolean; changed: string[] };
+  const snapshot = drift.body.snapshot as { drift: boolean; changed: string[]; blockingDrift: boolean };
   assert.equal(snapshot.drift, true);
+  assert.equal(snapshot.blockingDrift, true);
   assert.deepEqual(snapshot.changed, ['src/app.js']);
+});
+
+/** Drive a fresh run through the approval gate via the real CLI + store. */
+async function approveRun(f: InitFixture, seats = 2): Promise<void> {
+  const store = createStore({ runDir: f.runDir });
+  assert.ok((await store.writeProposedRoster(proposedRoster(f.runId, 10))).ok);
+  const rosterPath = path.join(f.target, 'roster.approved.json');
+  writeFileSync(rosterPath, JSON.stringify(approvedRoster(f.runId, seats)));
+  const locked = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    st.value.status = 'awaiting_approval';
+    return store.saveState(st.value);
+  });
+  assert.ok(locked.ok);
+  const ok = await cliJson(['approve', '--run', f.runDir, '--roster', rosterPath, '--json'], f.env);
+  assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+}
+
+interface VerifyApproval {
+  present: boolean;
+  bindingIntact?: boolean;
+  matchesStateHash?: boolean;
+  matchesCurrentArtifacts?: boolean;
+  rebuiltHash?: string;
+  recordHash?: string;
+  unreadableArtifacts?: Record<string, string>;
+}
+
+test('verify parity: a tampered approved roster fails the rebuilt-binding check the gate enforces', async () => {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  await approveRun(f);
+
+  const clean = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(clean.code, 0);
+  assert.equal(clean.body.verified, true);
+  const appr0 = clean.body.approval as VerifyApproval;
+  assert.equal(appr0.matchesCurrentArtifacts, true);
+  assert.equal(appr0.rebuiltHash, appr0.recordHash);
+
+  // Edit ONLY roster.approved.json — a schema-valid seat-model swap that
+  // leaves approval.json and state.json untouched. The stored record is
+  // internally consistent yet the launch gate would invalidate it.
+  const rosterFile = path.join(f.runDir, 'roster.approved.json');
+  const original = readFileSync(rosterFile, 'utf8');
+  const tampered = JSON.parse(original) as { seats: { agent: { model: string } }[] };
+  tampered.seats[0].agent.model = 'swe-2-maxx';
+  writeFileSync(rosterFile, JSON.stringify(tampered, null, 2));
+
+  const stale = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(stale.code, 0);
+  assert.equal(stale.body.verified, false, 'stored-consistent but stale approval must not verify');
+  const appr = stale.body.approval as VerifyApproval;
+  assert.equal(appr.bindingIntact, true, 'the stored record itself is untouched — still internally consistent');
+  assert.equal(appr.matchesCurrentArtifacts, false, 'rebuilt binding diverges from the recorded approval');
+  assert.notEqual(appr.rebuiltHash, appr.recordHash);
+  const human = await cli(['verify', '--run', f.runDir], f.env);
+  assert.match(human.stdout, /artifacts DIVERGED|INTEGRITY ISSUES/);
+
+  // Restore, then tamper the PROPOSED roster instead — proposedRosterHash
+  // is inside the binding, so this must fail identically.
+  writeFileSync(rosterFile, original);
+  const proposedFile = path.join(f.runDir, 'roster.proposed.json');
+  const proposedOriginal = readFileSync(proposedFile, 'utf8');
+  const tamperedProposed = JSON.parse(proposedOriginal) as { perspectives: { name: string }[] };
+  tamperedProposed.perspectives[0].name = 'Tampered charter name';
+  writeFileSync(proposedFile, JSON.stringify(tamperedProposed, null, 2));
+  const stale2 = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(stale2.body.verified, false);
+  assert.equal((stale2.body.approval as VerifyApproval).matchesCurrentArtifacts, false);
+
+  // Back to clean — parity holds in both directions.
+  writeFileSync(proposedFile, proposedOriginal);
+  const restored = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(restored.body.verified, true);
+  assert.equal((restored.body.approval as VerifyApproval).matchesCurrentArtifacts, true);
+});
+
+test('verify parity: tampered state objective/config fails, unreadable artifacts are honest', async () => {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  await approveRun(f);
+
+  // state.objective is inside the binding — a schema-valid edit must diverge.
+  const stateFile = path.join(f.runDir, 'state.json');
+  const state = JSON.parse(readFileSync(stateFile, 'utf8')) as { objective: string };
+  const originalObjective = state.objective;
+  state.objective = 'Tampered objective — not what was approved';
+  writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  const stale = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(stale.body.verified, false);
+  assert.equal((stale.body.approval as VerifyApproval).matchesCurrentArtifacts, false);
+  // The file-vs-state objective divergence is visible too.
+  assert.equal((stale.body.objectiveMd as { matchesStateObjective: boolean }).matchesStateObjective, false);
+  state.objective = originalObjective;
+  writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  const restored = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(restored.body.verified, true);
+
+  // A deleted roster.approved.json cannot be rebuilt against — reported as
+  // unreadable, never silently OK (the gate fails approval_stale identically).
+  rmSync(path.join(f.runDir, 'roster.approved.json'));
+  const gone = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(gone.body.verified, false);
+  const appr = gone.body.approval as VerifyApproval;
+  assert.equal(appr.matchesCurrentArtifacts, false);
+  assert.ok(appr.unreadableArtifacts !== undefined);
+  assert.match(appr.unreadableArtifacts!.approvedRoster, /.+/);
+});
+
+test('verify: added-only source drift is visible but non-blocking; pinned drift blocks and advises a new run', async () => {
+  const { runDir, target, env } = await initRun();
+  // A file the snapshot never pinned — the launch gate journals this as
+  // non-blocking growth; verify must say so, not cry drift-blocked.
+  writeFileSync(path.join(target, 'src', 'added.js'), 'export const added = true;\n');
+  const v = await cliJson(['verify', '--run', runDir, '--json'], env);
+  assert.equal(v.code, 0);
+  assert.equal(v.body.verified, true, 'added-only drift does not block launches — verified must mirror the gate');
+  const snap = v.body.snapshot as { drift: boolean; blockingDrift: boolean; added: string[]; manifestChanged: string[] };
+  assert.equal(snap.drift, true);
+  assert.equal(snap.blockingDrift, false);
+  assert.deepEqual(snap.added, ['src/added.js']);
+  assert.deepEqual(snap.manifestChanged, []);
+  assert.ok((v.body.warnings as string[]).some((w) => /added/i.test(w)));
+
+  // Pinned manifest drift DOES block — and the recovery text prescribes a
+  // new run, never a nonexistent re-snapshot (clm_0004).
+  writeFileSync(path.join(target, 'src', 'app.js'), 'export function main() { return 3; }\n');
+  const blocked = await cliJson(['verify', '--run', runDir, '--json'], env);
+  assert.equal(blocked.body.verified, false);
+  const snap2 = blocked.body.snapshot as { blockingDrift: boolean; manifestChanged: string[]; added: string[] };
+  assert.equal(snap2.blockingDrift, true);
+  assert.ok(snap2.manifestChanged.includes('src/app.js'));
+  assert.ok(snap2.added.includes('src/added.js'), 'added files stay visible alongside pinned drift');
+  assert.match(blocked.body.note as string, /create a new run/);
+  assert.doesNotMatch(blocked.body.note as string, /re-snapshot/);
+  const human = await cli(['verify', '--run', runDir], env);
+  assert.match(human.stdout, /create a new run/);
+  assert.doesNotMatch(human.stdout, /re-snapshot/);
+});
+
+test('verify: objective.md divergence is surfaced as a warning, not silently ignored', async () => {
+  const { runDir, env } = await initRun();
+  const objectiveFile = path.join(runDir, 'objective.md');
+  writeFileSync(objectiveFile, 'A different objective than the bound one.\n');
+  const v = await cliJson(['verify', '--run', runDir, '--json'], env);
+  assert.equal(v.code, 0);
+  // The file is human-facing only — the hash binds state.objective — so the
+  // verdict stays clean but the divergence is loud.
+  assert.equal(v.body.verified, true);
+  assert.equal((v.body.objectiveMd as { present: boolean; matchesStateObjective: boolean }).matchesStateObjective, false);
+  assert.ok((v.body.warnings as string[]).some((w) => /objective\.md diverges/i.test(w)));
+  const human = await cli(['verify', '--run', runDir], env);
+  assert.match(human.stdout, /objective\.md: DIVERGED/);
+
+  // Missing objective.md is likewise surfaced, not fatal.
+  rmSync(objectiveFile);
+  const gone = await cliJson(['verify', '--run', runDir, '--json'], env);
+  assert.equal((gone.body.objectiveMd as { present: boolean }).present, false);
+  assert.ok((gone.body.warnings as string[]).some((w) => /objective\.md missing/i.test(w)));
+});
+
+test('verify: a bound approvalHash with a missing approval.json fails like the gate', async () => {
+  const { runDir, env } = await initRun();
+  const stateFile = path.join(runDir, 'state.json');
+  const state = JSON.parse(readFileSync(stateFile, 'utf8')) as { approvalHash: string | null };
+  state.approvalHash = 'a'.repeat(64);
+  writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  const v = await cliJson(['verify', '--run', runDir, '--json'], env);
+  assert.equal(v.code, 0);
+  assert.equal(v.body.verified, false, 'the gate blocks an approvalHash it cannot revalidate — verify must agree');
+  assert.equal((v.body.approval as { present: boolean }).present, false);
 });
 
 // ─── approve gating ──────────────────────────────────────────────────────────

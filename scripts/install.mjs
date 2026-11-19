@@ -32,6 +32,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
@@ -111,6 +112,20 @@ function readManifest(destDir) {
 
 function resolveHome(env) {
   return env.HOME ?? env.USERPROFILE ?? homedir();
+}
+
+/**
+ * Canonical-path file identity for the invoked-directly guard. Node
+ * realpaths import.meta.url but keeps argv[1] as typed — a textual
+ * resolve() comparison silently no-ops whenever the invoked path crosses
+ * a symlink/junction (e.g. /var→/private/var on macOS, linked checkouts).
+ */
+function sameFile(a, b) {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
 }
 
 /**
@@ -564,7 +579,7 @@ function printHuman(r) {
   console.log(r.ok ? 'ok' : 'FAILED');
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && sameFile(process.argv[1], fileURLToPath(import.meta.url))) {
   const r = run(process.argv.slice(2));
   if (r.json) {
     console.log(JSON.stringify(r, null, 2));

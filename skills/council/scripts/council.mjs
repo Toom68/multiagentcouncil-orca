@@ -16,7 +16,7 @@
  * search, no disk scan. Failures name the source and the fix.
  */
 
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -25,6 +25,21 @@ import { fileURLToPath } from 'node:url';
 const WRAPPER = fileURLToPath(import.meta.url);
 const SKILL_DIR = path.resolve(path.dirname(WRAPPER), '..');
 const MANIFEST = path.join(SKILL_DIR, '.install-manifest.json');
+
+/**
+ * Canonical-path file identity. Node realpaths import.meta.url but keeps
+ * argv[1] as typed — a textual resolve() comparison silently mismatches
+ * under any symlinked path component (e.g. /var→/private/var on macOS,
+ * linked checkouts, dotfile-managed skill dirs). realpath both sides;
+ * fall back to the textual match only when realpath itself fails.
+ */
+function sameFile(a, b) {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
 
 function homeDir(env) {
   return env.HOME ?? env.USERPROFILE ?? homedir();
@@ -52,7 +67,7 @@ function manifestVersion() {
 /** A candidate is usable iff it is an absolute path to a real file. */
 function validateCli(cli) {
   if (!path.isAbsolute(cli)) return { ok: false, why: 'not an absolute path' };
-  if (path.resolve(cli) === path.resolve(WRAPPER)) {
+  if (sameFile(cli, WRAPPER)) {
     return { ok: false, why: 'points at this locator, not the built CLI' };
   }
   try {
@@ -106,7 +121,7 @@ The resolved path must be an existing regular file; it is invoked as
 Any other arguments are forwarded to the council CLI verbatim.
 `;
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(WRAPPER)) {
+if (process.argv[1] && sameFile(process.argv[1], WRAPPER)) {
   const args = process.argv.slice(2);
   if (args.includes('--locator-help')) {
     console.log(HELP);

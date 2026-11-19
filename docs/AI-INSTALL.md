@@ -110,6 +110,11 @@ The resolved path must be an existing regular file. The wrapper invokes
 no shell, no PATH search, no disk scan, no fallback to a similarly named
 command.
 
+Invocation through a symlinked or junctioned path is supported: linked
+checkouts, dotfile-managed skill directories, and macOS temp dirs
+(`/var` → `/private/var`) all resolve correctly — the entry guards compare
+canonical real paths, never the literal argv spelling.
+
 ## Safety and preservation rules (enforced by the installer)
 
 - **Foreign skills are never touched.** A same-named `council` dir without

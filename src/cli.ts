@@ -16,7 +16,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -58,8 +58,9 @@ import {
 import { resolveExecutable, runProcess } from './host/process.js';
 import { createPromptBuilder } from './prompts.js';
 import { captureSnapshot } from './snapshot.js';
-import { createStore } from './store.js';
+import { createStore, STORE_PATHS } from './store.js';
 import {
+  buildApprovalBinding,
   canonicalApprovalHash,
   err,
   minViableLaunches,
@@ -1597,10 +1598,20 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
   const state = await loadRun(store);
 
   const drift = unwrap(await store.verifySourceSnapshot());
+  // The launch gate blocks only on pinned-manifest changes; files merely
+  // added under the target are journaled as growth, not a launch blocker —
+  // verify mirrors that distinction so `verified` means what the gate means.
+  const snapR = await store.readSnapshot();
+  const pinned = snapR.ok ? new Set(Object.keys(snapR.value.files)) : null;
+  const manifestChanged = drift.changed.filter((p) => pinned === null || pinned.has(p));
+  const addedFiles = pinned === null ? [] : drift.changed.filter((p) => !pinned.has(p));
+  const blockingDrift = manifestChanged.length > 0;
+
   const appr = await store.readApproval();
   const approval: Record<string, unknown> = { present: appr.ok };
   let bindingIntact: boolean | null = null;
   let stateHashMatch: boolean | null = null;
+  let artifactsHashMatch: boolean | null = null;
   if (appr.ok) {
     const recomputed = canonicalApprovalHash(appr.value.binding);
     bindingIntact = recomputed === appr.value.record.hash;
@@ -1611,8 +1622,45 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
     approval.matchesStateHash = stateHashMatch;
     approval.approver = appr.value.record.approver;
     approval.createdAt = appr.value.record.createdAt;
+    // Launch-gate parity (revalidateApproval): rebuild the binding from the
+    // persisted artifacts AS THEY EXIST NOW — a stored approval can be
+    // internally consistent yet stale relative to the current
+    // roster/proposed/state/snapshot files, which is exactly what the gate
+    // invalidates before any launch.
+    const [rosterR, proposedR] = await Promise.all([
+      store.readApprovedRoster(),
+      store.readProposedRoster(),
+    ]);
+    if (rosterR.ok && proposedR.ok && snapR.ok) {
+      const rebuiltHash = canonicalApprovalHash(
+        buildApprovalBinding(state, rosterR.value, proposedR.value, snapR.value),
+      );
+      artifactsHashMatch = rebuiltHash === appr.value.record.hash && rebuiltHash === state.approvalHash;
+      approval.rebuiltHash = rebuiltHash;
+      approval.matchesCurrentArtifacts = artifactsHashMatch;
+    } else {
+      artifactsHashMatch = false;
+      approval.matchesCurrentArtifacts = false;
+      approval.unreadableArtifacts = {
+        approvedRoster: rosterR.ok ? 'ok' : rosterR.error.message,
+        proposedRoster: proposedR.ok ? 'ok' : proposedR.error.message,
+        snapshot: snapR.ok ? 'ok' : snapR.error.message,
+      };
+    }
   } else {
     approval.reason = appr.error.message;
+  }
+  // objective.md is a human-facing copy written once at init; the approval
+  // binds state.objective. A divergent or missing file cannot corrupt the
+  // hash but can mislead a human auditing the run dir — surface it.
+  const objectiveMd: Record<string, unknown> = {};
+  try {
+    const doc = await fsp.readFile(join(resolve(runDir), STORE_PATHS.objective), 'utf8');
+    objectiveMd.present = true;
+    objectiveMd.matchesStateObjective = doc.trim() === state.objective;
+  } catch {
+    objectiveMd.present = false;
+    objectiveMd.matchesStateObjective = null;
   }
   // Catalog execution fingerprint — legacy runs (pre-staff/pre-execution)
   // report "legacy"; execution-configured runs must match the shipped
@@ -1635,27 +1683,78 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
       catalog.detail = 'recorded fingerprint differs from the shipped catalog — refuse launches until reconciled';
     }
   }
-  const verified =
-    drift.drift === false &&
-    catalogIntact &&
-    (bindingIntact === null ? true : bindingIntact && stateHashMatch !== false);
+  // An approvalHash with an unreadable/absent approval artifact fails the
+  // gate exactly like a stale one; no approval bound at all is a workflow
+  // state, not an integrity issue.
+  const approvalGate = appr.ok
+    ? bindingIntact === true && stateHashMatch !== false && artifactsHashMatch === true
+    : state.approvalHash === null;
+  const verified = !blockingDrift && catalogIntact && approvalGate;
+  const warnings: string[] = [];
+  if (addedFiles.length > 0) {
+    warnings.push(
+      `${addedFiles.length} file(s) added under the target after the snapshot — not pinned, non-blocking for launches`,
+    );
+  }
+  if (objectiveMd.present === false) {
+    warnings.push('objective.md missing — the bound objective lives in state.json; the human-facing file is gone');
+  } else if (objectiveMd.matchesStateObjective === false) {
+    warnings.push(
+      'objective.md diverges from state.objective — approval binds the state copy; the file is stale or was edited',
+    );
+  }
+  const artifactsWord =
+    artifactsHashMatch === true
+      ? 'match'
+      : approval.unreadableArtifacts !== undefined
+        ? 'UNREADABLE'
+        : 'DIVERGED';
   return {
     payload: {
       runId: state.runId,
       verified,
-      snapshot: { drift: drift.drift, changed: drift.changed, snapshotId: state.snapshotId },
+      snapshot: {
+        drift: drift.drift,
+        changed: drift.changed,
+        blockingDrift,
+        manifestChanged,
+        added: addedFiles,
+        snapshotId: state.snapshotId,
+      },
       approval,
+      objectiveMd,
       catalog,
-      note: 'reports only — a drifted tree, mismatched binding, or catalog drift means re-snapshot/re-approve/reconcile are required before any launch',
+      warnings,
+      note:
+        'read-only parity check of the launch gate — a drifted manifest means the pinned snapshot is ' +
+        'immutable: create a new run (`council init`) to review the changed tree; a diverged binding is ' +
+        'invalidated at the gate and re-approval must reproduce the exact approved seats/config ' +
+        '(deliberate changes mean a new run); catalog drift must be reconciled — all before any launch',
     },
     human: [
       `run ${state.runId}: ${verified ? 'VERIFIED' : 'INTEGRITY ISSUES'}`,
-      `  snapshot ${state.snapshotId ?? 'none'}: ${drift.drift ? `DRIFT (${drift.changed.length} changed)` : 'clean'}`,
-      ...(drift.changed.length > 0 ? drift.changed.slice(0, 10).map((c) => `    changed: ${c}`) : []),
+      `  snapshot ${state.snapshotId ?? 'none'}: ${
+        drift.drift
+          ? `DRIFT (${manifestChanged.length} pinned changed${addedFiles.length > 0 ? `, ${addedFiles.length} added non-blocking` : ''})`
+          : 'clean'
+      }`,
+      ...manifestChanged.slice(0, 10).map((c) => `    changed: ${c}`),
+      ...addedFiles.slice(0, 10).map((c) => `    added (non-blocking): ${c}`),
+      ...(blockingDrift
+        ? ['    recovery: pinned snapshots are immutable — create a new run (`council init`) to review the changed tree']
+        : []),
       appr.ok
-        ? `  approval: binding ${bindingIntact === true ? 'intact' : 'MISMATCH'}${stateHashMatch === false ? ', state hash differs' : ''}`
+        ? `  approval: binding ${bindingIntact === true ? 'intact' : 'MISMATCH'}, artifacts ${artifactsWord}${stateHashMatch === false ? ', state hash differs' : ''}`
         : `  approval: none (${appr.error.message})`,
+      `  objective.md: ${
+        objectiveMd.present === false
+          ? 'missing — bound copy is state.objective'
+          : objectiveMd.matchesStateObjective === true
+            ? 'matches bound objective'
+            : 'DIVERGED from state.objective — human-facing file only; approval binds the state copy'
+      }`,
       `  catalog: ${catalog.status}${catalog.detail !== undefined ? ` — ${catalog.detail}` : ''}`,
+      ...warnings.map((w) => `  warning: ${w}`),
     ].join('\n'),
   };
 }
@@ -2526,10 +2625,18 @@ async function main(argv: readonly string[]): Promise<number> {
 const invokedDirectly = (() => {
   const a = process.argv[1];
   if (a === undefined) return false;
+  // Node realpaths import.meta.url but keeps argv[1] as typed — a textual
+  // resolve() comparison silently no-ops whenever the invoked path crosses
+  // a symlink/junction (macOS /var→/private/var, linked checkouts).
+  const self = fileURLToPath(import.meta.url);
   try {
-    return resolve(a) === resolve(fileURLToPath(import.meta.url));
+    return realpathSync(a) === realpathSync(self);
   } catch {
-    return false;
+    try {
+      return resolve(a) === resolve(self);
+    } catch {
+      return false;
+    }
   }
 })();
 

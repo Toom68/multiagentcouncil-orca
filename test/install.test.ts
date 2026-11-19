@@ -19,6 +19,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -468,7 +469,10 @@ describe('skills/council/scripts/council.mjs locator', () => {
     assert.equal(r.status, 0, r.stderr);
     const seen = JSON.parse(r.stdout) as { argv: string[]; cwd: string; marker: string | null };
     assert.deepEqual(seen.argv, ['status', '--json']);
-    assert.equal(seen.cwd, workDir);
+    // The kernel reports the child's cwd canonicalized (macOS /var→/private
+    // /var) — compare against the realpath of the requested dir, not the
+    // textual mkdtemp path.
+    assert.equal(seen.cwd, realpathSync(workDir));
     assert.equal(seen.marker, 'm-42');
   });
 
@@ -499,5 +503,118 @@ describe('skills/council/scripts/council.mjs locator', () => {
     assert.equal(r.status, 2);
     assert.match(r.stderr, /moved/);
     assert.match(r.stderr, /rebuild|npm run build|COUNCIL_CLI/i);
+  });
+});
+
+// Entry-point guards must compare CANONICAL paths: Node realpaths
+// import.meta.url but keeps argv[1] as typed, so a textual resolve()
+// comparison silently no-ops (exit 0, empty output) whenever the invoked
+// path crosses a link — macOS tmpdirs live under /var→/private/var, which
+// is exactly what broke this suite before the guards canonicalized. These
+// tests link the checkout itself so the regression is exercised on every
+// platform, not only on symlinked temp roots.
+describe('entry-point guards under symlinked invocation paths', () => {
+  /** <tmp>/link → REPO (dir link/junction); skip where links are not permitted. */
+  function linkedRepo(t: { skip: (msg?: string) => void }): string | null {
+    const parent = tmp('council-link-');
+    const link = join(parent, 'repo');
+    try {
+      symlinkSync(REPO, link, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      t.skip('symlink/junction creation not permitted here');
+      return null;
+    }
+    return link;
+  }
+
+  it('install.mjs runs when invoked through a linked checkout path', (t) => {
+    const link = linkedRepo(t);
+    if (link === null) return;
+    const h = tmp('council-h-');
+    const r = spawnSync(process.execPath, [join(link, 'scripts', 'install.mjs'), '--home', h, '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    });
+    assert.equal(r.status, 0, `silent no-op or failure: ${r.stdout} ${r.stderr}`);
+    const j = out(r);
+    assert.equal(j.ok, true);
+    assert.ok(existsSync(join(h, '.agents', 'skills', 'council', 'SKILL.md')));
+  });
+
+  it('install.mjs also runs through a FILE-level link to the script', (t) => {
+    const parent = tmp('council-link-');
+    const linkFile = join(parent, 'install-alias.mjs');
+    try {
+      symlinkSync(INSTALL, linkFile, 'file');
+    } catch {
+      t.skip('file symlink not permitted here');
+      return;
+    }
+    const r = spawnSync(process.execPath, [linkFile, '--help'], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `silent no-op or failure: ${r.stdout} ${r.stderr}`);
+    assert.match(r.stdout, /--home/);
+  });
+
+  it('the locator runs when invoked through a linked checkout path', (t) => {
+    const link = linkedRepo(t);
+    if (link === null) return;
+    const h = tmp('council-h-');
+    const r = wrapper(['--locator-help'], { HOME: h, USERPROFILE: h }, undefined, join(link, 'skills', 'council', 'scripts', 'council.mjs'));
+    assert.equal(r.status, 0, `silent no-op or failure: ${r.stdout} ${r.stderr}`);
+    assert.match(r.stdout, /COUNCIL_CLI/);
+  });
+
+  it('the locator still fails actionably (not silently) through a link with no runtime', (t) => {
+    const link = linkedRepo(t);
+    if (link === null) return;
+    const h = tmp('council-h-');
+    const r = wrapper(['status'], { HOME: h, USERPROFILE: h }, undefined, join(link, 'skills', 'council', 'scripts', 'council.mjs'));
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /no usable runtime/i);
+  });
+
+  it('the built CLI runs when invoked through a linked checkout path', (t) => {
+    const link = linkedRepo(t);
+    if (link === null) return;
+    const r = spawnSync(process.execPath, [join(link, 'dist', 'src', 'cli.js'), 'help'], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    });
+    assert.equal(r.status, 0, `silent no-op or failure: ${r.stdout} ${r.stderr}`);
+    assert.match(r.stdout, /usage: council/);
+  });
+
+  it('an installed wrapper reached through a linked skill dir resolves and runs', (t) => {
+    const h = tmp('council-h-');
+    assert.equal(install(['--home', h, '--json']).status, 0);
+    const parent = tmp('council-link-');
+    const linkedSkill = join(parent, 'council-skill');
+    try {
+      symlinkSync(join(h, '.agents', 'skills', 'council'), linkedSkill, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      t.skip('symlink/junction creation not permitted here');
+      return;
+    }
+    const work = tmp('council-target-');
+    const w = wrapper([], { HOME: h, USERPROFILE: h }, work, join(linkedSkill, 'scripts', 'council.mjs'));
+    assert.equal(w.status, 0, `silent no-op or failure: ${w.stdout} ${w.stderr}`);
+    assert.match(w.stdout, /init|approve|supervise/i);
+  });
+
+  it('a COUNCIL_CLI pointing back at the locator itself is refused, not recursed', (t) => {
+    const h = tmp('council-h-');
+    const parent = tmp('council-link-');
+    const linkFile = join(parent, 'council-alias.mjs');
+    try {
+      symlinkSync(WRAPPER, linkFile, 'file');
+    } catch {
+      t.skip('file symlink not permitted here');
+      return;
+    }
+    // Canonical self-check must see through the link — otherwise the wrapper
+    // would spawn itself forever.
+    const r = wrapper(['status'], { HOME: h, USERPROFILE: h, COUNCIL_CLI: linkFile });
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /locator|itself/i);
   });
 });
