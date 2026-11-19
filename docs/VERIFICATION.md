@@ -243,3 +243,136 @@ Found during the smoke and fixed in the same change: the
 cosmetic misreport (the persisted `supervisor/startup.json`, emitted argv,
 and host calls were always correct). The payload now echoes the recorded
 lane command; a test pins it.
+
+## Council repair round (2026-11-19, prompts/docs lane)
+
+A 15-seat live council `crun_01M7RQP9MT8C6PE2MSW48KW3GK` completed the
+protocol but admitted only 3 of 15 seats. Inspecting its `report.json` and
+journal directly shows 21 claims, quorum 11 unmet, 14 admitted challenges
+and 0 applied responses; dominant rejection causes were finding titles over
+the never-documented 200-char cap, malformed `evidence`/`counterEvidence`
+shapes, and challenge-id collisions (many seats minted the same bare
+`C-1`). A separate scribe produced notes that nothing then consumed, and a
+`revise` response was rejected for a missing `revisedFinding`. These are
+artifact observations, treated as hypotheses during the repair, not assumed
+root causes.
+
+Prompt/spec changes implemented and tested in `src/prompts.ts` +
+`test/prompts.test.ts`:
+
+- Every output spec states the validator-enforced caps verbatim, read from
+  `src/validation.ts`: `title` ≤200, `note` ≤2000, `snippet` ≤1000,
+  `steps`/`observed` ≤4000, `path` ≤240, `remedies`/`openQuestions`
+  ≤10×≤500, `notes` ≤4000, `evidence` 1–20, `counterEvidence` ≤20,
+  `confidence` ∈ [0,1], ids ≤128, challenge/response `argument` ≤4000 and
+  `evidence` ≤10, scribe-notes and synthesis bounds.
+- `evidence`/`counterEvidence` elements shown as Evidence **objects**
+  (`{"kind":"reasoned","note":"…"}`), never bare strings; specs require a
+  field-type self-check by inspection — no `council validate`-style command
+  exists and none is claimed.
+- Fail-closed citation rules stated (path requires `startLine`, `snippet`
+  verbatim inside the cited range, no whole-file fallback, no
+  whitespace-only snippets, cited file must match the approved snapshot),
+  matching the ledger owner's announced validation landing.
+- Independent-review seal explicitly covers synthesis/roadmap charters:
+  peer claims do not exist in that phase and arrive only via later bounded
+  envelopes.
+- Challenge specs say workers mint locally-unique ids (`C-1`, …) that the
+  runner qualifies to `ch-r<round>-<32 hex>` per challenger/round;
+  response specs require verbatim echo of the qualified id stamped on the
+  embedded challenge. The qualification formula is landed in
+  `src/contracts.ts` (`Challenge.localChallengeId`, `challengerPid`).
+- `counterexample` challenges documented as requiring ≥1 `evidence` item
+  (ledger-announced parser rule).
+- Optional `repair?: RepairContext` implemented on all six builders exactly
+  as landed in `contracts.ts`: verbatim diagnostics in a delimited
+  ```text``` block, untrusted data never instructions, bounded to the
+  assigned artifact, recorded rejection reasons — not a promise of
+  admission (the whole revised artifact is re-validated and may surface
+  further issues).
+- `scribeSynthesis` emits only the slim `SynthesisFile`
+  (`summary`/`limitations`) the runner reads, consumes admitted scribe
+  notes via `notesPath` as a non-authoritative prior read, and frames its
+  narrative as a self-checked authored layer alongside the runner's
+  deterministic run facts — no claim that a validator checks the prose.
+- Boundary honesty corrected: managed artifacts (ledger, envelopes,
+  journal, peer outputs) are READ, not ignored; `.council`/`.council-dev`
+  are excluded from the snapshot manifest (verified
+  `SNAPSHOT_EXCLUDED_DIRS` in `src/snapshot.ts`); the journal hash chain
+  detects inconsistent edits, not coherent same-host rewrites; edit/egress
+  rules remain cooperative, never sandboxed.
+
+Docs corrected in the same lane: `staff` mandatory at `init` (stale
+"future/optional" wording removed), drift recovery = start a NEW run
+(pinned snapshots are immutable; no re-snapshot path), `quorumRatio`
+documented as an admitted-findings coverage diagnostic not a gate,
+`.council` exclusion noted in USAGE, `AgentChoice.profile` and the new
+`PromptBuilder` signatures/`SynthesisFile` in `docs/design/CONTRACTS.md`,
+README status records the 15-seat partial run honestly.
+
+Checks (macOS Node 26.8.1): focused TypeScript compile of
+`src/prompts.ts` + `test/prompts.test.ts` + their imports clean;
+`node --test` on the compiled prompts suite: **93 passing, 0 failing, 11
+suites**. During peer integration, whole-project `npm run typecheck`
+transiently showed errors only in other workers' in-flight files
+(`src/engine.ts`, `src/host/orca.ts`, `test/claims.test.ts`); after their
+landings the whole-project `npm run typecheck` is clean.
+
+Limits: these are spec/wording repairs and prompt-level tests — they do not
+prove a future live council will produce schema-valid output, and no live
+rerun has been executed. Post-write verification: `parseSynthesisFile`
+(summary ≤8000, limitations ≤20×1000, generatedAt ≤40 — exactly the caps
+the spec states) and the `counterexample` ≥1-evidence rule have since
+landed in `src/validation.ts`; `qualifiedChallengeId` is exported from
+`src/claims.ts` with the documented `ch-r<round>-<32hex>` form.
+
+
+## Integrated repair verification (primary orchestrator, 2026-11-19)
+
+This section supersedes the mid-edit interface/build caveats in the prompts/docs
+lane entry above. All announced parser and builder interfaces are implemented.
+The primary orchestrator independently ran `npm test`: **501 tests passed,
+0 failed, 25 suites**, on local macOS Node 26.8.1. `git diff --check` passed.
+The original baseline was 383 passed / 3 failed; the symlink/path regressions
+now pass. These are automated tests with fake-host orchestration effects,
+not a live Orca council rerun.
+
+| Council finding | Implemented disposition |
+| --- | --- |
+| clm_0001, clm_0005 | Canonical entry guards and macOS/symlink regression checks; CLI/install stage independently passed 93 tests. |
+| clm_0002 | Full approved AgentChoice equality including profile, checked at reapproval and launch. |
+| clm_0003 | Journal-derived per-recipient mail accounting; uncertain intents reserve budget. |
+| clm_0004, clm_0006 | Immutable snapshot recovery says create a new run; staff/profile/invocation documentation aligned. |
+| clm_0007 | Quorum counts admitted independent findings; below-quorum reports are explicitly partial diagnostics. Quorum is documented as a coverage diagnostic. |
+| clm_0008–clm_0010 | Cited file bytes must match snapshot hash/size; snippets must be nonblank and match the cited range; citation-shaped fields are checked on every evidence kind. |
+| clm_0011–clm_0013 | Grades recomputed after evidence changes; qualified challenge identities, exact response claim/round binding, all-author routing, bounded envelopes with visible omissions, provenance-preserving folds. |
+| clm_0014 | Preserve honest challenged/defended/revised/withdrawn/escalated states. No vote-based confirmed/resolved claims were added; legacy enum values do not imply a verification facility exists. |
+| clm_0015–clm_0017 | Retain remedies, open questions, challenger evidence and per-author assessments; dedupe uses overlapping admitted citation ranges rather than same-file membership. |
+| clm_0018–clm_0020 | Deterministic facts precede labelled narrative, limitation authorship retained, pluralization repaired, slim synthesis contract with legacy compatibility. |
+| clm_0021 | Admitted scribe notes explicitly supplied to final synthesis. |
+
+The independent recovery audit reproduced additional append-success/state-save-
+failure gaps despite the earlier 490 passing tests. Added regression cases cover
+run identity restoration, lost planned/corrective attempts, durable launch charges,
+corrupt-journal refusal, uncertain request evidence, oversized diagnostics and
+pre-mutation stop/release/mail custody. Recovery uses exact identities and never
+interprets an empty/pruned host listing as proof that a mutation did not happen.
+Legacy markerless intents remain uncertain. Journal appends handle short writes
+and fsync before success.
+
+Remaining boundaries: a same-host writer can coherently rewrite local artifacts;
+reviewer edit/egress restrictions are cooperative; narrative validation is not a
+proof of prose faithfulness; deadlines and recovery need an external advance
+(no timer daemon); uncertain stop/release/mail intents can remain unresolved.
+Same-title findings without citations still use the documented title/kind merge
+fallback. The independent recovery re-audit passed RA-001 through RA-009 using the original fake-host probes and call-count checks. A bounded live rerun remains pending at the time this verification entry is written.
+
+
+The ledger stage (`667de44`) was independently validated in an isolated checkout
+with only its required API call-site glue: **442/442 tests passed**. The integrated
+engine/prompt stage (`1940b18`) has **501/501 tests passed** and passed the
+independent repeat of the original recovery probes. In particular, the repeated
+run-creation probe now issued zero createRun calls, restored the journaled run
+identity, and the lost corrective-attempt probe issued exactly one repair launch.
+The corrupted-journal probe returned journal_corrupt with zero host mutations.
+These probes use fake hosts and do not establish live Orca behavior.

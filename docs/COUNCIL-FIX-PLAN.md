@@ -27,3 +27,12 @@ All workers use `devin --model swe-2-max --permission-mode dangerous`. Primary o
 ## Integration and acceptance
 
 For each worker, review its diff and evidence, run meaningful focused tests, commit only its owned coherent changes and push the current branch to origin. Integrate shared API dependencies before claiming a green build. Run the complete test suite after integration. Then exercise a bounded live council and explicitly measure admitted findings, distinct challenge routing and applied responses; do not call fake-host tests live validation. Document any non-reproduced claims and residual limitations. Keep .council artifacts and credentials out of Git.
+
+
+## Integration status
+
+- Portability and CLI stage pushed at `565ed66`; isolated CLI/install validation: 93/93.
+- Ledger stage pushed at `667de44`, including minimal shared API call-site glue; isolated full-suite validation: 442/442. Engine and prompt stage pushed at `1940b18`; primary full-suite validation: 501/501 tests, no failures.
+- Independent recovery audit reproduced state-save crash gaps beyond the first green suite. Follow-up repaired them; original probes re-run independently passed RA-001 through RA-009. These are fake-host fault checks, not live Orca integration.
+- Checkpoint backup pushed on `checkpoints/council-repairs-20261119` while the recovery audit fixes were in progress. It is not the final integration branch.
+- Documentation integration records the actual schemas, quorum policy and recovery boundaries. Bounded live validation follows these commits. Reviewed-source drift remains an immutable-snapshot/new-run decision; no automatic truth/consensus closure or timer daemon is introduced.

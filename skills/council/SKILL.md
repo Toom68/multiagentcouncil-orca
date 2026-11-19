@@ -59,8 +59,9 @@ A public council has **no default provider**. Before any launch you must
 resolve, and the user must effectively authorize:
 
 - **Staff** — `organiser`, `scribe`, and `supervisor` roles. Staff choices are
-  needed before `init`/`start-supervisor`: the roster approval gate cannot
-  authorize organiser or supervisor work retroactively.
+  needed before `init`/`start-supervisor` and are mandatory at `init`: a
+  config without a complete `staff` is refused, because the roster approval
+  gate cannot authorize organiser or supervisor work retroactively.
 - **Seats** — one participant lane per approved roster seat, bound by the
   approval.
 
@@ -113,7 +114,7 @@ re-ask. See `references/selection.md` for choice shapes and per-lane notes.
 ## Run the council (details in references/operations.md)
 
 ```text
-node "<SKILL_DIR>/scripts/council.mjs" init --objective <objective-file> --target <path> [--config <file>] --json
+node "<SKILL_DIR>/scripts/council.mjs" init --objective <objective-file> --target <path> --config <file> --json
 node "<SKILL_DIR>/scripts/council.mjs" start-supervisor --run <runDir> --json
 # …wait for needs_approval mail, read roster.proposed.json, write
 # roster.approved.json with your seat/agent choices…

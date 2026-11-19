@@ -60,11 +60,16 @@ operating guide.
   deadlines/envelopes enforced by the runner.
 - **Status**: the reduced live Orca council completed the full protocol
   (10 proposed perspectives, 2 selected reviewers, one discussion round and
-  a separate scribe). Its report is **partial**: one review was rejected for
-  malformed output; seven admitted findings covered all four planted defects
-  and preserved a severity disagreement. Automated tests cover the full
-  15-seat lifecycle; a 15-seat live load test remains unverified. See
-  [docs/VERIFICATION.md](docs/VERIFICATION.md) for evidence and limits.
+  a separate scribe) with a partial report. A subsequent 15-seat live
+  council (`crun_01M7RQP9MT8C6PE2MSW48KW3GK`) also completed the protocol
+  but admitted only 3 of 15 seats — dominantly because worker specs never
+  documented the enforced 200-char finding-title cap — and challenge
+  routing collapsed on colliding worker-minted ids. The repair that
+  followed (schema-accurate worker specs, qualified challenge routing,
+  bounded corrective attempts, scribe-notes consumption, honest quorum and
+  drift semantics) is recorded in
+  [docs/COUNCIL-FIX-PLAN.md](docs/COUNCIL-FIX-PLAN.md) and
+  [docs/VERIFICATION.md](docs/VERIFICATION.md).
 - **Cooperative (prompt-level, not sandboxed)**: reviewer edit restrictions,
   network/egress limits, and per-worker token/tool budgets. The runner enforces
   what it can observe; the rest is enforced by the worker prompts.

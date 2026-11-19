@@ -45,22 +45,24 @@ Save the `runId` (may be `null`). If anything rebinds you, restore with
 ## Step 1 — create the run
 
 ```text
-COUNCIL init --objective <objective-file> --target <path> [--config <file>] --json
+COUNCIL init --objective <objective-file> --target <path> --config <file> --json
 ```
 
 Writes `.council/runs/<crun_id>/` inside the target: `council.json`,
 `objective.md`, `snapshot.json`, `state.json`, `meta.json`, and
 `prompts/supervisor.md` — the generated supervisor spec.
 
-`--config` overrides defaults. Core keys: `requestedPerspectives` (15 of
-10–25), `participants` (15), `concurrency` (5), `rounds` (1 of 1–3),
+`--config` is effectively required on a fresh run: it must carry a complete
+`staff.{organiser,scribe,supervisor}` of catalog AgentChoices — `init`
+refuses without it (the roster approval gate cannot authorize staff work
+retroactively). `execution.{catalogVersion,policyHash}` is captured at init,
+not supplied. Core keys: `requestedPerspectives` (15 of 10–25),
+`participants` (15), `concurrency` (5), `rounds` (1 of 1–3),
 `maxFindingsPerSeat` (7), `maxChallengesPerSeatPerRound` (3), `envelopeBytes`
-(8192), computed `maxLaunches`, `deadlines` object. Public-use fields:
-`staff.{organiser,scribe,supervisor}` and `execution.{catalogVersion,
-policyHash}` — required for new runs once the catalog contract lands; absent
-fields in old saved runs are preserved exactly (legacy behavior, never
-re-hashed). Print `COUNCIL init --help` / `catalog --json` for the live schema
-rather than guessing field names.
+(8192), computed `maxLaunches`, `deadlines` object. Fields absent in old
+saved runs are preserved exactly (legacy behavior, never re-hashed). Print
+`COUNCIL init --help` / `catalog --json` for the live schema rather than
+guessing field names.
 
 **Enforcement honesty:** budgets the runner forwards or launches —
 concurrency, launches/phases, rounds, envelope bytes, per-recipient envelopes —
