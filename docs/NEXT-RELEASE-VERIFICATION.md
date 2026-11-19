@@ -27,3 +27,26 @@ snapshot was tested before staging the exact verified file contents.
 Structured strengths, stage notifications, recovery and integrity changes are
 still separate in-progress stages. This is automated verification, not a new
 live council or evidence of new runtime behavior.
+
+## Stage 2: contracts, ledger and safe reporting
+
+Integrated additive strength, challenge-lifecycle, routing and provenance
+contracts; typed ledger/envelope/receipt parsers; canonical strengths with
+runner-stamped provenance; and separate answered/unanswered challenge facts
+while retaining dissent. Empty strengths remain valid. Reports include
+limitations and preserve untrusted prose as inert markdown while JSON retains
+the original text. New custody callback interfaces are optional pending engine
+and adapter integration.
+
+Primary verification used an isolated snapshot based on `5f6e1ab`, with only
+the four contracts/validation/claims/report modules and their four test files.
+Full `npm test`: **541 passed, 0 failed, 0 skipped**. Independent primary probes
+confirmed duplicate challenge and response identities reject, valid local IDs
+remain usable across seats/rounds, an existing 45-claim report still parses,
+malicious headings/HTML/links stay inert, and JSON strings remain unchanged.
+Exact source hashes, probes and logs remain under `.council/next-release`.
+
+This is the protocol/reporting foundation. Engine routing records, complete
+strength rejection diagnostics, export provenance and new reviewer prompts
+require the subsequent integration stage. Progress delivery, artifact custody
+and operator recovery still require independent audits and end-to-end checks.

@@ -19,6 +19,10 @@ to main. Development workers use only Devin swe-2-max with dangerous permissions
   Parse ledgers/envelopes on re-read. Envelope bytes cannot authorize their own
   changed assignments. Version the integrity policy for new runs; report honest
   legacy/untracked status on old runs. No same-UID sandbox/coherent-rewrite claim.
+  For new receipts-v1 runs, Store.initialize persists the run.initialized policy
+  marker as journal seq 1 before returning success. Non-engine journal writers
+  must never make the normal startup flow look like a stripped policy marker.
+  Do not bless an existing nonempty unmarked journal by adding a marker later.
 - Keep hash receipts tied to exact bytes and path/version; corrective attempts
   preserve rejected originals. Journal-first custody/order and finite budgets
   survive crashes. Journal terminal creation intent and returned resource identity

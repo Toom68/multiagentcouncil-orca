@@ -16,6 +16,7 @@ import {
   type CouncilConfig,
   type CouncilReport,
   type CouncilRunId,
+  type DiscussionRoundFacts,
   type Evidence,
   type LimitationSource,
   type Participant,
@@ -23,10 +24,72 @@ import {
   type PhaseKind,
   type ProposedRoster,
   type ReportCoverage,
+  type ReportProvenance,
   type RunnerFacts,
   type SeatOutcome,
 } from './contracts.js';
-import { orderedClaims, severityRank, gradeRank } from './claims.js';
+import { buildDiscussionAccounting, orderedClaims, severityRank, gradeRank } from './claims.js';
+
+// ─── Untrusted-text rendering ────────────────────────────────────────────────
+//
+// Every worker/scribe-authored string is UNTRUSTED: it must never mint
+// markdown that impersonates a runner-authored section or smuggle raw HTML.
+// Three renderings only:
+//  - escInline: for single-line positions (titles, list items, table cells).
+//    Newlines collapse to a visible marker, HTML-significant characters are
+//    entity-encoded, and markdown-active punctuation is backslash-escaped, so
+//    the text can never form a code span, link/image, emphasis run, autolink,
+//    raw-HTML tag, or table break.
+//  - codeSpan: for machine tokens rendered inside backticks (dedupeKey,
+//    evidence paths). The delimiter is sized past the longest backtick run
+//    inside the text so content can never close it.
+//  - fenceProse: wraps multi-line prose in a tilde fence sized so the content
+//    can never close it — rendered as verbatim text, never as structure.
+// Raw JSON strings are never mutated by this; only markdown output is.
+
+/**
+ * Make a string safe for a single-line markdown position. HTML-significant
+ * characters entity-encode (inert in every renderer — a backslash is not
+ * guaranteed to neutralize `<` outside CommonMark), markdown-active
+ * punctuation is backslash-escaped, and a leading line-start marker is
+ * escaped because list-item and cell content re-enters block parsing.
+ */
+function escInline(s: string): string {
+  return s
+    .replace(/[\r\n]+/g, ' ⏎ ')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/[\\`*_{}[\]()!|~]/g, '\\$&')
+    .replace(/^(\s*)([#+-]|\d+[.)])/, '$1\\$2');
+}
+
+/**
+ * Emit `s` as an inline code span whose delimiter is one backtick longer
+ * than the longest backtick run inside `s` — the same can't-close-early rule
+ * as fenceProse. Space-padded when `s` begins or ends with a backtick or
+ * space (CommonMark strips one leading+trailing space pair); newlines flatten
+ * to the escInline marker so the span stays single-line.
+ */
+function codeSpan(s: string): string {
+  const flat = s.replace(/[\r\n]+/g, ' ⏎ ');
+  let n = 0;
+  for (const r of flat.match(/`+/g) ?? []) n = Math.max(n, r.length);
+  const ticks = '`'.repeat(n + 1);
+  const pad = /^[ `]|[ `]$/.test(flat) && !/^ *$/.test(flat) ? ' ' : '';
+  return `${ticks}${pad}${flat}${pad}${ticks}`;
+}
+
+/**
+ * Emit `text` as a fenced block. The fence is one tilde longer than the
+ * longest tilde run inside the text, so content can never terminate it.
+ */
+function fenceProse(lines: string[], text: string): void {
+  let fence = '~~~';
+  const runs = text.match(/~{3,}/g) ?? [];
+  for (const r of runs) if (r.length >= fence.length) fence = '~'.repeat(r.length + 1);
+  lines.push(`${fence}text`, text, fence, '');
+}
 
 // ─── Seat outcomes and coverage ──────────────────────────────────────────────
 
@@ -183,6 +246,7 @@ export function buildRunnerFacts(
   coverage: ReportCoverage,
   claims: Claim[],
   summarySource: 'scribe' | 'runner',
+  extra?: { strengths?: number; discussion?: DiscussionRoundFacts[] },
 ): RunnerFacts {
   const byStatus: Record<string, number> = {};
   for (const c of claims) byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
@@ -196,9 +260,16 @@ export function buildRunnerFacts(
       total: claims.length,
       byStatus,
       withDissent: claims.filter((c) => c.dissent.length > 0).map((c) => c.claimId),
+      // Genuinely UNANSWERED challenges — a strict subset of retained
+      // dissent, disclosed separately so the two are never conflated.
+      unansweredChallenges: claims
+        .filter((c) => (c.challenges ?? []).some((ch) => !ch.answered))
+        .map((c) => c.claimId),
       withdrawn: byStatus['withdrawn'] ?? 0,
       escalated: byStatus['escalated'] ?? 0,
     },
+    ...(extra?.strengths !== undefined ? { strengths: extra.strengths } : {}),
+    ...(extra?.discussion !== undefined ? { discussion: extra.discussion } : {}),
   };
 }
 
@@ -218,6 +289,8 @@ export function buildCouncilReport(input: {
   ledger: ClaimLedger;
   scribe?: ScribeNarrative;
   runnerLimitations: string[];
+  /** What was reviewed — binds the report to its exact source. */
+  provenance?: ReportProvenance;
 }): CouncilReport {
   const coverage = buildCoverage(input);
   const claims = orderedClaims(input.ledger);
@@ -237,7 +310,7 @@ export function buildCouncilReport(input: {
   const scribeSummary = input.scribe?.summary;
   const scribeSummaryUsable = scribeSummary !== undefined && scribeSummary.trim().length > 0;
   const summary = scribeSummaryUsable ? scribeSummary : deterministicSummary(partial);
-  return {
+  const report: CouncilReport = {
     schemaVersion: SCHEMA_VERSION,
     runId: input.runId,
     generatedAt: input.generatedAt,
@@ -245,17 +318,25 @@ export function buildCouncilReport(input: {
     coverage,
     claims,
     limitations,
-    runnerFacts: buildRunnerFacts(coverage, claims, scribeSummaryUsable ? 'scribe' : 'runner'),
+    runnerFacts: buildRunnerFacts(coverage, claims, scribeSummaryUsable ? 'scribe' : 'runner', {
+      strengths: input.ledger.strengths?.length ?? 0,
+      discussion: buildDiscussionAccounting(input.ledger),
+    }),
     limitationSources,
   };
+  if (input.provenance !== undefined) report.provenance = input.provenance;
+  if (input.ledger.strengths !== undefined && input.ledger.strengths.length > 0) {
+    report.strengths = input.ledger.strengths;
+  }
+  return report;
 }
 
 // ─── Deterministic markdown rendering ────────────────────────────────────────
 
 function fmtEvidence(ev: Evidence, lines: string[]): void {
-  let line = `- **${ev.kind}** — ${ev.note}`;
+  let line = `- **${ev.kind}** — ${escInline(ev.note)}`;
   if (ev.path !== undefined) {
-    line += ` (\`${ev.path}\``;
+    line += ` (${codeSpan(ev.path)}`;
     if (ev.startLine !== undefined) {
       line += `:${ev.startLine}`;
       if (ev.endLine !== undefined && ev.endLine !== ev.startLine) line += `-${ev.endLine}`;
@@ -263,20 +344,24 @@ function fmtEvidence(ev: Evidence, lines: string[]): void {
     line += ')';
   }
   lines.push(line);
-  if (ev.snippet !== undefined) lines.push(`  > ${ev.snippet}`);
-  if (ev.steps !== undefined) lines.push(`  - steps: ${ev.steps}`);
-  if (ev.observed !== undefined) lines.push(`  - observed: ${ev.observed}`);
+  if (ev.snippet !== undefined) lines.push(`  > ${escInline(ev.snippet)}`);
+  if (ev.steps !== undefined) lines.push(`  - steps: ${escInline(ev.steps)}`);
+  if (ev.observed !== undefined) lines.push(`  - observed: ${escInline(ev.observed)}`);
 }
 
 function renderClaim(c: Claim, lines: string[]): void {
   lines.push(
-    `### ${c.claimId}: ${c.title}`,
+    `### ${c.claimId}: ${escInline(c.title)}`,
     '',
     `- kind: ${c.kind} | severity: ${c.severity} | grade: ${c.grade} | status: ${c.status} | confidence: ${c.confidence}`,
     `- source findings: ${c.sourceFindings.map((f) => `${f.participantId}/${f.findingId}`).join(', ')}`,
   );
+  if (c.dedupeKey !== undefined) lines.push(`- dedupe key: ${codeSpan(c.dedupeKey)}`);
+  if (c.rejectedEvidence !== undefined && c.rejectedEvidence > 0) {
+    lines.push(`- rejected evidence items: ${c.rejectedEvidence} (failed citation validation — see journal)`);
+  }
   if (c.mergedTitles !== undefined && c.mergedTitles.length > 0) {
-    lines.push(`- merged titles: ${c.mergedTitles.map((t) => `“${t}”`).join(', ')}`);
+    lines.push(`- merged titles: ${c.mergedTitles.map((t) => `“${escInline(t)}”`).join(', ')}`);
   }
   if (c.assessments !== undefined && c.assessments.length > 1) {
     lines.push(
@@ -296,20 +381,30 @@ function renderClaim(c: Claim, lines: string[]): void {
     for (const ev of c.counterEvidence) fmtEvidence(ev, lines);
     lines.push('');
   }
+  if (c.challenges !== undefined && c.challenges.length > 0) {
+    lines.push('Challenges (answered means a response was filed — never resolved):');
+    for (const ch of c.challenges) {
+      const state = ch.answered
+        ? `answered — ${ch.response?.disposition ?? 'response'} by ${ch.response?.participantId ?? 'unknown'}`
+        : '**unanswered**';
+      lines.push(`- ${ch.challengeId} — ${ch.kind} by ${ch.challengerPid}, round ${ch.round}: ${state}`);
+    }
+    lines.push('');
+  }
   if (c.remedies !== undefined && c.remedies.length > 0) {
     lines.push('Remedies:');
-    for (const r of c.remedies) lines.push(`- ${r}`);
+    for (const r of c.remedies) lines.push(`- ${escInline(r)}`);
     lines.push('');
   }
   if (c.openQuestions !== undefined && c.openQuestions.length > 0) {
     lines.push('Open questions:');
-    for (const q of c.openQuestions) lines.push(`- ${q}`);
+    for (const q of c.openQuestions) lines.push(`- ${escInline(q)}`);
     lines.push('');
   }
   if (c.dissent.length > 0) {
-    lines.push('Dissent:');
+    lines.push('Dissent (retained — an answer never erases the record):');
     for (const d of c.dissent) {
-      lines.push(`- ${d.participantId}${d.round !== null ? ` (round ${d.round})` : ''}: ${d.position}`);
+      lines.push(`- ${d.participantId}${d.round !== null ? ` (round ${d.round})` : ''}: ${escInline(d.position)}`);
       if (d.evidence !== undefined) for (const ev of d.evidence) fmtEvidence(ev, lines);
     }
     lines.push('');
@@ -318,8 +413,8 @@ function renderClaim(c: Claim, lines: string[]): void {
     lines.push('History:');
     for (const h of c.history) {
       const ref = h.refId !== undefined ? ` [${h.refId}]` : '';
-      const det = h.detail !== undefined ? ` — ${h.detail}` : '';
-      lines.push(`- ${h.ts} ${h.actor} ${h.type}${ref}${det}`);
+      const det = h.detail !== undefined ? ` — ${escInline(h.detail)}` : '';
+      lines.push(`- ${escInline(h.ts)} ${escInline(h.actor)} ${h.type}${ref}${det}`);
     }
     lines.push('');
   }
@@ -351,15 +446,32 @@ function renderRunnerFacts(report: CouncilReport, lines: string[]): void {
     `- narrative summary: ${rf.summarySource === 'scribe' ? 'scribe-authored' : 'deterministic runner fallback'}`,
     `- claims: ${plural(rf.claims.total, 'claim')}`,
   );
-  const statusBits = Object.entries(rf.claims.byStatus).sort().map(([k, v]) => `${k}: ${v}`);
+  const statusBits = Object.entries(rf.claims.byStatus).sort().map(([k, v]) => `${escInline(k)}: ${v}`);
   if (statusBits.length > 0) lines.push(`- status counts: ${statusBits.join(', ')}`);
   if (rf.claims.withDissent.length > 0) {
-    lines.push(`- **${plural(rf.claims.withDissent.length, 'claim')} with unresolved dissent: ${rf.claims.withDissent.join(', ')}**`);
+    lines.push(`- **${plural(rf.claims.withDissent.length, 'claim')} with retained dissent: ${rf.claims.withDissent.map(codeSpan).join(', ')}**`);
   }
+  if (rf.claims.unansweredChallenges !== undefined && rf.claims.unansweredChallenges.length > 0) {
+    lines.push(
+      `- **${plural(rf.claims.unansweredChallenges.length, 'claim')} with UNANSWERED challenges: ${rf.claims.unansweredChallenges.map(codeSpan).join(', ')}** (answered ≠ resolved — see Dissent)`,
+    );
+  }
+  if (rf.strengths !== undefined) lines.push(`- canonical strengths: ${rf.strengths}`);
   if (rf.claims.withdrawn > 0) lines.push(`- withdrawn: ${rf.claims.withdrawn}`);
   if (rf.claims.escalated > 0) lines.push(`- escalated to orchestrator: ${rf.claims.escalated}`);
+  if (rf.discussion !== undefined && rf.discussion.length > 0) {
+    lines.push('- discussion routing (delivery counts — a routed claim was assigned to a seat, not necessarily reviewed):');
+    for (const d of rf.discussion) {
+      lines.push(
+        `  - round ${d.round}: ${plural(d.challengesFiled, 'challenge')} filed (${d.challengesAnswered} answered, ${d.challengesUnanswered} unanswered); ` +
+          `claims routed ${d.claimsRouted} (${d.claimsRoutedNoChallenge} delivered but filed no challenge), never routed ${d.claimsNeverRouted} ` +
+          `(unassigned ${d.claimsUnassigned}, byte-dropped ${d.claimsByteDropped}); ` +
+          `responses routed ${d.responsesRouted}, dropped ${d.responsesByteDropped}, cap-omitted ${d.responsesCapOmitted}, unroutable ${d.responsesUnroutable}`,
+      );
+    }
+  }
   if (rf.uncoveredPerspectiveIds.length > 0) {
-    lines.push(`- **uncovered perspectives: ${rf.uncoveredPerspectiveIds.join(', ')}**`);
+    lines.push(`- **uncovered perspectives: ${rf.uncoveredPerspectiveIds.map(codeSpan).join(', ')}**`);
   }
   lines.push('');
 }
@@ -377,13 +489,26 @@ export function renderReportMarkdown(report: CouncilReport): string {
   const lines: string[] = [
     `# Council report — ${report.runId}`,
     '',
-    `Generated: ${report.generatedAt}`,
+    `Generated: ${escInline(report.generatedAt)}`,
     '',
   ];
   // Deterministic runner facts lead: coverage and disputes are verified
   // numbers and must not sit beneath unverified authored prose.
   renderRunnerFacts(report, lines);
-  lines.push(`## Narrative summary — ${summaryLabel(report)}`, '', report.summary, '');
+  if (report.provenance !== undefined) {
+    lines.push(
+      '## Provenance',
+      '',
+      `- snapshot: ${report.provenance.snapshotId}`,
+      `- target: ${escInline(report.provenance.targetRoot)}`,
+      `- git head: ${report.provenance.gitHead === null ? 'n/a (non-git target)' : escInline(report.provenance.gitHead)}`,
+      '',
+      'Objective:',
+    );
+    fenceProse(lines, report.provenance.objective);
+  }
+  lines.push(`## Narrative summary — ${summaryLabel(report)}`, '');
+  fenceProse(lines, report.summary);
   lines.push(
     '## Coverage',
     '',
@@ -397,13 +522,13 @@ export function renderReportMarkdown(report: CouncilReport): string {
   );
   for (const s of report.coverage.seats) {
     lines.push(
-      `| ${s.seatId} | ${s.perspectiveId} | ${s.participantId} | ${s.outcome} | ${s.phasesCompleted.join(',') || '—'} | ${s.detail ?? ''} |`,
+      `| ${escInline(s.seatId)} | ${escInline(s.perspectiveId)} | ${escInline(s.participantId)} | ${s.outcome} | ${s.phasesCompleted.join(',') || '—'} | ${escInline(s.detail ?? '')} |`,
     );
   }
   lines.push('');
   if (report.coverage.uncoveredPerspectiveIds.length > 0) {
     lines.push(
-      `Uncovered perspectives: ${report.coverage.uncoveredPerspectiveIds.join(', ')}`,
+      `Uncovered perspectives: ${report.coverage.uncoveredPerspectiveIds.map(codeSpan).join(', ')}`,
       '',
     );
   }
@@ -416,13 +541,37 @@ export function renderReportMarkdown(report: CouncilReport): string {
       a.claimId.localeCompare(b.claimId),
   );
   for (const c of sorted) renderClaim(c, lines);
+  if (report.strengths !== undefined && report.strengths.length > 0) {
+    lines.push('## Strengths', '');
+    lines.push(
+      'Canonical strengths admitted from independent review — concrete persona benefits with preservation guidance. Not challenged, not graded; zero would be an honest answer too.',
+      '',
+    );
+    for (const s of report.strengths) {
+      lines.push(
+        `### ${escInline(s.strengthId)}: ${escInline(s.feature)}`,
+        '',
+        `- reported by: ${s.participantId} (perspective ${s.perspectiveId})`,
+        '',
+        'Benefit:',
+      );
+      fenceProse(lines, s.benefit);
+      lines.push('Preserve:');
+      fenceProse(lines, s.preserve);
+      if (s.evidence.length > 0) {
+        lines.push('Evidence:');
+        for (const ev of s.evidence) fmtEvidence(ev, lines);
+        lines.push('');
+      }
+    }
+  }
   if (report.limitationSources !== undefined && report.limitationSources.length > 0) {
     lines.push('## Limitations', '');
-    for (const l of report.limitationSources) lines.push(`- [${l.origin}] ${l.text}`);
+    for (const l of report.limitationSources) lines.push(`- [${l.origin}] ${escInline(l.text)}`);
     lines.push('');
   } else if (report.limitations.length > 0) {
     lines.push('## Limitations', '');
-    for (const l of report.limitations) lines.push(`- ${l}`);
+    for (const l of report.limitations) lines.push(`- ${escInline(l)}`);
     lines.push('');
   }
   lines.push('---', 'Machine-readable form: `report.json` (CouncilReport).', '');
@@ -436,24 +585,72 @@ export function renderReportMarkdown(report: CouncilReport): string {
 export function renderSummaryMarkdown(report: CouncilReport): string {
   const completed = report.coverage.seats.filter((s) => s.outcome === 'completed').length;
   const disputed = report.claims.filter((c) => c.dissent.length > 0).length;
+  const unanswered = report.claims.filter((c) => (c.challenges ?? []).some((ch) => !ch.answered)).length;
   const lines = [
     `# Council summary — ${report.runId}`,
     '',
     `- ${plural(report.claims.length, 'claim')}; ${completed}/${report.coverage.selectedSeats} seats completed`,
     `- partial coverage: ${report.coverage.partial ? 'YES' : 'no'}`,
-    `- ${plural(disputed, 'disputed claim')}`,
+    `- ${plural(disputed, 'claim')} with retained dissent; ${plural(unanswered, 'claim')} with unanswered challenges`,
   ];
-  if (report.coverage.uncoveredPerspectiveIds.length > 0) {
-    lines.push(`- uncovered perspectives: ${report.coverage.uncoveredPerspectiveIds.join(', ')}`);
+  if (report.strengths !== undefined) {
+    lines.push(`- canonical strengths: ${report.strengths.length}`);
   }
-  lines.push('', `Narrative summary (${summaryLabel(report)}):`, '', report.summary, '');
+  if (report.coverage.uncoveredPerspectiveIds.length > 0) {
+    lines.push(`- uncovered perspectives: ${report.coverage.uncoveredPerspectiveIds.map(codeSpan).join(', ')}`);
+  }
+  if (report.provenance !== undefined) {
+    lines.push(
+      `- reviewed: snapshot ${report.provenance.snapshotId}` +
+        `${report.provenance.gitHead !== null ? ` @ ${escInline(report.provenance.gitHead)}` : ''}` +
+        ` — ${escInline(report.provenance.targetRoot)}`,
+    );
+  }
+  const discussion = report.runnerFacts?.discussion ?? [];
+  if (discussion.length > 0) {
+    lines.push('- discussion routing (delivery counts — routed means assigned, not reviewed):');
+    for (const d of discussion) {
+      lines.push(
+        `  - round ${d.round}: ${plural(d.challengesFiled, 'challenge')} filed (${d.challengesAnswered} answered, ${d.challengesUnanswered} unanswered); ` +
+          `claims routed ${d.claimsRouted} (${d.claimsRoutedNoChallenge} delivered but filed no challenge), never routed ${d.claimsNeverRouted} ` +
+          `(unassigned ${d.claimsUnassigned}, byte-dropped ${d.claimsByteDropped})`,
+      );
+    }
+  }
+  lines.push('', `Narrative summary (${summaryLabel(report)}):`, '');
+  fenceProse(lines, report.summary);
+  // Same ordering rule as the full report's Claims section: severity, then
+  // grade, then id — the summary can never silently reprioritize.
   const top = [...report.claims]
     .filter((c) => c.status !== 'withdrawn')
-    .sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.claimId.localeCompare(b.claimId))
-    .slice(0, 10);
-  if (top.length > 0) {
-    lines.push('', 'Top claims:');
-    for (const c of top) lines.push(`- [${c.severity}/${c.grade}/${c.status}] ${c.title}`);
+    .sort(
+      (a, b) =>
+        severityRank(b.severity) - severityRank(a.severity) ||
+        gradeRank(b.grade) - gradeRank(a.grade) ||
+        a.claimId.localeCompare(b.claimId),
+    );
+  const shown = top.slice(0, 10);
+  if (shown.length > 0) {
+    lines.push('', 'Top claims (same severity/grade ordering as the full report):');
+    for (const c of shown) lines.push(`- [${c.severity}/${c.grade}/${c.status}] ${escInline(c.title)}`);
+    if (top.length > shown.length) {
+      lines.push(`- …and ${top.length - shown.length} more — see report.md`);
+    }
+  }
+  if (report.strengths !== undefined && report.strengths.length > 0) {
+    lines.push('', 'Strengths (see full report for benefits and preservation guidance):');
+    for (const s of report.strengths) {
+      lines.push(`- ${escInline(s.feature)} — reported by ${s.participantId}`);
+    }
+  }
+  // Limitations are never omitted from the summary — provenance-tagged like
+  // the full report so their origin stays honest in either artifact.
+  if (report.limitationSources !== undefined && report.limitationSources.length > 0) {
+    lines.push('', 'Limitations:');
+    for (const l of report.limitationSources) lines.push(`- [${l.origin}] ${escInline(l.text)}`);
+  } else if (report.limitations.length > 0) {
+    lines.push('', 'Limitations (pre-repair artifact — origin unattributed):');
+    for (const l of report.limitations) lines.push(`- ${escInline(l)}`);
   }
   lines.push('');
   return lines.join('\n');

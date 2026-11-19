@@ -346,6 +346,45 @@ export interface Finding {
   openQuestions?: string[];
 }
 
+/**
+ * Optional worker-asserted strength — a specific, useful thing that already
+ * exists. Bounded and praise-is-never-required: zero strengths is a fully
+ * valid file, and strengths are never routed for challenge, graded, or used
+ * to upgrade certainty. `evidence` follows the exact same kind/citation
+ * rules as Finding.evidence; a strength whose entire evidence list fails
+ * citation validation is dropped with a journaled rejection rather than
+ * admitted as bare praise.
+ */
+export interface Strength {
+  /** Worker-minted local id ("S-1" style), unique within the file. */
+  strengthId: string;
+  /** The specific existing feature/behavior that works. */
+  feature: string;
+  /** Concrete benefit to this seat's persona/role — never generic praise. */
+  benefit: string;
+  /** What must not be lost in future changes — preservation guidance. */
+  preserve: string;
+  /** Supporting evidence, same kinds/citation rules as Finding.evidence. */
+  evidence: Evidence[];
+}
+
+/**
+ * Fixed per-file strength cap — a constant, not a config key, so the
+ * approval binding stays byte-stable and the praise surface stays small
+ * beside prioritized criticism.
+ */
+export const MAX_STRENGTHS_PER_FILE = 3;
+
+/**
+ * Canonical strength on the ledger/report: the worker's record plus
+ * RUNNER-STAMPED provenance. Participants never stamp their own
+ * participant/perspective ids — the runner assigns them at admission.
+ */
+export interface CanonicalStrength extends Strength {
+  participantId: ParticipantId;
+  perspectiveId: PerspectiveId;
+}
+
 /** findings/<participantId>.json — independent-phase reviewer output. */
 export interface FindingsFile {
   schemaVersion: typeof SCHEMA_VERSION;
@@ -353,6 +392,8 @@ export interface FindingsFile {
   participantId: ParticipantId;
   perspectiveId: PerspectiveId;
   findings: Finding[]; // <= config.maxFindingsPerSeat
+  /** Optional bounded strengths — absent or [] are both valid. */
+  strengths?: Strength[]; // <= MAX_STRENGTHS_PER_FILE
   notes?: string;
 }
 
@@ -532,6 +573,38 @@ export interface DissentRecord {
    * reports — legacy records lack it.
    */
   evidence?: Evidence[];
+  /**
+   * The QUALIFIED challenge id (`ch-r<round>-<32hex>`) this dissent record
+   * was created by, letting a consumer join a position to its lifecycle
+   * without replaying claim history. Absent on merge-time rating-divergence
+   * dissent (which has no challenge) and on legacy records.
+   */
+  challengeId?: ChallengeId;
+}
+
+/**
+ * One admitted challenge's lifecycle on its claim — qualified identity only.
+ *
+ * `answered` records only that an admitted author response referenced this
+ * challenge — a fact, never a verdict. ANSWERED IS NOT RESOLVED: a 'defend'
+ * reply keeps the disagreement live, a 'revise'/'withdraw' adopts or moots
+ * it without proving either side right, and 'escalate' hands it to the
+ * orchestrator. No disposition erases the dissent record or upgrades
+ * certainty — votes and revisions never establish truth.
+ */
+export interface ClaimChallenge {
+  /** Globally unique qualified id assigned by the ledger before routing. */
+  challengeId: ChallengeId;
+  round: number;
+  challengerPid: ParticipantId;
+  kind: ChallengeKind;
+  /** True once an admitted author response referenced this challenge. */
+  answered: boolean;
+  /** Present once answered: which author responded and how. */
+  response?: {
+    participantId: ParticipantId;
+    disposition: ResponseDisposition;
+  };
 }
 
 /**
@@ -586,15 +659,80 @@ export interface Claim {
   assessments?: ClaimAssessment[];
   /** Source-finding titles that differ from the canonical title (deduped). */
   mergedTitles?: string[];
+  /**
+   * Admitted challenges filed against this claim, by qualified id, with
+   * answered/unanswered linkage — so retained dissent can be told apart
+   * from genuinely unanswered disputes without replaying history.
+   * Absent on ledgers built before discussion accounting existed.
+   */
+  challenges?: ClaimChallenge[];
+  /**
+   * The deterministic dedupe key (kind|normalized title) this claim was
+   * merged under — emitted so downstream consumers can correlate the same
+   * defect across reruns without reimplementing normalization.
+   */
+  dedupeKey?: string;
+  /**
+   * Count of evidence items (across findings/challenges/responses folded
+   * into this claim) that FAILED citation validation. Distinguishes
+   * 'unsupported because nothing was filed' from 'unsupported because
+   * citations were rejected' — provenance for triage, never a grade input.
+   */
+  rejectedEvidence?: number;
 }
 
-/** claims.json — the ledger artifact. */
+/** What happened to claims at challenge-routing time for one round. */
+export interface ChallengeRoutingRecord {
+  /** Claim ids placed into at least one built challenge envelope. */
+  routedClaimIds: ClaimId[];
+  /**
+   * Assigned claims dropped from every envelope by the byte cap — distinct
+   * from `unassigned`, which never got a challenger at all.
+   */
+  byteDroppedClaimIds: ClaimId[];
+  /** Claims never assigned: reason distinguishes no-eligible vs at-cap. */
+  unassigned: { claimId: ClaimId; reason: string }[];
+}
+
+/** What happened to challenges at response-routing time for one round. */
+export interface ResponseRoutingRecord {
+  /** Qualified challenge ids routed into at least one response envelope. */
+  routedChallengeIds: ChallengeId[];
+  /** Whole response assignments dropped by the byte cap (claim-level). */
+  byteDropped: { claimId: ClaimId; authorPid: ParticipantId }[];
+  /** Challenges dropped because the author was already at cap. */
+  capOmitted: { challengeId: ChallengeId; claimId: ClaimId; authorPid: ParticipantId }[];
+  /** Admitted challenges with no routable author. */
+  unroutable: { challengeId: ChallengeId; claimId: ClaimId; reason: string }[];
+}
+
+/** Per-round routing records — the durable home of routed-vs-never-routed. */
+export interface RoundRoutingRecord {
+  round: number;
+  challenges: ChallengeRoutingRecord;
+  /** Stamped when the round's response envelopes were built. */
+  responses?: ResponseRoutingRecord;
+}
+
+/**
+ * claims.json — the ledger artifact.
+ *
+ * `discussion` holds the runner-stamped routing records that let a report
+ * separate routed/examined claims from never-routed ones and byte-cap drops
+ * from plan-level unassigned — counts the journal alone could only
+ * approximate. `strengths` are canonical, runner-provenanced and never
+ * challenged or graded. Both optional: legacy ledgers lack them.
+ */
 export interface ClaimLedger {
   schemaVersion: typeof SCHEMA_VERSION;
   runId: CouncilRunId;
   claims: Claim[];
   /** claimId → participantIds who authored a source finding (dedupe key support). */
   provenance: Record<ClaimId, ParticipantId[]>;
+  /** Canonical strengths collected from admitted findings, runner-provenanced. */
+  strengths?: CanonicalStrength[];
+  /** Per-round routing records for discussion accounting. */
+  discussion?: { rounds: RoundRoutingRecord[] };
 }
 
 // ─── Scribe artifacts ────────────────────────────────────────────────────────
@@ -669,11 +807,55 @@ export interface RunnerFacts {
     total: number;
     /** status → count, only statuses actually present. */
     byStatus: Record<string, number>;
-    /** Claims carrying at least one dissent record. */
+    /**
+     * Claims carrying at least one dissent record — RETAINED dissent
+     * including answered challenges (an answer never erases the record).
+     */
     withDissent: ClaimId[];
+    /**
+     * Claims with at least one genuinely UNANSWERED admitted challenge —
+     * the honest open-dispute subset withDissent used to conflate. Optional:
+     * absent on runner-facts blocks computed before discussion accounting.
+     */
+    unansweredChallenges?: ClaimId[];
     withdrawn: number;
     escalated: number;
   };
+  /** Canonical strengths admitted this run (0 is valid — no praise quota). */
+  strengths?: number;
+  /**
+   * Per-round discussion accounting derived from the ledger's routing
+   * records: filed/answered/unanswered challenges plus the
+   * routed / routed-no-challenge / never-routed claim split. Absent when
+   * the ledger carries no routing records (legacy or pre-discussion report).
+   */
+  discussion?: DiscussionRoundFacts[];
+}
+
+/** Discussion accounting for one round — counts, never verdicts. */
+export interface DiscussionRoundFacts {
+  round: number;
+  /** Admitted challenges filed this round. */
+  challengesFiled: number;
+  /** Challenges that received an admitted author response. */
+  challengesAnswered: number;
+  /** Admitted challenges no response ever resolved. */
+  challengesUnanswered: number;
+  /** Claims placed into at least one challenge envelope. */
+  claimsRouted: number;
+  /** Routed claims no challenge was filed against (examined, declined). */
+  claimsRoutedNoChallenge: number;
+  /** Claims never routed: unassigned ∪ byte-dropped. */
+  claimsNeverRouted: number;
+  /** …of which: no eligible challenger (self-authored/at-cap plan-level). */
+  claimsUnassigned: number;
+  /** …of which: assigned but dropped by the envelope byte cap. */
+  claimsByteDropped: number;
+  /** Challenge→author response routing outcomes for the round. */
+  responsesRouted: number;
+  responsesByteDropped: number;
+  responsesCapOmitted: number;
+  responsesUnroutable: number;
 }
 
 /** A report limitation with its origin — runner-derived or scribe-authored. */
@@ -682,11 +864,25 @@ export interface LimitationSource {
   text: string;
 }
 
+/**
+ * What was reviewed — binds the exported report to the exact source it
+ * covers so citations keep meaning once the artifact leaves the run dir.
+ */
+export interface ReportProvenance {
+  snapshotId: SnapshotId;
+  /** Git HEAD at snapshot time, or null on non-git targets. */
+  gitHead: string | null;
+  targetRoot: string;
+  objective: string;
+}
+
 /** report.json — canonical runner-built report (narrative may be scribe-authored). */
 export interface CouncilReport {
   schemaVersion: typeof SCHEMA_VERSION;
   runId: CouncilRunId;
   generatedAt: string;
+  /** What was reviewed — absent on legacy reports. */
+  provenance?: ReportProvenance;
   summary: string;
   coverage: ReportCoverage;
   claims: Claim[];
@@ -696,6 +892,12 @@ export interface CouncilReport {
    * Absent on reports produced before this field existed (legacy loads).
    */
   runnerFacts?: RunnerFacts;
+  /**
+   * Canonical strengths admitted this run — concrete persona benefits with
+   * preservation guidance, rendered below prioritized criticism. Absent on
+   * legacy reports and never a substitute for findings.
+   */
+  strengths?: CanonicalStrength[];
   /**
    * Provenance-tagged limitations in emission order (runner first). When
    * present, renderers should prefer it over the flat `limitations` list so
@@ -849,6 +1051,7 @@ export type JournalEventType =
   | 'snapshot.drift'
   | 'claim.updated'
   | 'report.written'
+  | 'supervisor.retired'
   | 'error'
   | 'run.finished';
 
@@ -866,6 +1069,60 @@ export interface JournalEvent {
 }
 
 // ─── HostAdapter (implemented by src/host/orca.ts) ──────────────────────────
+
+/**
+ * Journal-before intent recorded BEFORE a terminal-create host call, so a
+ * pre-attach resource is visible to recovery even when the create's outcome
+ * or returned identity is lost. The intent id is the durable join key —
+ * derived from the launch requestKey, never carried on argv.
+ */
+export interface TerminalCreateIntent {
+  /** Durable local id derived from the launch requestKey — never on argv. */
+  intentId: string;
+  /** Optional link back to the participant the terminal will serve. */
+  participantId?: ParticipantId;
+  taskId: TaskId;
+  runId: OrcaRunId;
+  worktree: string;
+  title: string;
+  /** Exact validated --command text — forensic journal evidence. */
+  command: string;
+  /** Optional — the engine's journal ts is authoritative; adapter won't mint. */
+  createdAt?: string;
+}
+
+/**
+ * After-create custody record: the identity the host returned for a prior
+ * intent. `refused` is a definite no-effects answer; `uncertain` means the
+ * outcome cannot be resolved and NEVER authorizes a repeat create —
+ * ambiguity stays visible for reconciliation, it does not license another
+ * mutation.
+ */
+export interface TerminalCreateReceipt {
+  /** Matches the journaled TerminalCreateIntent. */
+  intentId: string;
+  taskId: TaskId;
+  outcome: 'created' | 'refused' | 'uncertain';
+  terminalHandle?: TerminalHandle;
+  /** Host envelope request/operation id — never a --retry-request value. */
+  requestId?: string;
+  detail?: string;
+  /** Optional — the engine's journal ts is authoritative; adapter won't mint. */
+  observedAt?: string;
+}
+
+/**
+ * Custody callbacks the engine supplies on WorkerLaunchSpec.custody and the
+ * adapter MUST invoke around every terminal create:
+ * `beforeTerminalCreate` persists the intent — a non-ok result aborts
+ * BEFORE any mutation; `afterTerminalCreate` records the returned
+ * identity/uncertainty — a non-ok result stops all further mutation with
+ * outcome 'uncertain' rather than losing custody of a live terminal.
+ */
+export interface TerminalCustodyHooks {
+  beforeTerminalCreate(intent: TerminalCreateIntent): Promise<Result<void>>;
+  afterTerminalCreate(receipt: TerminalCreateReceipt): Promise<Result<void>>;
+}
 
 /**
  * Boundary to the host execution environment (Orca on v1). Implementations use
@@ -895,6 +1152,12 @@ export interface WorkerLaunchSpec {
   retainTerminal: boolean;
   /** Reuse this retained terminal for the new Task instead of a new agent launch. */
   reuseTerminal?: TerminalHandle;
+  /**
+   * Terminal-create custody callbacks (see TerminalCustodyHooks). The
+   * adapter invokes them around any terminal create this launch performs —
+   * absent on legacy launches, which keep their prior behavior.
+   */
+  custody?: TerminalCustodyHooks;
 }
 
 export type LaunchOutcome = 'started' | 'failed' | 'unknown';
@@ -1205,10 +1468,44 @@ export interface EngineStatus {
     role: ParticipantRole;
     status: ParticipantStatus;
     activeAttempt: AttemptId | null;
+    /** Detail of the active attempt when one exists — additive, diagnostic. */
+    activeAttemptDetail?: {
+      attemptId: AttemptId;
+      phase: PhaseKind;
+      round: number | null;
+      status: AttemptStatus;
+      taskId: TaskId | null;
+      dispatchId: DispatchId | null;
+      terminalHandle: TerminalHandle | null;
+      requestId?: string;
+    };
   }[];
   consumption: { launches: number; mailSent: number };
   approvalHash: string | null;
   pendingDecisions: string[]; // e.g. "approve roster via: council approve --run <dir>"
+  /**
+   * Read-only timing facts for the current phase (evaluated at status call
+   * time — never fabricated liveness). Deadline fields absent when the phase
+   * has no configured bound.
+   */
+  phaseTiming?: {
+    enteredAt: string;
+    elapsedMs: number;
+    deadlineMs?: number;
+    graceMs?: number;
+    remainingMs?: number;
+  };
+  /** Whole-run timing facts from state.createdAt + deadlines.runMs. */
+  runTiming?: {
+    createdAt: string;
+    elapsedMs: number;
+    deadlineMs?: number;
+    remainingMs?: number;
+  };
+  /** Newest journal event as an activity marker — a fact, not a heartbeat. */
+  lastActivity?: { ts: string; seq: number; type?: JournalEventType };
+  /** Recorded supervisor identity echo, when bound. */
+  supervisor?: { terminalHandle: TerminalHandle; dispatchId: DispatchId | null } | null;
 }
 
 export interface Engine {
