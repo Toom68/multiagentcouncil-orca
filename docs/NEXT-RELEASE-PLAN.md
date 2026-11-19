@@ -29,7 +29,19 @@ to main. Development workers use only Devin swe-2-max with dangerous permissions
   Keep a documented manual recovery path and caller Run binding.
 - Status is a read-only diagnostic: include activity age, phase/deadline timing,
   supervisor health, exact actionable pending decisions and uncertainty. No timer
-  daemon, fabricated liveness or implicit host rebinding for status/verify.
+  daemon for status, fabricated liveness or implicit host rebinding for status/verify.
+- User amendment: wake the initiating orchestrator at every lifecycle stage,
+  approval/blocker/failure and completion, with concrete counts and next action.
+  Long stages also need bounded progress wakes (default two minutes), so silence
+  is never presented as evidence of health. Persist the intended recipient before
+  supervisor binding changes. Use documented Orca mail; never consume mail or
+  rebind the primary to the child Run. Deduplicate stage messages durably and
+  retain uncertain delivery receipts without blind retries. A run-local bounded
+  timer helper is approved solely for these progress wakes: argv-based, no agents,
+  no new scheduled provider jobs, no worker/status host polling, finite lifetime
+  and message budget, singleton lease, and clean exit on terminal council state.
+  A dead helper/host must be visible, not advertised as guaranteed delivery.
+  The bundled skill instructs the awakened primary to relay concise user updates.
 - Add optional, bounded Strength records: perspective/participant provenance,
   specific feature, benefit to that role, supporting evidence, and what to
   preserve. Absence is valid; no praise quota or invented criticism to attach it
@@ -77,6 +89,10 @@ another lane's files. Interfaces are coordinated through Orca mail before use.
    skills/council/references/*; examples/* (new only if useful).
    Structured strengths, honest independence/authority wording, real templates,
    explicit paused/status/recovery guidance and no unearned verification claims.
+7. **progress**: src/progress.ts (new); test/progress.test.ts (new).
+   Run-local progress outbox, deduplicated stage and periodic wake helper,
+   bounded lifetime/lease/receipts. Publish exact APIs to engine and operator;
+   they own their integration points. No direct engine/CLI/contracts edits.
 
 Ledger-report owns all shared contracts and validation exports; the engine,
 operator, adapter and artifact lanes request additive interfaces by mail early.
