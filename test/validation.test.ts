@@ -16,9 +16,11 @@ import {
   parseJournalEvent,
   parseProposedRoster,
   parseReportFile,
+  parseResponseEnvelope,
   parseResponsesFile,
   parseScribeNotesFile,
   parseSourceSnapshot,
+  parseSynthesisFile,
   resolveConfig,
 } from '../src/validation.js';
 import type {
@@ -639,4 +641,199 @@ test('approval hash covers staff/execution/profile when present (approval-bound)
   const seatProfile = mkBinding();
   seatProfile.seats[0]!.agent.profile = 'work';
   assert.notEqual(canonicalApprovalHash(seatProfile), h);
+});
+
+// ─── narrative synthesis contract (SynthesisFile) ────────────────────────────
+
+test('parseSynthesisFile accepts narrative-only scribe output within caps', () => {
+  const r = parseSynthesisFile(
+    {
+      schemaVersion: 1, runId: RUN, participantId: 'scribe0',
+      generatedAt: '2026-11-18T00:00:00Z',
+      summary: 'three seats missed; two claims disputed',
+      limitations: ['seat rev3 timed out', 'no repro run'],
+    },
+    { runId: RUN, participantId: 'scribe0' },
+  );
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.summary, 'three seats missed; two claims disputed');
+  assert.deepEqual(r.value.limitations, ['seat rev3 timed out', 'no repro run']);
+});
+
+test('parseSynthesisFile enforces identity, caps and narrative-only shape', () => {
+  const good = {
+    schemaVersion: 1, runId: RUN, participantId: 'scribe0',
+    summary: 's', limitations: [],
+  };
+  assert.ok(hasCode(parseSynthesisFile({ ...good, runId: 'crun_other' }, { runId: RUN }), 'mismatch'));
+  assert.ok(hasCode(parseSynthesisFile({ ...good, participantId: 'other' }, { participantId: 'scribe0' }), 'mismatch'));
+  assert.ok(hasCode(
+    parseSynthesisFile({ ...good, summary: 'x'.repeat(8001) }, {}),
+    'too_long',
+  ));
+  const tooMany = Array.from({ length: 21 }, (_, i) => `lim ${i}`);
+  assert.ok(hasCode(
+    parseSynthesisFile({ ...good, limitations: tooMany }, {}),
+    'too_many',
+  ));
+  // A legacy FULL report (has coverage/claims, no participantId) cannot pass
+  // as narrative — callers fall back to parseReportFile for those.
+  const legacyReport = {
+    schemaVersion: 1, runId: RUN, generatedAt: '2026-11-18T00:00:00Z',
+    summary: 'done',
+    coverage: {
+      requestedPerspectives: 10, proposedPerspectives: 10, selectedSeats: 1, partial: false,
+      seats: [], uncoveredPerspectiveIds: [],
+    },
+    claims: [], limitations: ['l'],
+  };
+  assert.ok(!parseSynthesisFile(legacyReport, { runId: RUN }).ok, 'full report must fail the narrative parser');
+  assert.ok(parseReportFile(legacyReport, { runId: RUN }).ok, '…but still parses as a legacy report');
+});
+
+test('parseChallengesFile: counterexample requires evidence; other kinds do not', () => {
+  const mk = (kind: string, evidence: unknown[]) => ({
+    schemaVersion: 1, runId: RUN, round: 1, participantId: 'rev1',
+    challenges: [{ challengeId: 'C-1', claimId: 'c1', kind, argument: 'arg', evidence }],
+  });
+  // counterexample with no evidence is a rejection — the claim is unfounded.
+  assert.ok(hasCode(
+    parseChallengesFile(mk('counterexample', []), {}),
+    'required',
+  ));
+  const withEv = parseChallengesFile(mk('counterexample', [ev('reasoned')]), {});
+  assert.ok(withEv.ok, issues(withEv));
+  // missing_evidence legitimately carries none — never force fabrication.
+  assert.ok(parseChallengesFile(mk('missing_evidence', []), {}).ok);
+});
+
+test('parseChallengeEnvelope carries runner-stamped provenance and omittedCount', () => {
+  const env = {
+    schemaVersion: 1, runId: RUN, phase: 'author_response', round: 1, recipientId: 'rev1',
+    omittedCount: 2,
+    assignments: [{
+      claimId: 'c1', findingId: 'f1',
+      claim: { claimId: 'c1', title: 't', kind: 'defect', severity: 'high', evidence: [ev('reasoned')], counterEvidence: [] },
+      challenges: [{
+        challengeId: 'ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        claimId: 'c1', kind: 'other', argument: 'why', evidence: [],
+        localChallengeId: 'C-1', challengerPid: 'rev2',
+      }],
+    }],
+    outputPath: 'rounds/1/responses/rev1.json', outputContract: 'ResponsesFile',
+  };
+  const r = parseResponseEnvelope(env, { runId: RUN, round: 1 });
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.omittedCount, 2);
+  const ch = r.value.assignments[0]!.challenges[0]!;
+  assert.equal(ch.localChallengeId, 'C-1');
+  assert.equal(ch.challengerPid, 'rev2');
+});
+
+test('parseResponseEnvelope: malformed omittedCount is a parse issue', () => {
+  const env = {
+    schemaVersion: 1, runId: RUN, phase: 'author_response', round: 1, recipientId: 'rev1',
+    omittedCount: -3, assignments: [],
+    outputPath: 'rounds/1/responses/rev1.json', outputContract: 'ResponsesFile',
+  };
+  assert.ok(hasCode(parseResponseEnvelope(env, {}), 'too_small'));
+});
+
+// ─── canonical claim retention fields (via report.json parse) ────────────────
+
+function mkReportWithClaims(claims: unknown[], extra: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 1, runId: RUN, generatedAt: '2026-11-18T00:00:00Z', summary: 'done',
+    coverage: {
+      requestedPerspectives: 10, proposedPerspectives: 10, selectedSeats: 1, partial: false,
+      seats: [{
+        participantId: 'rev0', perspectiveId: 'p0', seatId: 's0', outcome: 'completed',
+        phasesCompleted: ['independent_review'],
+      }],
+      uncoveredPerspectiveIds: [],
+    },
+    claims,
+    limitations: [],
+    ...extra,
+  };
+}
+
+test('parseReportFile retains claim remedies/openQuestions/assessments/mergedTitles', () => {
+  const claim = {
+    claimId: 'clm_0001', title: 't', kind: 'defect', grade: 'plausible_risk',
+    status: 'revised', severity: 'high', confidence: 0.8,
+    evidence: [ev('reasoned')], counterEvidence: [],
+    sourceFindings: [{ participantId: 'rev0', findingId: 'f1' }],
+    history: [], dissent: [],
+    remedies: ['add timeout'],
+    openQuestions: ['which SLO?'],
+    mergedTitles: ['alt title'],
+    assessments: [{ participantId: 'rev0', findingId: 'f1', severity: 'high', confidence: 0.8 }],
+  };
+  const r = parseReportFile(mkReportWithClaims([claim]), { runId: RUN });
+  assert.ok(r.ok, issues(r));
+  const c = r.value.claims[0]!;
+  assert.deepEqual(c.remedies, ['add timeout']);
+  assert.deepEqual(c.openQuestions, ['which SLO?']);
+  assert.deepEqual(c.mergedTitles, ['alt title']);
+  assert.equal(c.assessments?.length, 1);
+  assert.equal(c.assessments![0]!.severity, 'high');
+});
+
+test('parseReportFile retains validated dissent evidence; legacy dissent still parses', () => {
+  const claim = {
+    claimId: 'clm_0001', title: 't', kind: 'defect', grade: 'plausible_risk',
+    status: 'challenged', severity: 'high', confidence: 0.8,
+    evidence: [ev('reasoned')], counterEvidence: [],
+    sourceFindings: [{ participantId: 'rev0', findingId: 'f1' }],
+    history: [],
+    dissent: [
+      { participantId: 'rev1', round: 1, position: 'no evidence', ts: '2026-11-18T00:00:00Z', evidence: [ev('reasoned', { note: 'counter' })] },
+      { participantId: 'rev2', round: null, position: 'old-style dissent', ts: '2026-11-18T00:00:00Z' },
+    ],
+  };
+  const r = parseReportFile(mkReportWithClaims([claim]), { runId: RUN });
+  assert.ok(r.ok, issues(r));
+  const c = r.value.claims[0]!;
+  assert.equal(c.dissent[0]!.evidence?.length, 1, 'dissent evidence retained');
+  assert.equal(c.dissent[1]!.evidence, undefined, 'legacy record without evidence parses');
+});
+
+test('parseReportFile round-trips runnerFacts and limitationSources', () => {
+  const extra = {
+    runnerFacts: {
+      seatsCompleted: 2, seatsSelected: 3, partialCoverage: true,
+      uncoveredPerspectiveIds: ['p3'], summarySource: 'runner',
+      claims: {
+        total: 2, byStatus: { defended: 1, challenged: 1 },
+        withDissent: ['clm_0002'], withdrawn: 0, escalated: 1,
+      },
+    },
+    limitationSources: [
+      { origin: 'runner', text: 'seat rev3 timed out' },
+      { origin: 'scribe', text: 'reproduction not attempted' },
+    ],
+  };
+  const claim = {
+    claimId: 'clm_0002', title: 't', kind: 'defect', grade: 'plausible_risk',
+    status: 'challenged', severity: 'medium', confidence: 0.5,
+    evidence: [ev('reasoned')], counterEvidence: [],
+    sourceFindings: [{ participantId: 'rev0', findingId: 'f1' }],
+    history: [], dissent: [],
+  };
+  const r = parseReportFile(mkReportWithClaims([claim], extra), { runId: RUN });
+  assert.ok(r.ok, issues(r));
+  const rf = r.value.runnerFacts!;
+  assert.equal(rf.seatsCompleted, 2);
+  assert.equal(rf.partialCoverage, true);
+  assert.equal(rf.summarySource, 'runner');
+  assert.equal(rf.claims.escalated, 1);
+  assert.deepEqual(rf.claims.withDissent, ['clm_0002']);
+  assert.deepEqual(
+    r.value.limitationSources!.map((l) => l.origin),
+    ['runner', 'scribe'],
+  );
+  // Malformed fact block fails parse, never silently accepted.
+  const bad = mkReportWithClaims([claim], { runnerFacts: { seatsCompleted: 'two' } });
+  assert.ok(!parseReportFile(bad, { runId: RUN }).ok);
 });

@@ -1824,11 +1824,11 @@ export class OrcaAdapter implements HostAdapter {
    * took effect. States per request-show --help: completed | pending |
    * absent. 'absent' is NOT proof the request never landed (pruning).
    */
-  async requestShow(requestId: string): Promise<
+  async requestShow(input: { requestId: string }): Promise<
     Result<{ state: 'completed' | 'pending' | 'absent' | 'unknown'; raw: unknown }>
   > {
     try {
-      const res = await this.host.showRequest(requestId);
+      const res = await this.host.showRequest(input.requestId);
       if (!res.ok) {
         return failure(adapterErr(res.error.code, res.error.message, { data: res.error.data }));
       }

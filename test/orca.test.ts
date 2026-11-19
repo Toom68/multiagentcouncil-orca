@@ -796,10 +796,10 @@ describe('OrcaAdapter mutation recovery', () => {
           ? okEnv({ requestId: 'req-done', state: 'completed' })
           : failEnv('unexpected'),
     );
-    const a = await adapter.requestShow('req-abs');
+    const a = await adapter.requestShow({ requestId: 'req-abs' });
     assert.ok(a.ok);
     if (a.ok) assert.equal(a.value.state, 'absent');
-    const c = await adapter.requestShow('req-done');
+    const c = await adapter.requestShow({ requestId: 'req-done' });
     assert.ok(c.ok);
     if (c.ok) assert.equal(c.value.state, 'completed');
   });

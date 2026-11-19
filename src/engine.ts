@@ -1557,9 +1557,16 @@ export function createEngine(deps: EngineDeps): Engine {
     if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
 
     const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    let snapshot = ctx.snapshot;
+    if (snapshot === undefined) {
+      const snapR = await store.readSnapshot();
+      if (!snapR.ok) return { kind: 'error', error: snapR.error };
+      snapshot = snapR.value;
+    }
     const applied = applyChallengesToLedger(
       ledger,
       admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      sourceAccess(state, snapshot),
       ctx.now,
     );
     const w = await writeLedger(ctx, ledger);
