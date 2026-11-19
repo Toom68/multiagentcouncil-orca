@@ -36,3 +36,10 @@ For each worker, review its diff and evidence, run meaningful focused tests, com
 - Independent recovery audit reproduced state-save crash gaps beyond the first green suite. Follow-up repaired them; original probes re-run independently passed RA-001 through RA-009. These are fake-host fault checks, not live Orca integration.
 - Checkpoint backup pushed on `checkpoints/council-repairs-20261119` while the recovery audit fixes were in progress. It is not the final integration branch.
 - Documentation integration records the actual schemas, quorum policy and recovery boundaries. Bounded live validation follows these commits. Reviewed-source drift remains an immutable-snapshot/new-run decision; no automatic truth/consensus closure or timer daemon is introduced.
+
+
+Live follow-up: the 15-seat fixture council was interrupted by an Orca restart.
+Manual coordination resumed the same child Run and approval; eight admitted
+reviews survived, five lost workers remained failed, and the two unstarted seats
+were launched. Completion and discussion acceptance remain pending. The runtime
+repair commits are now also on `main` (through `03210ca`).

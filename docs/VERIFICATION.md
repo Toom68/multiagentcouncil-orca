@@ -376,3 +376,31 @@ run-creation probe now issued zero createRun calls, restored the journaled run
 identity, and the lost corrective-attempt probe issued exactly one repair launch.
 The corrupted-journal probe returned journal_corrupt with zero host mutations.
 These probes use fake hosts and do not establish live Orca behavior.
+
+
+## Live validation restart observation (2026-11-19)
+
+The repaired runtime started a real Orca council against the Fieldnotes fixture:
+`crun_01M7RZE6YCB77MYHWX17YVH9PQ`, 15 selected Devin SWE-2 Max reviewers,
+concurrency 5, one discussion round, two findings and one challenge/response per
+seat, maxLaunches 100, quorumRatio 1. The primary reviewed and persisted the exact
+roster approval before reviewers launched. This smaller per-seat output budget
+bounds the live acceptance workload; it is not a full default-budget load test.
+
+An Orca restart destroyed the supervisor terminal and five unfinished reviewer
+terminals. Orca reported their dispatches abandoned/failed; they were not silently
+re-launched. The primary resumed coordination of the existing child Run through
+Orca's documented run-use command and advanced manually. The engine reconciled
+the five failed reviewers, retained eight admitted independent findings files,
+and launched the two previously unstarted seats. The recorded launch count is
+16 (organiser plus 15 independent reviewer attempts). The recorded supervisor
+identity remains historical; no replacement identity or approval was forged.
+
+`council verify` after restart reported no fixture drift, the exact approval
+binding intact and matching current artifacts, and the catalog fingerprint intact.
+Thus the restart preserved admitted artifacts and approval while exposing lost
+coverage honestly. At this observation the run is still in independent_review;
+discussion routing and applied author responses are not yet established by this
+live attempt. Because five selected seats failed, a later report must remain
+partial. Automated 501-test and fake-host re-audit results remain separate from
+this live evidence.
