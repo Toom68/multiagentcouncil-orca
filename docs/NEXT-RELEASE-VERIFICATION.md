@@ -1,8 +1,8 @@
-# Next release verification — in progress
+# Next release verification
 
-This records integrated stages of NEXT-RELEASE-PLAN.md. Worker completion is
-not release completion; remaining runtime changes require integration, fault
-checks and bounded live verification before their documentation is published.
+This records integrated stages of NEXT-RELEASE-PLAN.md. Automated checks are
+labelled separately from the bounded live Orca run. The local raw logs and run
+artifacts are ignored by Git; this document retains the reviewable results.
 
 ## Stage 1: charter provenance and independence
 
@@ -74,7 +74,84 @@ and **31 task rows**. This verifies listing compatibility; it launches no worker
 and is not a new live council. Exact tested bytes, probe adaptations and logs
 remain in the ignored local verification directory.
 
-Engine/CLI custody callback integration and progress recovery continue in the
-next stage. The frozen pre-progress-fix integration snapshot passed 693 tests;
-independent probes still found notification recovery gaps, which are being
-fixed before release verification and the bounded live run.
+The frozen pre-progress-fix integration snapshot passed 693 tests. Independent
+probes found notification recovery gaps in that snapshot; stage 4 records the
+corrected implementation and its verification.
+
+## Stage 4: integrated recovery and progress
+
+The integrated release adds journal-authoritative exact-byte artifact receipts,
+typed artifact rereads, guarded supervisor replacement, issued-stage startup
+custody, journal-bound read-only verification, and idempotent participant and
+attempt recovery. It carries optional evidence-cited strengths, dissent and
+challenge history, disjoint routing limits, source provenance, and markdown
+safe for untrusted reviewer text. Progress uses a persisted primary recipient,
+durable outbox intents, stage wakes and a two-minute helper heartbeat. Outbox
+corruption and uncertain delivery fail closed; silence is never treated as
+proof that a worker died.
+
+The primary froze all 21 remaining changed files against `24bf3b5` and ran the
+full suite on that exact snapshot: **732 passed, 0 failed, 0 skipped**. The
+supervisor recovery probe passed **45/45** after updating one assertion from
+the old generic error wording to the new `launch_unknown` refusal. The
+read-only status/verify probe passed **31/31**, including the fixed
+mid-journal corruption refusal. Independent recovery audits covered 211 checks
+on the completed core snapshot; only the CLI closeout changed afterward, so
+the primary reran the affected CLI probes and retained the earlier core checks
+with their source hashes. The primary also repeated 48 notification/helper
+probes against the corrected core snapshot and exercised corrupt/deleted
+outbox and directory-fsync failures without resending uncertain mail.
+
+Commit `b93a9b2` contains the integrated snapshot and was pushed to main. A
+live-run observation found two progress-display defects: a helper diagnostics
+record with `exitReason: null` was labelled exited despite its live PID, and
+the fresh organiser stage suggested re-approval before any approval existed.
+Commit `4370a1d` fixes both. TypeScript compiled cleanly and all **50/50**
+focused progress checks passed, including regressions for those cases. The
+active live run kept the prior built code; the following end-to-end evidence
+is therefore for the `b93a9b2` runtime. After the live run, the primary rebuilt
+and reran the full suite on `4370a1d`: **732 passed, 0 failed, 0 skipped**.
+
+## Stage 5: bounded live Orca council
+
+The primary ran `crun_01M7SV2AXNJECSFBXG8VG7VES9` against a disposable,
+fictional 12-file Node library fixture, not this repository. The target was
+reviewed read-only. Its configuration requested ten organiser perspectives,
+selected four distinct Devin `swe-2-max` seats, limited concurrency to two,
+used two discussion rounds, and capped launches at 50. Explicit roster
+approval was persisted before any reviewer launched. The organiser, four
+reviewers, scribe notes, both challenge/response rounds, and scribe synthesis
+all completed with **19/50 launches**, **4/4 seats settled**, no failed seats,
+and a `reported`/`succeeded` terminal outcome.
+
+The report has **12 admitted claims**, **nine live and three withdrawn**,
+**seven filed and answered challenges**, **six claims retaining dissent**, and
+**nine optional, evidence-cited strengths**. These strengths are reviewer
+authored preservation guidance, not verified endorsements or a praise quota.
+All claims retain the runner's `plausible_risk` grade ceiling; the report does
+not claim council agreement proves truth. The scribe identified access,
+pagination and export defects, retained duplicate live claims and severity
+disagreement, and recorded an embedded reviewer-directed audit letter as
+untrusted input. One evidence item was rejected on a citation-range mismatch;
+the limitation is visible in the summary and journal. Six proposed
+perspectives were not selected, so coverage is explicitly limited to four.
+
+The primary received **31/31 sent progress deliveries**: ten distinct stage
+milestones from initialization through synthesis, one approval notice, one
+finished notice, and 19 two-minute helper heartbeats. The initial approval
+mail to the bound council child Run had an `unknown` delivery result. After
+the supervisor stayed idle with no reviewer launch, the primary checked its
+recorded live Dispatch and sent the documented one-time fallback wake; the
+supervisor then launched reviewers. This demonstrates recovery but does not
+claim that the uncertain automatic mail was delivered. The supervisor later
+sent a `worker_done` receipt naming the generated reports.
+
+Read-only `council verify` after completion returned `verified:true`, an intact
+approval binding and pinned snapshot, `journalBinding:bound`, and **54/54
+journal-tracked artifact receipts clean** with no changed or missing tracked
+bytes. Seven operational files (progress and supervisor metadata) were
+reported as untracked warnings, as designed. The live run did not exercise
+fifteen seats, multiple providers, coherent same-UID journal forgery, or an OS
+sandbox guarantee. Its reviewer reproductions were performed by agents and
+reported by the scribe; this verification checks the council flow and custody,
+not independent truth of each fixture finding.
