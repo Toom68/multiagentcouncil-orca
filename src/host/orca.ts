@@ -1186,6 +1186,66 @@ export class OrcaHost {
     ], { mutation: true });
   }
 
+  /**
+   * Read-only task ledger for one Run (`orchestration task-list --run --full`).
+   * The receipt must expose an explicit row array; malformed receipts surface
+   * as an error rather than a fake "empty" that could unlock a duplicate
+   * task-create.
+   */
+  async listTasks(runId: string): Promise<OrcaCommandResult<{ tasks: Record<string, unknown>[] }>> {
+    const res = await this.run<{ tasks?: unknown; items?: unknown }>([
+      'orchestration',
+      'task-list',
+      '--run',
+      assertSafeValue('runId', runId),
+      '--full',
+      '--json',
+    ]);
+    if (!res.ok) return res;
+    const raw = res.value;
+    const list = raw?.tasks ?? raw?.items ?? (Array.isArray(raw) ? raw : undefined);
+    if (!Array.isArray(list)) {
+      return {
+        ok: false,
+        error: {
+          code: 'malformed_task_list',
+          message: `task-list for Run ${runId} returned no task array — refusing to treat the read as reliable`,
+          data: raw,
+        },
+        uncertain: false,
+        exitCode: res.exitCode,
+        timedOut: false,
+      };
+    }
+    for (const row of list) {
+      const identifiable =
+        typeof row === 'object' &&
+        row !== null &&
+        [row.id, row.taskId, row.specFile, row.spec_file, row.specPath, row.spec_path, row.spec, row.title, row.taskTitle, row.task].some(
+          (v) => v !== undefined && v !== null,
+        );
+      if (!identifiable) {
+        return {
+          ok: false,
+          error: {
+            code: 'incomplete_task_list',
+            message: `task-list for Run ${runId} contains a row with no task id or spec fields — refusing to treat the read as reliable`,
+            data: row,
+          },
+          uncertain: false,
+          exitCode: res.exitCode,
+          timedOut: false,
+        };
+      }
+    }
+    return {
+      ok: true,
+      value: { tasks: list as Record<string, unknown>[] },
+      exitCode: res.exitCode,
+      truncated: res.truncated,
+    };
+  }
+
   /** Read-only reconciliation for a mutation whose response was lost. */
   async showRequest(requestId: string): Promise<OrcaCommandResult<Record<string, unknown>>> {
     return this.run([
@@ -1456,6 +1516,22 @@ function adapterErr(
   return { code: 'adapter_error', message, details: { adapterCode, ...details } };
 }
 
+/**
+ * Map a low-level Orca failure to a CouncilError preserving ALL custody
+ * evidence: `uncertain` (the mutation may have landed — never a definitive
+ * refusal), `requestId` (the reconcile/request-show key), and the raw data.
+ * Dropping requestId makes `council reconcile` unreachable for the caller.
+ */
+function orcaFailure<T>(res: OrcaCommandFailure): Result<T> {
+  return failure(
+    adapterErr(res.error.code, res.error.message, {
+      uncertain: res.uncertain,
+      ...(res.requestId !== undefined ? { requestId: res.requestId } : {}),
+      ...(res.error.data !== undefined ? { data: res.error.data } : {}),
+    }),
+  );
+}
+
 function unsupportedErr(message: string, details?: Record<string, unknown>): CouncilError {
   return { code: 'unsupported', message, details };
 }
@@ -1505,7 +1581,7 @@ export class OrcaAdapter implements HostAdapter {
     }
   }
 
-  async createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId }>> {
+  async createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId; requestId?: string }>> {
     try {
       if (input.objective.trim().length === 0) {
         return failure(adapterErr('bad_objective', 'objective must be non-empty'));
@@ -1516,16 +1592,15 @@ export class OrcaAdapter implements HostAdapter {
         runObjectiveLabel(input.objective),
         requestKey('run', input.objective),
       );
-      if (!res.ok) {
-        return failure(
-          adapterErr(res.error.code, res.error.message, {
-            uncertain: res.uncertain,
-            data: res.error.data,
-          }),
-        );
-      }
+      if (!res.ok) return orcaFailure(res);
       this.boundRunId = res.value.runId;
-      return { ok: true, value: { runId: res.value.runId } };
+      return {
+        ok: true,
+        value: {
+          runId: res.value.runId,
+          ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+        },
+      };
     } catch (e) {
       return failure(tokenErr(e));
     }
@@ -1536,7 +1611,7 @@ export class OrcaAdapter implements HostAdapter {
     specFilePath: string;
     title: string;
     deps?: TaskId[];
-  }): Promise<Result<{ taskId: TaskId }>> {
+  }): Promise<Result<{ taskId: TaskId; requestId?: string }>> {
     try {
       const res = await this.host.createTask({
         runId: input.runId,
@@ -1545,15 +1620,43 @@ export class OrcaAdapter implements HostAdapter {
         deps: input.deps,
         requestKey: requestKey('task', input.runId, input.specFilePath, input.title),
       });
-      if (!res.ok) {
-        return failure(
-          adapterErr(res.error.code, res.error.message, {
-            uncertain: res.uncertain,
-            data: res.error.data,
-          }),
-        );
-      }
-      return { ok: true, value: { taskId: res.value.taskId } };
+      if (!res.ok) return orcaFailure(res);
+      return {
+        ok: true,
+        value: {
+          taskId: res.value.taskId,
+          ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+        },
+      };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  /**
+   * Read-only reconciliation surfaces (optional HostAdapter capability):
+   * the engine observes landed task/dispatch records after a crash so a
+   * persisted launch intent is never retried blind. Pure reads, never mail.
+   */
+  async listTasks(input: {
+    runId: OrcaRunId;
+  }): Promise<Result<{ tasks: Record<string, unknown>[] }>> {
+    try {
+      const res = await this.host.listTasks(input.runId);
+      if (!res.ok) return orcaFailure(res);
+      return { ok: true, value: { tasks: res.value.tasks } };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  async listWorkers(input: {
+    runId: OrcaRunId;
+  }): Promise<Result<{ workers: WorkerListRow[] }>> {
+    try {
+      const res = await this.host.listWorkers(input.runId);
+      if (!res.ok) return orcaFailure(res);
+      return { ok: true, value: { workers: res.value.workers } };
     } catch (e) {
       return failure(tokenErr(e));
     }
@@ -1671,9 +1774,7 @@ export class OrcaAdapter implements HostAdapter {
             },
           };
         }
-        return failure(
-          adapterErr(res.error.code, res.error.message, { data: res.error.data }),
-        );
+        return orcaFailure(res);
       }
       const rec = res.value ?? {};
       const obs: WorkerObservation = {
@@ -1750,9 +1851,7 @@ export class OrcaAdapter implements HostAdapter {
             },
           };
         }
-        return failure(
-          adapterErr(res.error.code, res.error.message, { data: res.error.data }),
-        );
+        return orcaFailure(res);
       }
       const messageId = firstString(
         res.value?.messageId,
@@ -1803,11 +1902,7 @@ export class OrcaAdapter implements HostAdapter {
         input.dispatchId,
         requestKey('release', input.dispatchId),
       );
-      if (!res.ok) {
-        return failure(
-          adapterErr(res.error.code, res.error.message, { uncertain: res.uncertain }),
-        );
-      }
+      if (!res.ok) return orcaFailure(res);
       // ok:true is not release proof — observed 1.4.261: worker-release can
       // return state 'retained' (reason 'user_requested') with nothing
       // released. Only an explicit released marker may claim released; a
@@ -1829,9 +1924,7 @@ export class OrcaAdapter implements HostAdapter {
   > {
     try {
       const res = await this.host.showRequest(input.requestId);
-      if (!res.ok) {
-        return failure(adapterErr(res.error.code, res.error.message, { data: res.error.data }));
-      }
+      if (!res.ok) return orcaFailure(res);
       const rec = (res.value ?? {}) as Record<string, unknown>;
       const state = typeof rec.state === 'string' ? rec.state : 'unknown';
       const normalized =

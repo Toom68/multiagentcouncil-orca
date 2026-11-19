@@ -37,7 +37,7 @@ import type {
 } from '../src/contracts.js';
 import { SCHEMA_VERSION } from '../src/contracts.js';
 import { captureSnapshot } from '../src/snapshot.js';
-import { createStore, STORE_PATHS, type Store } from '../src/store.js';
+import { createStore, STORE_PATHS, writeFully, type Store } from '../src/store.js';
 import {
   canonicalApprovalHash,
   canonicalRosterHash,
@@ -330,6 +330,30 @@ test('journal appends are sequential and hash-linked', async () => {
   const all = await store.readJournal();
   assert.ok(all.ok);
   assert.equal(all.value.length, 3);
+});
+
+test('writeFully completes short writes and fails on a stalled handle', async () => {
+  // A single write() syscall may accept only part of the buffer — the journal
+  // append must loop until the whole block is out, or the hash-chained tail
+  // silently truncates and every later event fails the chain.
+  const sink: number[] = [];
+  const partialFh = {
+    calls: 0,
+    async write(buf: Buffer, offset = 0) {
+      this.calls += 1;
+      const n = Math.min(7, buf.length - offset); // always accept at most 7 bytes
+      for (let i = 0; i < n; i++) sink.push(buf[offset + i]);
+      return { bytesWritten: n };
+    },
+  };
+  const buf = Buffer.from('x'.repeat(100), 'utf8');
+  await writeFully(partialFh, buf);
+  assert.equal(sink.length, 100, 'every byte landed despite short writes');
+  assert.ok(partialFh.calls > 1, 'the loop actually iterated');
+  assert.deepEqual(Buffer.from(sink).toString('utf8'), 'x'.repeat(100), 'byte order preserved');
+
+  const stalled = { async write() { return { bytesWritten: 0 }; } };
+  await assert.rejects(writeFully(stalled, buf), /stalled/, 'a zero-byte write must fail, not spin');
 });
 
 test('concurrent appends across store instances lose no events', async () => {

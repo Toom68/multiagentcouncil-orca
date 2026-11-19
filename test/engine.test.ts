@@ -34,7 +34,9 @@ import {
   type SourceSnapshot,
   type StopOutcome,
   type Store,
+  type TaskListRow,
   type WorkerLaunchSpec,
+  type WorkerListRow,
   type WorkerObservation,
   type ApprovalBinding,
   type ApprovalRecord,
@@ -93,6 +95,15 @@ function makeSnapshot(liveSource: Record<string, string>, targetRoot: string): S
 
 class FakeStore implements Store {
   readonly runDir: string;
+  /** Fault injection: error returned once / persistently on the next op. */
+  failNextAppend: CouncilError | null = null;
+  appendError: CouncilError | null = null;
+  failNextSaveState: CouncilError | null = null;
+  saveError: CouncilError | null = null;
+  /** RA-005 probe: journal unreadable (corrupt/torn) — engine must fail closed. */
+  journalError: CouncilError | null = null;
+  /** Ordering probe: [journal-append, state-save] sequence actually taken. */
+  order: string[] = [];
   constructor(public db: FakeDb) {
     this.runDir = db.runDir;
   }
@@ -103,6 +114,13 @@ class FakeStore implements Store {
     return ok(structuredClone(this.db.state));
   }
   async saveState(state: CouncilState) {
+    this.order.push('state');
+    if (this.failNextSaveState !== null) {
+      const e = this.failNextSaveState;
+      this.failNextSaveState = null;
+      return failRes(e);
+    }
+    if (this.saveError !== null) return failRes(this.saveError);
     this.db.state = structuredClone(state);
     return ok(undefined);
   }
@@ -126,11 +144,19 @@ class FakeStore implements Store {
     return ok([...this.db.artifacts.keys()].filter((k) => k.startsWith(prefix)).sort());
   }
   async appendJournal(events: Omit<JournalEvent, 'seq'>[]) {
+    this.order.push('journal');
+    if (this.failNextAppend !== null) {
+      const e = this.failNextAppend;
+      this.failNextAppend = null;
+      return failRes(e);
+    }
+    if (this.appendError !== null) return failRes(this.appendError);
     const out = events.map((e, i) => ({ ...e, seq: this.db.journal.length + i + 1 }));
     this.db.journal.push(...out);
     return ok(out);
   }
   async readJournal() {
+    if (this.journalError !== null) return failRes(this.journalError);
     return ok([...this.db.journal]);
   }
   async writeProposedRoster(roster: ProposedRoster) {
@@ -188,29 +214,53 @@ class FakeHost implements HostAdapter {
   seq = 0;
   createRunCalls = 0;
   createTaskCalls = 0;
+  launchCalls = 0;
   launches: LaunchRecord[] = [];
   liveness = new Map<string, { liveness: WorkerObservation['liveness']; taskStatus?: string }>();
   notifications: { to: string; subject: string; body: string }[] = [];
   stops: { dispatchId: string; outcome: StopOutcome }[] = [];
   released: string[] = [];
+  /**
+   * Host-visible records — what the documented read APIs would show. A row
+   * exists only when the mutation LANDED host-side, whether or not the
+   * receipt ever reached the engine (fault-injection tests push these
+   * directly to simulate landed-but-unreceipted mutations).
+   */
+  landedTasks: TaskListRow[] = [];
+  landedWorkers: WorkerListRow[] = [];
+  requestStates = new Map<string, 'completed' | 'pending' | 'absent' | 'unknown'>();
   runImpl?: () => Result<{ runId: string }>;
   launchImpl?: (spec: WorkerLaunchSpec) => Result<LaunchResult>;
   observeImpl?: (dispatchId: string) => Result<WorkerObservation>;
   stopImpl?: (dispatchId: string) => Result<{ outcome: StopOutcome }>;
+  listTasksImpl?: (runId: string) => Result<{ tasks: TaskListRow[] }>;
+  listWorkersImpl?: (runId: string) => Result<{ workers: WorkerListRow[] }>;
 
   async createRun() {
     this.createRunCalls += 1;
     if (this.runImpl) return this.runImpl();
     return ok({ runId: 'orca_run_1' });
   }
-  async createTask() {
+  async createTask(input: { runId: string; specFilePath: string; title: string }) {
     this.createTaskCalls += 1;
-    return ok({ taskId: `task_${this.createTaskCalls}` });
+    const taskId = `task_${this.createTaskCalls}`;
+    this.landedTasks.push({ taskId, specFile: input.specFilePath, title: input.title });
+    return ok({ taskId });
   }
   async launchWorker(spec: WorkerLaunchSpec) {
+    this.launchCalls += 1;
     if (this.launchImpl) {
       const r = this.launchImpl(spec);
-      if (r.ok) this.launches.push({ spec, result: r.value });
+      if (r.ok) {
+        this.launches.push({ spec, result: r.value });
+        if (r.value.outcome === 'started' && r.value.dispatchId !== undefined) {
+          this.landedWorkers.push({
+            dispatchId: r.value.dispatchId,
+            taskId: spec.taskId,
+            terminalHandle: r.value.terminalHandle,
+          });
+        }
+      }
       return r;
     }
     this.seq += 1;
@@ -221,7 +271,19 @@ class FakeHost implements HostAdapter {
       requestId: `req_${this.seq}`,
     };
     this.launches.push({ spec, result: res });
+    this.landedWorkers.push({ dispatchId: res.dispatchId!, taskId: spec.taskId, terminalHandle: res.terminalHandle });
     return ok(res);
+  }
+  async listTasks(input: { runId: string }) {
+    if (this.listTasksImpl) return this.listTasksImpl(input.runId);
+    return ok({ tasks: this.landedTasks.map((t) => ({ ...t })) });
+  }
+  async listWorkers(input: { runId: string }) {
+    if (this.listWorkersImpl) return this.listWorkersImpl(input.runId);
+    return ok({ workers: this.landedWorkers.map((w) => ({ ...w })) });
+  }
+  async requestShow(input: { requestId: string }) {
+    return ok({ state: this.requestStates.get(input.requestId) ?? 'absent', raw: {} });
   }
   async observeWorker(input: { dispatchId: string }) {
     if (this.observeImpl) return this.observeImpl(input.dispatchId);
@@ -582,9 +644,13 @@ test('full 15-seat lifecycle: organiser → gate → independent → scribe → 
   assert.equal(taskIds.size, 48);
   assert.equal(env.host.createTaskCalls, 48);
   // Every launch went through immutable intent → task → worker order.
-  const intents = env.db.journal.filter((e) => e.type === 'launch.intent');
+  // Attempt-level intents carry launchIntentId; stage markers (task-create /
+  // worker-launch issue proof) carry `stage` and are additional.
+  const intents = env.db.journal.filter(
+    (e) => e.type === 'launch.intent' && typeof e.payload?.launchIntentId === 'string',
+  );
   const started = env.db.journal.filter((e) => e.type === 'worker.started');
-  assert.equal(intents.filter((e) => typeof e.payload?.attemptId === 'string').length, 48);
+  assert.equal(intents.length, 48);
   assert.equal(started.length, 48);
   for (const s of started) {
     const intent = intents.find((e) => e.payload?.attemptId === s.payload?.attemptId);
@@ -946,18 +1012,18 @@ test('crash after task-create resumes at launch without duplicating task', async
 
 // ─── Output admission ────────────────────────────────────────────────────────
 
-test('misbound reviewer output is rejected visibly; run continues partial', async () => {
+test('misbound reviewer output is rejected visibly; one bounded repair, then partial', async () => {
   const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
   await driveToApproval(env);
   await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
-  let poisoned = false;
   for (let g = 0; g < 200; g++) {
     for (const l of env.host.launches) {
       const d = l.result.dispatchId;
       if (d === undefined || env.host.liveness.get(d)?.liveness === 'finished') continue;
       let json: object;
-      if (l.spec.phase === 'independent_review' && !poisoned) {
-        poisoned = true;
+      if (l.spec.phase === 'independent_review' && l.spec.participantId === 'rev_1') {
+        // rev_1 produces misbound output on EVERY attempt — the single
+        // corrective repair fails the same way and no third attempt exists.
         json = { ...mkFindings('rev_WRONG', 'persp_1'), participantId: 'rev_WRONG' } as object; // misbound
       } else if (l.spec.phase === 'independent_review') {
         const p = env.db.state.participants.find((x) => x.participantId === l.spec.participantId);
@@ -981,8 +1047,17 @@ test('misbound reviewer output is rejected visibly; run continues partial', asyn
       break;
     }
   }
-  const rejections = env.db.journal.filter((e) => e.type === 'artifact.rejected');
-  assert.ok(rejections.length > 0, 'misbound output visibly rejected');
+  const rejections = env.db.journal.filter((e) => e.type === 'artifact.rejected' && e.phase === 'independent_review');
+  assert.ok(rejections.length >= 2, 'original + repair both visibly rejected');
+  const repairEvents = rejections.filter((e) => typeof e.payload?.repairAttemptId === 'string');
+  assert.equal(repairEvents.length, 1, 'exactly one corrective attempt minted');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const rev1Attempts = rev1.attempts.filter((a) => a.phase === 'independent_review');
+  assert.equal(rev1Attempts.length, 2, 'original + one repair — no unbounded retry');
+  // The rejected original was archived before the repair rewrote the path
+  // (diagnostics artifacts ride alongside under rejected/ too).
+  const archived = [...env.db.artifacts.keys()].filter((k) => k.startsWith('rejected/') && !k.endsWith('__diagnostics.json'));
+  assert.equal(archived.length, 1, `rejected artifact archived: ${archived.join(',')}`);
   const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
   assert.equal(report.coverage.partial, true, 'partial coverage marked');
   assert.ok(report.coverage.seats.some((s) => s.outcome === 'failed'));
@@ -1167,9 +1242,9 @@ test('timed-out worker keeps its slot: next phase waits, stop requested once, sl
   assert.equal(seat2.attempts.at(-1)!.status, 'timed_out');
   // A best-effort stop was requested exactly once and journaled honestly.
   assert.deepEqual(env.host.stops.map((s) => s.dispatchId), [disp2]);
+  // Intent custody precedes the call; the outcome receipt follows it.
   const stopEvs = env.db.journal.filter((e) => e.type === 'worker.stop_requested');
-  assert.equal(stopEvs.length, 1);
-  assert.equal(stopEvs[0].payload?.outcome, 'refused');
+  assert.deepEqual(stopEvs.map((e) => e.payload?.outcome), ['intent', 'refused']);
   assert.equal(env.db.state.status, 'scribe_notes', 'phase closes on seat 1 findings');
 
   // The timed-out seat still holds the only slot: the scribe must NOT launch.
@@ -1368,4 +1443,760 @@ test('legacy run without execution/staff is an unchanged fixed point', async () 
   const r = await drive(env);
   assert.equal(r.action, 'finished');
   assert.equal(env.db.state.status, 'reported');
+});
+
+// ─── Crash-window durability: stage chronology, adoption, overlay ───────────
+
+/**
+ * True crash simulation: a PERSISTENT append failure means every flush —
+ * including the end-of-advance error-path retry — dies, so the advance
+ * returns a Result failure exactly where a process crash would stop it.
+ * `resume` models the supervisor restarting the run on a fresh engine.
+ */
+const killAppends = (env: Env, why = 'simulated crash: receipt never journaled') => {
+  env.store.appendError = err('io_error', why);
+};
+/** Full persistence death: journal appends AND state saves both fail — the
+ * process "dies" with everything after this point existing only in memory
+ * (and, for host calls, possibly landed host-side). */
+const killPersistence = (env: Env, why = 'simulated crash: receipt never persisted') => {
+  env.store.appendError = err('io_error', why);
+  env.store.saveError = err('io_error', why);
+};
+const resume = (env: Env): Engine => {
+  env.store.appendError = null;
+  env.store.saveError = null;
+  return createEngine({ store: env.store, host: env.host, prompts: env.prompts, now: () => new Date(env.clock.t) });
+};
+
+test('journal append failure happens before the host mutation (journal-first order)', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const creates = env.host.createTaskCalls;
+  const orderLen = env.store.order.length;
+  killAppends(env, 'journal write dead');
+  const r = await env.engine.advance();
+  assert.ok(!r.ok, 'persistent append failure must propagate as a Result failure');
+  assert.equal(env.host.createTaskCalls, creates, 'intent could not be durably recorded → createTask never issued');
+  // 'journal' attempts happened; 'state' saves may have run for earlier
+  // flushes, but NOTHING after the dead append — and the last op was journal.
+  assert.equal(env.store.order.at(-1), 'journal');
+  void orderLen;
+  // Restart: the intent never persisted, so the launch issues cleanly once.
+  const engine2 = resume(env);
+  const r2 = await engine2.advance();
+  assert.ok(r2.ok && (r2.value.action === 'progress' || r2.value.action === 'wait'), JSON.stringify(r2.ok ? r2.value : r2.error));
+});
+
+test('task-create issued + landed + receipt lost: adopted via exact-spec match, never duplicated', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const realCreate = env.host.createTask.bind(env.host);
+  let armed = false;
+  env.host.createTask = async (input) => {
+    const r = await realCreate(input); // lands the row + returns the taskId
+    if (!armed && input.title.includes('rev_1')) {
+      armed = true;
+      killPersistence(env, 'crash between task-create effect and task.created receipt');
+    }
+    return r;
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'every flush dies under a persistent append failure — the process "crashed"');
+  const rev1Spec = env.host.landedTasks.find((t) => (t.title ?? '').includes('rev_1'))!.specFile!;
+  const tasksForSpec = () => env.host.landedTasks.filter((t) => t.specFile === rev1Spec).length;
+
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok && (r2.value.action === 'progress' || r2.value.action === 'wait'), JSON.stringify(r2.ok ? r2.value : r2.error));
+  assert.equal(tasksForSpec(), 1, 'landed task adopted — no duplicate createTask for the attempt');
+  const adopted = env.db.journal.find((e) => e.type === 'launch.resume' && e.payload?.resolution === 'adopted-task');
+  assert.ok(adopted !== undefined, 'adoption journaled');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.attempts[0]!.taskId, env.host.landedTasks.find((t) => t.specFile === rev1Spec)!.taskId);
+});
+
+test('task-create issued + empty/pruned listing stays blocked — never retries', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Host "accepts" the create but lands nothing observable (receipt + ledger lost).
+  const realCreate = env.host.createTask.bind(env.host);
+  env.host.createTask = async (input) => {
+    const r = await realCreate(input);
+    env.host.landedTasks.pop(); // un-land: the host-side record is gone/unreplicated
+    if (input.title.includes('rev_1')) killPersistence(env, 'receipt lost');
+    return r;
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'persistent append failure crashes the advance');
+  const creates = env.host.createTaskCalls;
+  const engine2 = resume(env);
+  for (let i = 0; i < 3; i++) {
+    const r = await engine2.advance();
+    assert.ok(r.ok && r.value.action === 'blocked', `advance ${i} must stay blocked, got ${JSON.stringify(r.ok ? r.value : r.error)}`);
+  }
+  const rev1Creates = env.host.landedTasks.filter((t) => (t.title ?? '').includes('rev_1')).length;
+  assert.equal(rev1Creates, 0, 'never re-created while outcome uncertain');
+  const unknowns = env.db.journal.filter((e) => e.type === 'worker.unknown' && (e.payload?.detail as string | undefined)?.includes('task-create issued but no host record'));
+  assert.ok(unknowns.length >= 1, 'uncertain outcome journaled honestly');
+  void creates;
+});
+
+test('task adoption refuses title-only matches and unidentifiable rows', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const realCreate = env.host.createTask.bind(env.host);
+  env.host.createTask = async (input) => {
+    const r = await realCreate(input);
+    if (input.title.includes('rev_1')) {
+      // Replace the real row with a same-TITLE different-spec decoy — the
+      // classic alias collision that must never be adopted.
+      env.host.landedTasks.pop();
+      env.host.landedTasks.push({ taskId: 'task_decoy', title: input.title, specFile: '/elsewhere/decoy-spec.md' });
+      killPersistence(env, 'receipt lost');
+    }
+    return r;
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'persistent append failure crashes the advance');
+  const engine2 = resume(env);
+  const r2 = await engine2.advance();
+  assert.ok(r2.ok && r2.value.action === 'blocked', 'decoy row must not satisfy the exact-spec identity check');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.attempts[0]!.taskId, null, 'decoy task never adopted');
+
+  // Same situation with a row that has NO spec identity at all. Reset the
+  // attempt to intent_recorded so the reconcile path runs the row check
+  // again (the journaled task-create marker still governs the outcome).
+  rev1.attempts[0]!.status = 'intent_recorded';
+  env.host.landedTasks.pop();
+  env.host.landedTasks.push({ taskId: 'task_decoy2', title: 'council independent_review rev_1' });
+  const r3 = await engine2.advance();
+  assert.ok(r3.ok && r3.value.action === 'blocked', 'unidentifiable row cannot prove zero-match');
+});
+
+test('worker-launch issued + landed + receipt lost: adopted, launchWorker never re-called', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  env.host.launchImpl = (spec) => {
+    const res: LaunchResult = {
+      outcome: 'started',
+      dispatchId: `disp_land_${spec.participantId}`,
+      terminalHandle: `term_land_${spec.participantId}`,
+    };
+    if (spec.participantId === 'rev_1') killPersistence(env, 'crash between worker effect and worker.started receipt');
+    return ok(res);
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'persistent append failure crashes the advance');
+  const launches1 = env.host.launchCalls;
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok, JSON.stringify(r2));
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const att = rev1.attempts[0]!;
+  assert.equal(att.dispatchId, 'disp_land_rev_1', 'landed dispatch adopted');
+  assert.equal(att.status, 'dispatched');
+  const adopted = env.db.journal.find((e) => e.type === 'launch.resume' && e.payload?.resolution === 'adopted-dispatch');
+  assert.ok(adopted !== undefined, 'dispatch adoption journaled');
+  const rev1LaunchCalls = env.host.launches.filter((l) => l.spec.participantId === 'rev_1').length;
+  assert.equal(rev1LaunchCalls, 1, `worker launched once, not relaunched (calls=${launches1})`);
+});
+
+test('worker-launch issued + pruned worker listing stays blocked', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const realLaunch = env.host.launchWorker.bind(env.host);
+  env.host.launchWorker = async (spec) => {
+    const r = await realLaunch(spec);
+    if (spec.participantId === 'rev_1') {
+      env.host.landedWorkers.pop(); // landed row lost host-side; receipt also lost
+      killPersistence(env, 'receipt lost');
+    }
+    return r;
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'persistent append failure crashes the advance');
+  const engine2 = resume(env);
+  for (let i = 0; i < 3; i++) {
+    const r = await engine2.advance();
+    assert.ok(r.ok && r.value.action === 'blocked');
+  }
+  const rev1Launches = env.host.launches.filter((l) => l.spec.participantId === 'rev_1').length;
+  assert.equal(rev1Launches, 1, 'never relaunched while outcome uncertain');
+});
+
+test('chronology: refusal → re-issue → receipt lost resumes uncertain, never duplicates', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  let rev1Calls = 0;
+  env.host.launchImpl = (spec) => {
+    if (spec.participantId !== 'rev_1') {
+      return ok({ outcome: 'started', dispatchId: `disp_${spec.participantId}`, terminalHandle: 't' });
+    }
+    rev1Calls += 1;
+    if (rev1Calls === 1) {
+      return failRes(err('adapter_error', 'definitive worker-start refusal (nothing landed)'));
+    }
+    // Retry #2 LANDS the worker, then every receipt dies with the process.
+    killPersistence(env, 'crash: second launch landed, receipt lost');
+    return ok({ outcome: 'started', dispatchId: 'disp_chron_2', terminalHandle: 'term_chron' });
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok && r1.value.action === 'blocked');
+  const r2 = await env.engine.advance();
+  assert.ok(!r2.ok, 'second issue receipt lost → crash');
+  const r3 = await resume(env).advance();
+  assert.ok(r3.ok, JSON.stringify(r3));
+  assert.equal(rev1Calls, 2, 'the journaled refusal must NOT authorize retrying over a newer lost receipt');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.attempts[0]!.dispatchId, 'disp_chron_2', 'landed retry adopted through reconcile');
+});
+
+test('legacy intent_recorded attempt (pre-marker journal) adopts or blocks — never blind-proceeds', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, concurrency: 1 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Forge the pre-upgrade persisted shape: an intent WITHOUT the v2 marker
+  // scheme, attempt intent_recorded with no ids, and host records that DID land.
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const att = rev1.attempts.find((a) => a.phase === 'independent_review')!;
+  att.status = 'intent_recorded';
+  att.taskId = null;
+  att.dispatchId = null;
+  env.db.journal.push({
+    seq: env.db.journal.length + 1,
+    ts: new Date().toISOString(),
+    type: 'launch.intent',
+    actor: 'engine',
+    participantId: 'rev_1',
+    phase: 'independent_review',
+    payload: { attemptId: att.attemptId, launchIntentId: att.launchIntentId }, // legacy: no v, no stage
+  });
+  const specAbs = join(env.db.runDir, `specs/${att.attemptId}.md`);
+  env.host.landedTasks.push({ taskId: 'task_legacy', specFile: specAbs, title: 'council independent_review rev_1' });
+  env.host.landedWorkers.push({ dispatchId: 'disp_legacy', taskId: 'task_legacy', terminalHandle: 'term_legacy' });
+  const creates = env.host.createTaskCalls;
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok, JSON.stringify(r1));
+  assert.equal(env.host.createTaskCalls, creates, 'legacy attempt adopted its landed records — nothing re-created');
+  const adoptedAtt = env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!;
+  assert.equal(adoptedAtt.taskId, 'task_legacy');
+  assert.equal(adoptedAtt.dispatchId, 'disp_legacy');
+  assert.equal(adoptedAtt.status, 'dispatched');
+
+  // Legacy attempt with NOTHING landed: stays blocked, never proceeds.
+  const rev2 = env.db.state.participants.find((p) => p.participantId === 'rev_2')!;
+  const att2 = rev2.attempts.find((a) => a.phase === 'independent_review')!;
+  env.db.journal.push({
+    seq: env.db.journal.length + 1,
+    ts: new Date().toISOString(),
+    type: 'launch.intent',
+    actor: 'engine',
+    participantId: 'rev_2',
+    phase: 'independent_review',
+    payload: { attemptId: att2.attemptId, launchIntentId: att2.launchIntentId },
+  });
+  att2.status = 'intent_recorded';
+  att2.taskId = null;
+  att2.dispatchId = null;
+  env.host.landedTasks.splice(0); // host listing pruned entirely
+  const creates2 = env.host.createTaskCalls;
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok && r2.value.action === 'blocked', 'legacy intent + empty listing → uncertain → blocked');
+  assert.equal(env.host.createTaskCalls, creates2, 'no blind re-create under a legacy markerless intent');
+});
+
+test('worker-launch definitive refusal is bounded: two tries then the seat fails visibly', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  env.host.launchImpl = (spec) =>
+    spec.participantId === 'rev_1'
+      ? failRes(err('adapter_error', 'worker-start definitively refused'))
+      : ok({ outcome: 'started', dispatchId: `disp_${spec.participantId}`, terminalHandle: 't' });
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok && r1.value.action === 'blocked');
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok && r2.value.action === 'blocked');
+  const r3 = await env.engine.advance();
+  assert.ok(r3.ok, JSON.stringify(r3));
+  const failures = env.db.journal.filter(
+    (e) => e.type === 'error' && e.payload?.op === 'worker-launch' && String(e.payload?.attemptId).includes('rev_1'),
+  ).length;
+  assert.equal(failures, 2, 'exactly the bounded count of journaled refusals');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.status, 'failed', 'seat marked failed after the retry bound — no livelock');
+  const settled = env.db.journal.find((e) => e.type === 'worker.settled' && e.participantId === 'rev_1');
+  assert.ok(settled !== undefined && /bounded retry exhausted/.test(String(settled.payload?.detail)));
+});
+
+test('saveState failure after journal append is recovered by the journal overlay', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const realCreate = env.host.createTask.bind(env.host);
+  env.host.createTask = async (input) => {
+    const r = await realCreate(input);
+    if (input.title.includes('rev_1')) {
+      env.store.saveError = err('io_error', 'crash: task.created journaled, state.json lost');
+    }
+    return r;
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'persistent save failure crashes the advance');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.attempts[0]!.taskId, null, 'persisted state lacks the taskId — the journal has it');
+  const journaled = env.db.journal.find((e) => e.type === 'task.created' && e.participantId === 'rev_1');
+  assert.ok(journaled !== undefined, 'task.created survived the failed save');
+  const creates = env.host.createTaskCalls;
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok, JSON.stringify(r2));
+  assert.equal(env.host.createTaskCalls, creates + 1, 'journal overlay re-adopted the task; only the peer creates new');
+  assert.equal(env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!.taskId, journaled.payload!.taskId);
+});
+
+// ─── Mail budget, quorum, approval profile binding ──────────────────────────
+
+test('per-recipient mail budget is journaled-counted and enforced (clm_0003)', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, maxMailPerParticipant: 2 }));
+  await driveToApproval(env);
+  // Two sends to the run address already journaled (e.g. earlier wake retries);
+  // a send to a DIFFERENT recipient must not count against this one.
+  for (const [to, outcome] of [['run:orca_run_1', 'sent'], ['run:orca_run_1', 'unknown'], ['term_other', 'sent']] as const) {
+    env.db.journal.push({
+      seq: env.db.journal.length + 1,
+      ts: new Date().toISOString(),
+      type: 'mail.sent',
+      actor: 'engine',
+      payload: { to, outcome },
+    });
+  }
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(ap.ok);
+  assert.equal(env.host.notifications.filter((n) => n.to === 'run:orca_run_1').length, 0, 'budget exhausted → wake refused');
+  const refused = env.db.journal.find((e) => e.type === 'mail.sent' && e.payload?.outcome === 'budget_refused');
+  assert.ok(refused !== undefined, 'refusal journaled visibly, never silent');
+  assert.equal(refused.payload?.to, 'run:orca_run_1');
+});
+
+test('below-quorum report is an explicit partial diagnostic (clm_0007)', async () => {
+  const env = makeEnv(configWith({ participants: 3, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2', 'persp_3']), approver: 'o' });
+  // rev_3's launch receipts a definitive failure — 2/3 seats admit, quorum is 3.
+  env.host.launchImpl = (spec) =>
+    spec.participantId === 'rev_3' && spec.phase === 'independent_review'
+      ? ok({ outcome: 'failed', detail: 'worker-start refused by host' })
+      : ok({ outcome: 'started', dispatchId: `disp_${spec.participantId}_${spec.phase}`, terminalHandle: `t_${spec.participantId}` });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  assert.match(r.note ?? '', /PARTIAL coverage/);
+  const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
+  assert.equal(report.coverage.partial, true, 'below-quorum report must be marked partial');
+  const fin = env.db.journal.find((e) => e.type === 'run.finished');
+  assert.equal(fin?.payload?.belowQuorum, true, 'run.finished records the quorum miss');
+  assert.equal(fin?.payload?.admittedSeats, 2);
+  assert.equal(fin?.payload?.quorum, 3);
+});
+
+test('re-approval with a different agent profile is rejected; identical re-approval succeeds (clm_0002)', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  const roster = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  roster.seats.forEach((s) => { s.agent = { ...s.agent, profile: 'ops' }; });
+  assert.ok((await env.engine.approve({ roster, approver: 'o' })).ok);
+  // Tamper the persisted approval so the binding no longer verifies →
+  // invalidated on the next advance (approvalHash cleared, re-approval open).
+  env.db.approved!.seats[0]!.agent = { ...env.db.approved!.seats[0]!.agent, profile: 'tampered' };
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok && (r1.value.action === 'blocked' || r1.value.action === 'needs_approval'));
+  assert.equal(env.db.state.approvalHash, null, 'binding mismatch invalidates approval');
+  assert.ok(env.db.journal.some((e) => e.type === 'approval.invalidated'));
+  // Re-approval must reproduce the EXACT launched seats — profile included.
+  const wrongProfile = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  wrongProfile.seats.forEach((s) => { s.agent = { ...s.agent, profile: 'tampered' }; });
+  const bad = await env.engine.approve({ roster: wrongProfile, approver: 'o' });
+  assert.ok(!bad.ok && bad.error.code === 'roster_invalid', `profile-blind equality must not pass: ${JSON.stringify(bad)}`);
+  const good = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(good.ok, `exact re-approval should succeed: ${JSON.stringify(good)}`);
+});
+
+test('a participant whose AgentChoice diverges from the approved seat is refused at launch (rev-04)', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Tamper the in-run participant record — state.json is NOT approval-bound,
+  // so the divergence must be caught against the approved roster at launch.
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  rev1.agent = { ...rev1.agent, profile: 'injected' };
+  const r = await env.engine.advance();
+  assert.ok(r.ok && r.value.action === 'blocked', JSON.stringify(r.ok ? r.value : r.error));
+  assert.match(r.value.note ?? '', /AgentChoice|roster/i);
+  assert.equal(env.host.launches.filter((l) => l.spec.participantId === 'rev_1').length, 0, 'divergent seat never launched');
+});
+
+// ─── Evidence rejection + scribe notes consumption ──────────────────────────
+
+test('challenge evidence the ledger cannot admit is journaled, not dropped', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }), );
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  for (let g = 0; g < 300; g++) {
+    for (const l of env.host.launches) {
+      const d = l.result.dispatchId;
+      if (d === undefined || env.host.liveness.get(d)?.liveness === 'finished') continue;
+      let json: object;
+      switch (l.spec.phase) {
+        case 'organiser': json = mkProposal(10); break;
+        case 'independent_review': {
+          const p = env.db.state.participants.find((x) => x.participantId === l.spec.participantId);
+          json = mkFindings(l.spec.participantId, p?.perspectiveId ?? 'persp_1');
+          break;
+        }
+        case 'scribe_notes': json = mkScribeNotes(); break;
+        case 'challenge': {
+          const envText = await env.store.readArtifact(outPaths.challengeEnv(l.spec.participantId, l.spec.round ?? 1));
+          assert.ok(envText.ok);
+          const envelope = JSON.parse(envText.value) as { assignments: { claimId: string }[] };
+          json = {
+            schemaVersion: SCHEMA_VERSION,
+            runId: RUN,
+            round: l.spec.round ?? 1,
+            participantId: l.spec.participantId,
+            challenges: envelope.assignments.map((a, i) => ({
+              challengeId: `ch_${l.spec.participantId}_${i}`,
+              claimId: a.claimId,
+              kind: 'missing_evidence',
+              argument: `challenge from ${l.spec.participantId}`,
+              evidence: i === 0 ? [{ kind: 'code_location', note: 'cites a path outside the manifest', path: 'src/ghost.js', startLine: 1 }] : [],
+            })),
+          };
+          break;
+        }
+        case 'author_response': json = await responsesFor(env, l.spec.participantId, l.spec.round ?? 1); break;
+        case 'scribe_synthesis': json = mkScribeReport(); break;
+      }
+      await env.store.writeArtifact(outputPathFor(l.spec), JSON.stringify(json));
+      env.host.settle(d);
+    }
+    const r = await env.engine.advance();
+    assert.ok(r.ok, `advance failed: ${JSON.stringify(r.ok ? r.value : r.error)}`);
+    if (r.value.action === 'finished') break;
+  }
+  const evRej = env.db.journal.filter((e) => e.type === 'artifact.rejected' && e.payload?.kind === 'challenge-evidence');
+  assert.ok(evRej.length >= 1, `challenge-evidence rejections journaled, got ${JSON.stringify(env.db.journal.filter((e) => e.type === 'artifact.rejected').map((e) => e.payload?.kind))}`);
+});
+
+test('admitted scribe notes reach the synthesis spec as explicit input (clm_0021)', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  const synthCalls = env.prompts.calls.scribeSynthesis;
+  assert.equal(synthCalls.length, 1);
+  const notesPath = (synthCalls[0]!.input as { notesPath?: string }).notesPath;
+  assert.ok(typeof notesPath === 'string' && notesPath.endsWith('scribe/notes.json'), `notesPath present: ${notesPath}`);
+});
+
+/* ================= recovery-audit RA-002..RA-008 regression ====================
+ * Fresh-engine append-ok / save-fail fault injection for the audited seams:
+ * journaled facts must re-materialize lost state, counters must come from the
+ * journal, corrupt journals must fail closed, and mutation custody must
+ * survive the intent→outcome window. */
+
+/** Append pre-shaped journal events with monotonically increasing seq. */
+const jour = (env: Env, evs: Array<Partial<JournalEvent> & { type: JournalEvent['type'] }>) => {
+  for (const e of evs) {
+    env.db.journal.push({ seq: env.db.journal.length + 1, ts: 't', actor: 'engine', ...e } as JournalEvent);
+  }
+};
+
+test('RA-002: journaled run-scope receipt restores orcaRunId — no duplicate createRun', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Reproduce: createRun landed + receipts journaled; saveState died before
+  // orcaRunId persisted — a fresh engine used to re-issue createRun.
+  jour(env, [
+    { type: 'launch.intent', payload: { scope: 'run', v: 2 } },
+    { type: 'task.created', payload: { scope: 'run', orcaRunId: 'run_landed_1' } },
+  ]);
+  assert.equal(env.db.state.orcaRunId, null, 'reproduction: runId absent from state');
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  assert.equal(env.host.createRunCalls, 0, 'no second createRun — receipt restored run identity');
+  assert.equal(env.db.state.orcaRunId, 'run_landed_1');
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser');
+  assert.ok(org !== undefined, 'organiser seeding proceeded under the restored run');
+});
+
+test('RA-003: journaled rejection re-mints the lost corrective attempt', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Reproduce: rejection + repair minted + journaled; saveState died — the
+  // state's participant has only the settled original, the repair is gone.
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const orig = rev1.attempts.find((a) => a.phase === 'independent_review')!;
+  orig.status = 'settled_ok';
+  const repairId = 'att_rev_1_independent_review_r0_1';
+  assert.ok(!rev1.attempts.some((a) => a.attemptId === repairId), 'repair attempt lost from state');
+  jour(env, [{
+    type: 'artifact.rejected',
+    participantId: 'rev_1',
+    phase: 'independent_review',
+    payload: {
+      attemptId: orig.attemptId,
+      path: 'findings/rev_1.json',
+      issueCount: 1,
+      issuesExcerpt: ['bad output'],
+      issuesRef: 'rejected/x__diagnostics.json',
+      repairAttemptId: repairId,
+      repairTuple: 'rev_1|independent_review|null',
+      repair: { repairOf: orig.attemptId, contract: 'FindingsFile', diagnostics: ['bad output'] },
+    },
+  }]);
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  const rev1b = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const repair = rev1b.attempts.find((a) => a.attemptId === repairId);
+  assert.ok(repair !== undefined, 'journaled repair attempt re-materialized');
+  assert.ok(env.db.journal.some((e) => e.payload?.repairOf === orig.attemptId), 'repair lineage preserved in journal');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.attemptId === repairId),
+    `repair actually launched, status ${repair.status}`,
+  );
+  // Exactly ONE re-minted repair — replaying again must not mint a third attempt.
+  const r3 = await resume(env).advance();
+  assert.ok(r3.ok, JSON.stringify(r3.ok ? r3.value : r3.error));
+  const rev1c = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1c.attempts.filter((a) => a.attemptId === repairId).length, 1);
+});
+
+test('RA-003: journaled organiser events re-seed the lost participant and attempt', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const orgAttempt = 'att_organiser_organiser_r0_0';
+  const orgSpec = join(env.db.runDir, `specs/${orgAttempt}.md`);
+  env.db.state.status = 'organising';
+  env.db.state.participants = [];
+  env.host.landedTasks.push({ taskId: 'task_org_l', specFile: orgSpec, title: 'council organiser organiser' });
+  env.host.landedWorkers.push({ dispatchId: 'disp_org', taskId: 'task_org_l', terminalHandle: 'term_org' });
+  jour(env, [
+    { type: 'phase.entered', payload: { phase: 'organising' } },
+    { type: 'launch.intent', payload: { attemptId: orgAttempt, launchIntentId: 'li_org', v: 2, agent: { adapter: 'orca' } } },
+    { type: 'launch.intent', payload: { attemptId: orgAttempt, stage: 'task-create' } },
+    { type: 'task.created', payload: { attemptId: orgAttempt, taskId: 'task_org_l', specFile: orgSpec, title: 'council organiser organiser' } },
+    { type: 'launch.intent', payload: { attemptId: orgAttempt, stage: 'worker-launch' } },
+    { type: 'worker.started', payload: { attemptId: orgAttempt, taskId: 'task_org_l', dispatchId: 'disp_org', terminalHandle: 'term_org' } },
+  ]);
+  const taskCreates = env.host.createTaskCalls;
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser');
+  assert.ok(org !== undefined, 'organiser participant re-seeded from journal');
+  assert.equal(org.attempts.at(-1)!.attemptId, orgAttempt);
+  assert.equal(org.attempts.at(-1)!.taskId, 'task_org_l', 'journaled taskId restored');
+  assert.equal(org.attempts.at(-1)!.dispatchId, 'disp_org', 'journaled dispatchId restored');
+  assert.equal(env.host.createTaskCalls, taskCreates, 'journaled task — no duplicate createTask');
+});
+
+test('RA-003: journaled reviewer seats rebuild a wiped participant list', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  env.db.state.participants = [];
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  const pids = env.db.state.participants.map((p) => p.participantId).sort();
+  assert.deepEqual(pids, ['organiser', 'rev_1', 'rev_2']);
+  assert.ok(env.db.state.participants.every((p) => p.attempts.length >= 1), 'attempts seeded');
+});
+
+test('RA-004: consumption is journal-derived — receipt vs re-observe dedupe, mail counted', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const rev1Att = 'att_rev_1_independent_review_r0_0';
+  const rev2Att = 'att_rev_2_independent_review_r0_0';
+  jour(env, [
+    // Receipt (has taskId — an actual launch) for rev_1…
+    { type: 'worker.started', payload: { attemptId: rev1Att, taskId: 'task_a', dispatchId: 'd1' } },
+    // …then a later liveness re-observe of the SAME launch identity (no taskId)
+    { type: 'worker.started', payload: { attemptId: rev1Att, dispatchId: 'd1', liveness: 'working' } },
+    // rev_2 issued, outcome unknown — charged once.
+    { type: 'worker.unknown', payload: { attemptId: rev2Att, dispatchId: 'd2' } },
+    { type: 'mail.sent', payload: { to: 'run:orca_run_1', outcome: 'sent', subject: 'a' } },
+    { type: 'mail.sent', payload: { to: 'run:orca_run_1', outcome: 'sent', subject: 'b' } },
+  ]);
+  env.db.state.consumption = { launches: 0, mailSent: 0 };
+  // rev_2 stays 'unknown' → the step blocks; consumption is still derived.
+  await resume(env).advance();
+  // organiser receipt + rev_1 receipt + rev_2 unknown = 3 journaled launches;
+  // the liveness re-observe must NOT count twice.
+  assert.equal(env.db.state.consumption.launches, 3);
+  // approval-wake mail + 2 seeded 'sent' = 3.
+  assert.equal(env.db.state.consumption.mailSent, 3);
+});
+
+test('RA-005: corrupt journal fails closed — advance/approve/cancel never mutate', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  env.store.journalError = err('io_error', 'journal_corrupt: seq 3 prevHash mismatch');
+  const before = {
+    tasks: env.host.createTaskCalls,
+    launches: env.host.launchCalls,
+    stops: env.host.stops.length,
+    released: env.host.released.length,
+    mail: env.host.notifications.length,
+  };
+  const r = await env.engine.advance();
+  assert.ok(!r.ok && /journal_corrupt/.test(r.error.message), JSON.stringify(r));
+  const a = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(!a.ok && /journal_corrupt/.test(a.error.message), 'approve fails before any mutation');
+  const c = await env.engine.cancel({ reason: 'abort' });
+  assert.ok(!c.ok && /journal_corrupt/.test(c.error.message), 'cancel fails closed');
+  assert.deepEqual(
+    {
+      tasks: env.host.createTaskCalls,
+      launches: env.host.launchCalls,
+      stops: env.host.stops.length,
+      released: env.host.released.length,
+      mail: env.host.notifications.length,
+    },
+    before,
+    'stop/release/mail/launch mutations suppressed on corrupt journal',
+  );
+  assert.equal(env.db.approved, null, 'roster write suppressed');
+});
+
+test('RA-006: uncertain adapter error preserves requestId and never reads as definitive refusal', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const realCreate = env.host.createTask.bind(env.host);
+  env.host.createTask = async (input) =>
+    input.title.includes('rev_1')
+      ? failRes(err('adapter_error', 'transport timeout', { details: { requestId: 'req_tc_7', uncertain: true } }))
+      : realCreate(input);
+  await env.engine.advance();
+  const errEv = env.db.journal.find((e) => e.type === 'error' && e.payload?.op === 'task-create');
+  assert.ok(errEv !== undefined, 'adapter error journaled');
+  assert.equal(errEv.payload?.requestId, 'req_tc_7', 'actual requestId preserved');
+  assert.equal(errEv.payload?.uncertain, true, 'uncertainty preserved');
+  // 'issued' semantics: a landed host row is adopted, never refused-and-retried.
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const spec = join(env.db.runDir, `specs/${rev1.attempts[0]!.attemptId}.md`);
+  env.host.landedTasks.push({ taskId: 'task_tc7', specFile: spec, title: 'council independent_review rev_1' });
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok, JSON.stringify(r2.ok ? r2.value : r2.error));
+  const rev1b = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1b.attempts[0]!.taskId, 'task_tc7', 'landed task adopted through reconcile');
+});
+
+test('RA-007: fat diagnostics never overflow the journal line — artifact carries them', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  await env.engine.advance();
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const att = rev1.attempts[0]!;
+  // A findings file with dozens of violations → a very large issues array.
+  env.db.artifacts.set('findings/rev_1.json', JSON.stringify({
+    schemaVersion: 1, runId: 'r', participantId: 'rev_1',
+    findings: Array.from({ length: 60 }, (_, i) => ({ wrong: i, also_wrong: 'x'.repeat(40) })),
+  }));
+  env.host.settle(att.dispatchId!, false);
+  await env.engine.advance();
+  const rej = env.db.journal.find((e) => e.type === 'artifact.rejected' && e.payload?.attemptId === att.attemptId);
+  assert.ok(rej !== undefined, 'rejection journaled');
+  const line = JSON.stringify(rej);
+  assert.ok(line.length < 8192, `journaled line bounded under the envelope cap, got ${line.length}`);
+  assert.equal(rej.payload?.issues, undefined, 'raw issues never journaled');
+  const ref = rej.payload?.issuesRef as string;
+  assert.ok(typeof ref === 'string' && ref.length > 0);
+  const diag = JSON.parse(env.db.artifacts.get(ref)!) as { issues: unknown[] };
+  assert.equal(diag.issues.length, rej.payload?.issueCount, 'artifact carries the full diagnostics');
+  assert.ok(typeof rej.payload?.issuesHash === 'string' && rej.payload.issuesHash.length > 0);
+  // The repair prompt gets a bounded excerpt plus a link to the full artifact.
+  await env.engine.advance();
+  const repairCall = env.prompts.calls.reviewerIndependent.at(-1)!;
+  const repairCtx = repairCall.input as { repair?: { diagnostics?: string[] } };
+  const diagLines = repairCtx.repair?.diagnostics ?? [];
+  assert.ok(
+    diagLines.some((l) => l.includes(`full diagnostics archived at: ${join(env.db.runDir, ref)}`)),
+    `prompt links to full diagnostics: ${JSON.stringify(diagLines)}`,
+  );
+  assert.ok(diagLines.length <= 21, 'prompt context bounded');
+});
+
+test('RA-008: stop custody — intent flushed before requestStop; crash never re-issues', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  await env.engine.advance(); // reviewers dispatched
+  let firstStopped = '';
+  let intentFlushedBeforeCall = false;
+  env.host.stopImpl = (d) => {
+    firstStopped ||= d;
+    intentFlushedBeforeCall ||= env.db.journal.some(
+      (e) => e.type === 'worker.stop_requested' && e.payload?.outcome === 'intent' && e.payload?.dispatchId === d,
+    );
+    killPersistence(env, 'crash after stop intent, before outcome journal');
+    return ok({ outcome: 'stopped' });
+  };
+  const c1 = await env.engine.cancel({ reason: 'abort' });
+  assert.ok(!c1.ok, 'cancel dies mid-mutation');
+  assert.ok(intentFlushedBeforeCall, 'stop intent durably journaled BEFORE the host call');
+  const c2 = await resume(env).cancel({ reason: 'abort' });
+  void c2;
+  assert.equal(
+    env.host.stops.filter((s) => s.dispatchId === firstStopped).length,
+    1,
+    'journaled intent → requestStop never blind-reissued',
+  );
+});
+
+test('RA-008: release custody — journaled reservation never re-issues releaseWorker', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r1 = await env.engine.advance();
+  assert.ok(r1.ok);
+  // Settle rev_1 so the seat is release-eligible, then simulate: release intent
+  // journaled + flushed, process died before the outcome could journal.
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const att = rev1.attempts[0]!;
+  env.db.artifacts.set('findings/rev_1.json', JSON.stringify(mkFindings('rev_1', 'persp_1')));
+  env.host.settle(att.dispatchId!, false);
+  await env.engine.advance(); // settles + admits
+  const rev1b = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.ok(rev1b.retainedTerminal !== null && att.dispatchId !== undefined);
+  const lastDispatch = rev1b.attempts.at(-1)!.dispatchId!;
+  jour(env, [
+    { type: 'worker.released', participantId: 'rev_1', payload: { dispatchId: lastDispatch, outcome: 'intent' } },
+  ]);
+  await resume(env).cancel({ reason: 'abort' });
+  assert.ok(!env.host.released.includes(lastDispatch), 'journaled intent → releaseWorker never re-issued');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'worker.released' && e.payload?.outcome === 'skipped' && e.payload?.dispatchId === lastDispatch),
+    'the skipped reconcile is journaled honestly',
+  );
+});
+
+test('RA-008: mail intent+outcome pair charges the cap once, not twice', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, maxMailPerParticipant: 2 }));
+  await driveToApproval(env);
+  // Pre-seed a completed send pair to the same target the wake mail uses.
+  jour(env, [
+    { type: 'mail.sent', payload: { to: 'run:orca_run_1', mailIntentId: 'mi_a', outcome: 'intent' } },
+    { type: 'mail.sent', payload: { to: 'run:orca_run_1', mailIntentId: 'mi_a', outcome: 'sent' } },
+  ]);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.equal(env.host.notifications.length, 1, 'pair deduped — wake send fits under cap 2');
+  assert.equal(env.db.state.consumption.mailSent, 2, 'seeded sent + wake sent');
 });

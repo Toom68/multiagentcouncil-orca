@@ -89,6 +89,25 @@ class FakeHost implements HostAdapter {
       requestId: `fake-req-${this.seq}`,
     });
   }
+  /** Documented read API: the host-visible task list for one run. */
+  async listTasks(input: { runId: string }) {
+    return ok({
+      tasks: this.tasks
+        .filter((t) => t.runId === input.runId)
+        .map((t) => ({ taskId: t.taskId, specFile: t.specFilePath, title: t.title })),
+    });
+  }
+  /** Documented read API: the host-visible worker dispatches for one run. */
+  async listWorkers(input: { runId: string }) {
+    void input;
+    return ok({
+      workers: this.launches.map((l) => ({
+        dispatchId: l.dispatchId,
+        taskId: l.spec.taskId,
+        terminalHandle: l.spec.reuseTerminal ?? `fake-term`,
+      })),
+    });
+  }
   async observeWorker(input: { dispatchId: string }): Promise<Result<WorkerObservation>> {
     const l = this.launches.find((x) => x.dispatchId === input.dispatchId);
     if (l === undefined) {
