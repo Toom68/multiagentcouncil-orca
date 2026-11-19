@@ -42,6 +42,11 @@ to main. Development workers use only Devin swe-2-max with dangerous permissions
   and message budget, singleton lease, and clean exit on terminal council state.
   A dead helper/host must be visible, not advertised as guaranteed delivery.
   The bundled skill instructs the awakened primary to relay concise user updates.
+  Final interface decision: progress/recipient.json is the sole canonical wake
+  destination, validated and serialized by progress.captureRecipient. It is
+  operational metadata independent of CouncilState and approval. Do not add a
+  state.notifyRecipient copy. This supersedes the transient v1.1 proposal to
+  store it in state; engine/operator/docs use the file-based v1 API.
 - Add optional, bounded Strength records: perspective/participant provenance,
   specific feature, benefit to that role, supporting evidence, and what to
   preserve. Absence is valid; no praise quota or invented criticism to attach it
