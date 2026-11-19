@@ -87,6 +87,13 @@ posture remains materially uncertain. Genuine user-local preferences are valid;
 they are not package defaults. Honor already-given authorization — do not
 re-ask. See `references/selection.md` for choice shapes and per-lane notes.
 
+`references/templates/` ships fill-in files: `council.config.template.json`
+(all keys + `staff` placeholders), `council.config.smoke.template.json` (a
+bounded 2-seat rehearsal), and `roster.approved.template.json` (the approved
+wrapper: `schemaVersion`, `runId`, `seats[]`). Replace every `<...>`
+placeholder with your explicit choices — an unreplaced placeholder fails
+validation instead of silently defaulting.
+
 ## Non-negotiable invariants
 
 - **Approval gate**: reviewers and scribe launch only after
@@ -105,6 +112,9 @@ re-ask. See `references/selection.md` for choice shapes and per-lane notes.
 - **Mail custody**: only an agent consumes its own mailbox (`check`/`--ack`);
   the CLI never consumes mail. No polling or sleeps — everything is
   wake-driven; end your turn when there is nothing to do.
+- **Wakes are for the user**: council stage/progress mail reaching you is a
+  signal to report — relay stage, counts, blocker, and next action concisely
+  on every wake. Silence until the final report is never acceptable.
 - **Recovery**: a lost/ambiguous mutation result is *unknown*, not permission
   to retry — reconcile (`request-show`, `worker-list`) first. Physical process
   death, released terminals, and quiet sessions never prove logical task
@@ -114,17 +124,49 @@ re-ask. See `references/selection.md` for choice shapes and per-lane notes.
 ## Run the council (details in references/operations.md)
 
 ```text
+node "<SKILL_DIR>/scripts/council.mjs" doctor --config <file> --json        # readiness preflight
 node "<SKILL_DIR>/scripts/council.mjs" init --objective <objective-file> --target <path> --config <file> --json
 node "<SKILL_DIR>/scripts/council.mjs" start-supervisor --run <runDir> --json
-# …wait for needs_approval mail, read roster.proposed.json, write
-# roster.approved.json with your seat/agent choices…
+# CHECK THE JSON: ok:true exit 0 can still mean outcome:"paused" —
+# require outcome:"launched" + supervisorStarted:true before waiting.
+# …wait for council mail (relay each to the user), read roster.proposed.json,
+# write roster.approved.json with your seat/agent choices…
 node "<SKILL_DIR>/scripts/council.mjs" approve --run <runDir> --roster <runDir>/roster.approved.json
 # send the printed wake; on finished, read <runDir>/report.md then report.json
+node "<SKILL_DIR>/scripts/council.mjs" verify --run <runDir> --json         # drift/approval/artifact integrity
 ```
+
+**`start-supervisor` outcome check (exit 0 ≠ started).** A trust/permission
+screen or custody ambiguity pauses setup — the command still exits 0 with
+`ok:true`. Require `outcome:"launched"` + `supervisorStarted:true`. On
+`outcome:"paused"` + `needsAttention:true`: resolve `reason` at the named
+terminal per `recovery`, then rerun the same command (it reuses recorded
+resources). Never wait for `needs_approval` mail a paused launch cannot send.
+
+**First run? Rehearse bounded.** Defaults are 15 seats, a 48-launch floor,
+and hours of deadlines. Exercise the protocol cheaply first: `doctor`, then
+init with a bounded config —
+`references/templates/council.config.smoke.template.json` (10 perspectives,
+2 seats, 1 round, tighter deadlines). Afterwards `verify` the run.
+
+## Relay wakes to the user — mandatory
+
+Council stage mail (subject `council <crun>: <stage>`) reaches you at every
+lifecycle change — stages, the approval gate, blockers, completion — plus
+bounded heartbeat updates during long phases (~2 min cadence while a stage
+runs). Each message carries persisted facts: stage label, participant/attempt
+counts, launch consumption, elapsed/stage age, next action, and report paths
+on finish. On EVERY wake, give the user a concise update — stage, counts,
+blocker or next action — never stay silent until the final report. The facts
+are persisted run facts: they never prove worker liveness, and a dead
+progress helper is a visibility gap, not evidence of health or of failure.
 
 ## References (bundled — self-contained)
 
 - `references/selection.md` — staff/seat choice axes, profile vs permission vs
   model, precedence, per-lane notes.
 - `references/operations.md` — the full runbook: supervisor loop, approval
-  mechanics, cancellation, recovery, manual driving, honest boundaries.
+  mechanics, progress wakes, cancellation, recovery playbooks, manual
+  driving, honest boundaries.
+- `references/templates/` — `council.config.template.json`,
+  `council.config.smoke.template.json`, `roster.approved.template.json`.

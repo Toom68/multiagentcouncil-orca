@@ -14,21 +14,26 @@ import type {
   ApprovalRecord,
   ApprovedRoster,
   AuthorResponse,
+  CanonicalStrength,
   Challenge,
   ChallengeAssignment,
   ChallengeEnvelope,
   ChallengesFile,
   ChallengeKind,
+  ChallengeRoutingRecord,
   Claim,
   ClaimAssessment,
+  ClaimChallenge,
   ClaimEvent,
   ClaimId,
+  ClaimLedger,
   ClaimView,
   CouncilConfig,
   CouncilError,
   CouncilErrorCode,
   CouncilReport,
   CouncilState,
+  DiscussionRoundFacts,
   DissentRecord,
   Evidence,
   EvidenceGrade,
@@ -45,16 +50,22 @@ import type {
   PhaseDeadlines,
   ProposedRoster,
   ReportCoverage,
-  RunnerFacts,
+  ReportProvenance,
   ResponseAssignment,
+  RunnerFacts,
   ResponseDisposition,
   ResponseEnvelope,
+  ResponseRoutingRecord,
   ResponsesFile,
+  RoundRoutingRecord,
   ScribeNotesFile,
   SeatAssignment,
   Severity,
   SourceSnapshot,
+  Strength,
   SynthesisFile,
+  TerminalCreateIntent,
+  TerminalCreateReceipt,
   ValidationIssue,
   ClaimStatus,
   CouncilStaff,
@@ -65,7 +76,7 @@ import type {
   RunStatus,
   DiscussionStage,
 } from './contracts.js';
-import { SCHEMA_VERSION } from './contracts.js';
+import { MAX_STRENGTHS_PER_FILE, SCHEMA_VERSION } from './contracts.js';
 
 // ─── Error/issue helpers ─────────────────────────────────────────────────────
 
@@ -323,7 +334,7 @@ const JOURNAL_EVENT_TYPES = [
   'mail.sent', 'mail.observed', 'roster.proposed', 'approval.granted',
   'approval.invalidated', 'artifact.written', 'artifact.admitted',
   'artifact.rejected', 'envelope.built', 'deadline.hit', 'snapshot.drift',
-  'claim.updated', 'report.written', 'error', 'run.finished',
+  'claim.updated', 'report.written', 'supervisor.retired', 'error', 'run.finished',
 ] as const;
 
 // Compile-time exhaustiveness: fails to compile if EITHER the enum misses a
@@ -681,6 +692,10 @@ export function parseApprovedRoster(
 
 // ─── Evidence / findings ─────────────────────────────────────────────────────
 
+// NOTE: `config.maxTextChars` is deliberately NOT consumed here. The primary
+// deferred the free-text-bound overhaul; the itemized per-field caps below
+// remain the authoritative limits for worker-authored output.
+
 function parseEvidence(u: unknown, path: string, issues: ValidationIssue[]): Evidence | null {
   const o = reqObj(u, path, issues);
   if (o === null) return null;
@@ -788,9 +803,28 @@ function parseFinding(u: unknown, path: string, issues: ValidationIssue[]): Find
   return out;
 }
 
+/**
+ * Worker-asserted strength — same evidence rules as findings, bounded text.
+ * At least one evidence item is required so a strength cannot be bare praise;
+ * citation verification happens later against the snapshot, same as findings.
+ */
+function parseStrength(u: unknown, path: string, issues: ValidationIssue[], cap: Cap = NO_CAP): Strength | null {
+  const o = reqObj(u, path, issues);
+  if (o === null) return null;
+  const strengthId = reqId(o.strengthId, `${path}.strengthId`, issues);
+  const feature = reqStr(o.feature, `${path}.feature`, issues, { max: cap(200) });
+  const benefit = reqStr(o.benefit, `${path}.benefit`, issues, { max: cap(2000) });
+  const preserve = reqStr(o.preserve, `${path}.preserve`, issues, { max: cap(2000) });
+  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 20, required: true, cap });
+  if (evidence.length === 0) issues.push(fail(`${path}.evidence`, 'required', 'a strength requires at least one evidence item'));
+  if (strengthId === null || feature === null || benefit === null || preserve === null || evidence.length === 0)
+    return null;
+  return { strengthId, feature, benefit, preserve, evidence };
+}
+
 export function parseFindingsFile(
   raw: unknown,
-  ctx: { runId?: string; participantId?: string; perspectiveId?: string; maxFindings?: number },
+  ctx: { runId?: string; participantId?: string; perspectiveId?: string; maxFindings?: number; maxTextChars?: number },
 ): ParseResult<FindingsFile> {
   const issues: ValidationIssue[] = [];
   const o = reqObj(raw, 'file', issues);
@@ -814,28 +848,66 @@ export function parseFindingsFile(
     issues.push(fail('file.findings', 'too_many', `at most ${max} findings`));
     return parseFail(issues);
   }
+  const cap = mkCap(ctx);
   const findings: Finding[] = [];
+  const seenFindingIds = new Set<string>();
   o.findings.forEach((f, i) => {
-    const parsed = parseFinding(f, `file.findings[${i}]`, issues);
-    if (parsed !== null) findings.push(parsed);
+    const parsed = parseFinding(f, `file.findings[${i}]`, issues, cap);
+    if (parsed !== null) {
+      // The stated 'unique findingIds' rule is enforced at admission: source
+      // identity is how provenance and response routing join, so a duplicate
+      // is a file-level rejection, never a silent first-wins collapse.
+      if (seenFindingIds.has(parsed.findingId)) {
+        issues.push(fail(`file.findings[${i}].findingId`, 'duplicate', `duplicate findingId ${parsed.findingId}`));
+      } else {
+        seenFindingIds.add(parsed.findingId);
+        findings.push(parsed);
+      }
+    }
   });
-  const notes = optStr(o.notes, 'file.notes', issues, { max: 4000 });
+  // Optional bounded strengths — absent or [] are both valid; the fixed cap
+  // keeps praise subordinate to criticism without a new approval-bound knob.
+  let strengths: Strength[] | undefined;
+  if (o.strengths !== undefined && o.strengths !== null) {
+    if (!isArr(o.strengths)) {
+      issues.push(fail('file.strengths', 'type', 'expected array'));
+    } else {
+      if (o.strengths.length > MAX_STRENGTHS_PER_FILE) {
+        issues.push(fail('file.strengths', 'too_many', `at most ${MAX_STRENGTHS_PER_FILE} strengths`));
+      }
+      strengths = [];
+      const seenStrengthIds = new Set<string>();
+      o.strengths.forEach((s, i) => {
+        const parsed = parseStrength(s, `file.strengths[${i}]`, issues, cap);
+        if (parsed !== null) {
+          if (seenStrengthIds.has(parsed.strengthId)) {
+            issues.push(fail(`file.strengths[${i}].strengthId`, 'duplicate', `duplicate strengthId ${parsed.strengthId}`));
+          } else {
+            seenStrengthIds.add(parsed.strengthId);
+            strengths!.push(parsed);
+          }
+        }
+      });
+    }
+  }
+  const notes = optStr(o.notes, 'file.notes', issues, { max: cap(4000) });
   if (issues.length || runId === null || participantId === null || perspectiveId === null) return parseFail(issues);
   const out: FindingsFile = { schemaVersion: SCHEMA_VERSION, runId, participantId, perspectiveId, findings };
+  if (strengths !== undefined && strengths.length > 0) out.strengths = strengths;
   if (notes !== undefined) out.notes = notes;
   return ok(out);
 }
 
 // ─── Challenges / responses ──────────────────────────────────────────────────
 
-function parseChallenge(u: unknown, path: string, issues: ValidationIssue[]): Challenge | null {
+function parseChallenge(u: unknown, path: string, issues: ValidationIssue[], cap: Cap = NO_CAP): Challenge | null {
   const o = reqObj(u, path, issues);
   if (o === null) return null;
   const challengeId = reqId(o.challengeId, `${path}.challengeId`, issues);
   const claimId = reqId(o.claimId, `${path}.claimId`, issues);
   const kind = reqEnum(o.kind, CHALLENGE_KINDS, `${path}.kind`, issues);
-  const argument = reqStr(o.argument, `${path}.argument`, issues, { max: 4000 });
-  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 10 });
+  const argument = reqStr(o.argument, `${path}.argument`, issues, { max: cap(4000) });
+  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 10, cap });
   // A 'counterexample' challenge asserts a concrete counter-case — it must
   // carry at least one evidence item to be justifiable; other kinds keep
   // evidence optional so nothing forces fabricated citations.
@@ -856,7 +928,7 @@ function parseChallenge(u: unknown, path: string, issues: ValidationIssue[]): Ch
 
 export function parseChallengesFile(
   raw: unknown,
-  ctx: { runId?: string; round?: number; participantId?: string; max?: number },
+  ctx: { runId?: string; round?: number; participantId?: string; max?: number; maxTextChars?: number },
 ): ParseResult<ChallengesFile> {
   const issues: ValidationIssue[] = [];
   const o = reqObj(raw, 'file', issues);
@@ -880,26 +952,27 @@ export function parseChallengesFile(
     issues.push(fail('file.challenges', 'too_many', `at most ${max} challenges`));
     return parseFail(issues);
   }
+  const cap = mkCap(ctx);
   const challenges: Challenge[] = [];
   o.challenges.forEach((c, i) => {
-    const parsed = parseChallenge(c, `file.challenges[${i}]`, issues);
+    const parsed = parseChallenge(c, `file.challenges[${i}]`, issues, cap);
     if (parsed !== null) challenges.push(parsed);
   });
   if (issues.length || runId === null || round === null || participantId === null) return parseFail(issues);
   return ok({ schemaVersion: SCHEMA_VERSION, runId, round, participantId, challenges });
 }
 
-function parseAuthorResponse(u: unknown, path: string, issues: ValidationIssue[]): AuthorResponse | null {
+function parseAuthorResponse(u: unknown, path: string, issues: ValidationIssue[], cap: Cap = NO_CAP): AuthorResponse | null {
   const o = reqObj(u, path, issues);
   if (o === null) return null;
   const claimId = reqId(o.claimId, `${path}.claimId`, issues);
   const challengeId = reqId(o.challengeId, `${path}.challengeId`, issues);
   const disposition = reqEnum(o.disposition, RESPONSE_DISPOSITIONS, `${path}.disposition`, issues);
-  const argument = reqStr(o.argument, `${path}.argument`, issues, { max: 4000 });
-  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 10 });
+  const argument = reqStr(o.argument, `${path}.argument`, issues, { max: cap(4000) });
+  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 10, cap });
   let revisedFinding: Finding | undefined;
   if (o.revisedFinding !== undefined && o.revisedFinding !== null) {
-    revisedFinding = parseFinding(o.revisedFinding, `${path}.revisedFinding`, issues) ?? undefined;
+    revisedFinding = parseFinding(o.revisedFinding, `${path}.revisedFinding`, issues, cap) ?? undefined;
   }
   if (disposition === 'revise' && revisedFinding === undefined) {
     issues.push(fail(`${path}.revisedFinding`, 'required', 'disposition "revise" requires revisedFinding'));
@@ -913,7 +986,7 @@ function parseAuthorResponse(u: unknown, path: string, issues: ValidationIssue[]
 
 export function parseResponsesFile(
   raw: unknown,
-  ctx: { runId?: string; round?: number; participantId?: string; max?: number },
+  ctx: { runId?: string; round?: number; participantId?: string; max?: number; maxTextChars?: number },
 ): ParseResult<ResponsesFile> {
   const issues: ValidationIssue[] = [];
   const o = reqObj(raw, 'file', issues);
@@ -937,9 +1010,10 @@ export function parseResponsesFile(
     issues.push(fail('file.responses', 'too_many', `at most ${max} responses`));
     return parseFail(issues);
   }
+  const cap = mkCap(ctx);
   const responses: AuthorResponse[] = [];
   o.responses.forEach((r2, i) => {
-    const parsed = parseAuthorResponse(r2, `file.responses[${i}]`, issues);
+    const parsed = parseAuthorResponse(r2, `file.responses[${i}]`, issues, cap);
     if (parsed !== null) responses.push(parsed);
   });
   if (issues.length || runId === null || round === null || participantId === null) return parseFail(issues);
@@ -1091,7 +1165,19 @@ export function parseResponseEnvelope(
 
 export function parseScribeNotesFile(
   raw: unknown,
-  ctx: { runId?: string; participantId?: string },
+  ctx: {
+    runId?: string;
+    participantId?: string;
+    /**
+     * Optional completeness check (clm_0021): the id set claimSummaries
+     * entries must key into — whichever family the spec instructs (finding
+     * ids under the shipped prompt; ledger claim ids if it ever changes).
+     * When provided, an entry keyed outside the set is an 'unknown' issue
+     * and every expected id left unsummarised is an 'incomplete' issue.
+     */
+    expectedKeys?: string[];
+    maxTextChars?: number;
+  },
 ): ParseResult<ScribeNotesFile> {
   const issues: ValidationIssue[] = [];
   const o = reqObj(raw, 'file', issues);
@@ -1109,20 +1195,37 @@ export function parseScribeNotesFile(
     return parseFail(issues);
   }
   if (o.claimSummaries.length > 200) issues.push(fail('file.claimSummaries', 'too_many', 'at most 200 summaries'));
+  const expected = ctx.expectedKeys === undefined ? undefined : new Set(ctx.expectedKeys);
+  const cap = mkCap(ctx);
+  const covered = new Set<string>();
   o.claimSummaries.forEach((s, i) => {
     const p = `file.claimSummaries[${i}]`;
     const obj = reqObj(s, p, issues);
     if (obj === null) return;
     const claimId = reqId(obj.claimId, `${p}.claimId`, issues);
-    const summary = reqStr(obj.summary, `${p}.summary`, issues, { max: 2000 });
+    const summary = reqStr(obj.summary, `${p}.summary`, issues, { max: cap(2000) });
     const possibleDuplicates = reqStrArr(obj.possibleDuplicates, `${p}.possibleDuplicates`, issues, {
       maxItems: 10,
       maxItemLen: 128,
     });
-    const openQuestions = reqStrArr(obj.openQuestions, `${p}.openQuestions`, issues, { maxItems: 10, maxItemLen: 500 });
-    if (claimId !== null && summary !== null) summaries.push({ claimId, summary, possibleDuplicates, openQuestions });
+    const openQuestions = reqStrArr(obj.openQuestions, `${p}.openQuestions`, issues, { maxItems: 10, maxItemLen: cap(500) });
+    if (claimId !== null && summary !== null) {
+      if (expected !== undefined) {
+        if (expected.has(claimId)) covered.add(claimId);
+        else issues.push(fail(`${p}.claimId`, 'unknown', `claimSummaries key ${claimId} is not an expected id`));
+      }
+      summaries.push({ claimId, summary, possibleDuplicates, openQuestions });
+    }
   });
-  const observations = optStr(o.observations, 'file.observations', issues, { max: 4000 });
+  if (expected !== undefined) {
+    const missing = [...expected].filter((k) => !covered.has(k)).sort();
+    if (missing.length > 0) {
+      issues.push(
+        fail('file.claimSummaries', 'incomplete', `no summary entry for ${missing.length} expected id(s): ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', …' : ''}`),
+      );
+    }
+  }
+  const observations = optStr(o.observations, 'file.observations', issues, { max: cap(4000) });
   if (issues.length || runId === null || participantId === null) return parseFail(issues);
   const out: ScribeNotesFile = { schemaVersion: SCHEMA_VERSION, runId, participantId, claimSummaries: summaries };
   if (observations !== undefined) out.observations = observations;
@@ -1145,7 +1248,7 @@ export const SYNTHESIS_GENERATED_AT_MAX = 40;
  */
 export function parseSynthesisFile(
   raw: unknown,
-  ctx: { runId?: string; participantId?: string },
+  ctx: { runId?: string; participantId?: string; maxTextChars?: number },
 ): ParseResult<SynthesisFile> {
   const issues: ValidationIssue[] = [];
   const o = reqObj(raw, 'file', issues);
@@ -1157,11 +1260,12 @@ export function parseSynthesisFile(
     issues.push(fail('file.runId', 'mismatch', `expected ${ctx.runId}`));
   if (participantId !== null && ctx.participantId !== undefined && participantId !== ctx.participantId)
     issues.push(fail('file.participantId', 'mismatch', `expected ${ctx.participantId}`));
+  const cap = mkCap(ctx);
   const generatedAt = optStr(o.generatedAt, 'file.generatedAt', issues, { max: SYNTHESIS_GENERATED_AT_MAX });
-  const summary = reqStr(o.summary, 'file.summary', issues, { max: SYNTHESIS_SUMMARY_MAX });
+  const summary = reqStr(o.summary, 'file.summary', issues, { max: cap(SYNTHESIS_SUMMARY_MAX) });
   const limitations = reqStrArr(o.limitations, 'file.limitations', issues, {
     maxItems: SYNTHESIS_LIMITATIONS_MAX_ITEMS,
-    maxItemLen: SYNTHESIS_LIMITATION_MAX_LEN,
+    maxItemLen: cap(SYNTHESIS_LIMITATION_MAX_LEN),
   });
   if (issues.length || runId === null || participantId === null || summary === null) return parseFail(issues);
   const out: SynthesisFile = { schemaVersion: SCHEMA_VERSION, runId, participantId, summary, limitations };
@@ -1235,9 +1339,11 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
         // Challenger-authored evidence retained on the dissent record —
         // optional (legacy records lack it), validated like any evidence list.
         const dEvidence = parseEvidenceArr(obj.evidence, `${p}.evidence`, issues, { maxItems: 20 });
+        const dChallengeId = optId(obj.challengeId, `${p}.challengeId`, issues);
         if (participantId !== null && position !== null && ts !== null && round !== undefined) {
           const rec: DissentRecord = { participantId, position, ts, round };
           if (dEvidence.length > 0) rec.evidence = dEvidence;
+          if (dChallengeId !== undefined) rec.challengeId = dChallengeId;
           dissent.push(rec);
         }
       });
@@ -1246,6 +1352,43 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
   const remedies = reqStrArr(o.remedies, `${path}.remedies`, issues, { maxItems: 100, maxItemLen: 500 });
   const openQuestions = reqStrArr(o.openQuestions, `${path}.openQuestions`, issues, { maxItems: 100, maxItemLen: 500 });
   const mergedTitles = reqStrArr(o.mergedTitles, `${path}.mergedTitles`, issues, { maxItems: 100, maxItemLen: 200 });
+  // Discussion-accounting fields — additive; absent on pre-accounting ledgers.
+  const dedupeKey = optStr(o.dedupeKey, `${path}.dedupeKey`, issues, { max: 400 });
+  const rejectedEvidence = o.rejectedEvidence === undefined || o.rejectedEvidence === null
+    ? undefined
+    : (reqInt(o.rejectedEvidence, `${path}.rejectedEvidence`, issues, { min: 0 }) ?? undefined);
+  const challenges: ClaimChallenge[] = [];
+  if (o.challenges !== undefined) {
+    if (!isArr(o.challenges)) issues.push(fail(`${path}.challenges`, 'type', 'expected array'));
+    else if (o.challenges.length > 200) issues.push(fail(`${path}.challenges`, 'too_many', 'at most 200 challenge records'));
+    else
+      o.challenges.forEach((c, i) => {
+        const p = `${path}.challenges[${i}]`;
+        const obj = reqObj(c, p, issues);
+        if (obj === null) return;
+        const challengeId = reqId(obj.challengeId, `${p}.challengeId`, issues);
+        const round = reqInt(obj.round, `${p}.round`, issues, { min: 1, max: 3 });
+        const challengerPid = reqId(obj.challengerPid, `${p}.challengerPid`, issues);
+        const kind = reqEnum(obj.kind, CHALLENGE_KINDS, `${p}.kind`, issues);
+        const answered = isBool(obj.answered)
+          ? obj.answered
+          : (issues.push(fail(`${p}.answered`, 'type', 'expected boolean')), undefined);
+        let response: ClaimChallenge['response'];
+        if (obj.response !== undefined && obj.response !== null) {
+          const ro = reqObj(obj.response, `${p}.response`, issues);
+          if (ro !== null) {
+            const rPid = reqId(ro.participantId, `${p}.response.participantId`, issues);
+            const rDisp = reqEnum(ro.disposition, RESPONSE_DISPOSITIONS, `${p}.response.disposition`, issues);
+            if (rPid !== null && rDisp !== null) response = { participantId: rPid, disposition: rDisp };
+          }
+        }
+        if (challengeId !== null && round !== null && challengerPid !== null && kind !== null && answered !== undefined) {
+          const rec: ClaimChallenge = { challengeId, round, challengerPid, kind, answered };
+          if (response !== undefined) rec.response = response;
+          challenges.push(rec);
+        }
+      });
+  }
   const assessments: ClaimAssessment[] = [];
   if (o.assessments !== undefined) {
     if (!isArr(o.assessments)) issues.push(fail(`${path}.assessments`, 'type', 'expected array'));
@@ -1274,6 +1417,233 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
   if (openQuestions.length > 0) out.openQuestions = openQuestions;
   if (assessments.length > 0) out.assessments = assessments;
   if (mergedTitles.length > 0) out.mergedTitles = mergedTitles;
+  if (challenges.length > 0) out.challenges = challenges;
+  if (dedupeKey !== undefined) out.dedupeKey = dedupeKey;
+  if (rejectedEvidence !== undefined) out.rejectedEvidence = rejectedEvidence;
+  return out;
+}
+
+/**
+ * Canonical (runner-stamped) strength — same field rules as a worker
+ * Strength plus REQUIRED provenance ids. Used for ledger/report rereads;
+ * provenance is never trusted from the worker-facing shape.
+ */
+function parseCanonicalStrength(u: unknown, path: string, issues: ValidationIssue[]): CanonicalStrength | null {
+  const base = parseStrength(u, path, issues);
+  if (base === null) return null;
+  const o = u as Record<string, unknown>;
+  const participantId = reqId(o.participantId, `${path}.participantId`, issues);
+  const perspectiveId = reqId(o.perspectiveId, `${path}.perspectiveId`, issues);
+  if (participantId === null || perspectiveId === null) return null;
+  return { ...base, participantId, perspectiveId };
+}
+
+function parseClaimIdList(u: unknown, path: string, issues: ValidationIssue[], maxItems: number): string[] {
+  if (!isArr(u)) {
+    issues.push(fail(path, 'type', 'expected array'));
+    return [];
+  }
+  if (u.length > maxItems) {
+    issues.push(fail(path, 'too_many', `at most ${maxItems} ids`));
+    return [];
+  }
+  const out: string[] = [];
+  u.forEach((item, i) => {
+    const id = reqId(item, `${path}[${i}]`, issues);
+    if (id !== null) out.push(id);
+  });
+  return out;
+}
+
+/**
+ * claims.json reread parser — the ledger is a runner artifact, but artifact
+ * integrity requires a typed parse on every consumption: a corrupted or
+ * hand-edited ledger fails visibly here instead of being trusted by cast.
+ * Optional fields (strengths/discussion/challenges/dedupeKey/…) stay absent
+ * on legacy ledgers, which keep loading.
+ */
+export function parseClaimLedger(raw: unknown, ctx: { runId?: string }): ParseResult<ClaimLedger> {
+  const issues: ValidationIssue[] = [];
+  const o = reqObj(raw, 'ledger', issues);
+  if (o === null) return parseFail(issues);
+  reqVersion(o.schemaVersion, 'ledger.schemaVersion', issues);
+  const runId = reqId(o.runId, 'ledger.runId', issues);
+  if (runId !== null && ctx.runId !== undefined && runId !== ctx.runId)
+    issues.push(fail('ledger.runId', 'mismatch', `expected ${ctx.runId}`));
+  const claims: Claim[] = [];
+  if (!isArr(o.claims)) {
+    issues.push(fail('ledger.claims', 'type', 'expected array'));
+  } else if (o.claims.length > 500) {
+    issues.push(fail('ledger.claims', 'too_many', 'at most 500 claims'));
+  } else {
+    o.claims.forEach((c, i) => {
+      const parsed = parseClaim(c, `ledger.claims[${i}]`, issues);
+      if (parsed !== null) claims.push(parsed);
+    });
+  }
+  const provenance: ClaimLedger['provenance'] = {};
+  if (!isObj(o.provenance)) {
+    issues.push(fail('ledger.provenance', 'type', 'expected object map'));
+  } else {
+    for (const [claimId, pids] of Object.entries(o.provenance)) {
+      if (!ID_RE.test(claimId)) {
+        issues.push(fail(`ledger.provenance key ${JSON.stringify(claimId)}`, 'bad_id', 'invalid claimId'));
+        continue;
+      }
+      if (!isArr(pids)) {
+        issues.push(fail(`ledger.provenance[${JSON.stringify(claimId)}]`, 'type', 'expected array of participant ids'));
+        continue;
+      }
+      const list: string[] = [];
+      let bad = false;
+      for (const [j, p] of pids.entries()) {
+        if (!isStr(p) || !ID_RE.test(p)) {
+          issues.push(fail(`ledger.provenance[${JSON.stringify(claimId)}][${j}]`, 'bad_id', 'invalid participantId'));
+          bad = true;
+          break;
+        }
+        list.push(p);
+      }
+      if (!bad) provenance[claimId] = list;
+    }
+  }
+  let strengths: CanonicalStrength[] | undefined;
+  if (o.strengths !== undefined && o.strengths !== null) {
+    if (!isArr(o.strengths)) {
+      issues.push(fail('ledger.strengths', 'type', 'expected array'));
+    } else {
+      if (o.strengths.length > 100) issues.push(fail('ledger.strengths', 'too_many', 'at most 100 canonical strengths'));
+      strengths = [];
+      o.strengths.forEach((s, i) => {
+        const parsed = parseCanonicalStrength(s, `ledger.strengths[${i}]`, issues);
+        if (parsed !== null) strengths!.push(parsed);
+      });
+    }
+  }
+  let discussion: ClaimLedger['discussion'];
+  if (o.discussion !== undefined && o.discussion !== null) {
+    const d = reqObj(o.discussion, 'ledger.discussion', issues);
+    if (d !== null) {
+      if (!isArr(d.rounds)) {
+        issues.push(fail('ledger.discussion.rounds', 'type', 'expected array'));
+      } else {
+        const rounds: RoundRoutingRecord[] = [];
+        d.rounds.forEach((r, i) => {
+          const p = `ledger.discussion.rounds[${i}]`;
+          const ro = reqObj(r, p, issues);
+          if (ro === null) return;
+          const round = reqInt(ro.round, `${p}.round`, issues, { min: 1, max: 3 });
+          const ch = reqObj(ro.challenges, `${p}.challenges`, issues);
+          let challenges: ChallengeRoutingRecord | null = null;
+          if (ch !== null) {
+            const routedClaimIds = parseClaimIdList(ch.routedClaimIds, `${p}.challenges.routedClaimIds`, issues, 500);
+            const byteDroppedClaimIds = parseClaimIdList(ch.byteDroppedClaimIds, `${p}.challenges.byteDroppedClaimIds`, issues, 500);
+            const unassigned: ChallengeRoutingRecord['unassigned'] = [];
+            if (!isArr(ch.unassigned)) issues.push(fail(`${p}.challenges.unassigned`, 'type', 'expected array'));
+            else
+              ch.unassigned.forEach((u, j) => {
+                const up = `${p}.challenges.unassigned[${j}]`;
+                const uo = reqObj(u, up, issues);
+                if (uo === null) return;
+                const cid = reqId(uo.claimId, `${up}.claimId`, issues);
+                const reason = reqStr(uo.reason, `${up}.reason`, issues, { max: 500 });
+                if (cid !== null && reason !== null) unassigned.push({ claimId: cid, reason });
+              });
+            challenges = { routedClaimIds, byteDroppedClaimIds, unassigned };
+          }
+          let responses: ResponseRoutingRecord | undefined;
+          if (ro.responses !== undefined && ro.responses !== null) {
+            const rs = reqObj(ro.responses, `${p}.responses`, issues);
+            if (rs !== null) {
+              const routedChallengeIds = parseClaimIdList(rs.routedChallengeIds, `${p}.responses.routedChallengeIds`, issues, 1000);
+              const byteDropped: ResponseRoutingRecord['byteDropped'] = [];
+              if (!isArr(rs.byteDropped)) issues.push(fail(`${p}.responses.byteDropped`, 'type', 'expected array'));
+              else
+                rs.byteDropped.forEach((b, j) => {
+                  const bp = `${p}.responses.byteDropped[${j}]`;
+                  const bo = reqObj(b, bp, issues);
+                  if (bo === null) return;
+                  const cid = reqId(bo.claimId, `${bp}.claimId`, issues);
+                  const authorPid = reqId(bo.authorPid, `${bp}.authorPid`, issues);
+                  if (cid !== null && authorPid !== null) byteDropped.push({ claimId: cid, authorPid });
+                });
+              const capOmitted: ResponseRoutingRecord['capOmitted'] = [];
+              if (!isArr(rs.capOmitted)) issues.push(fail(`${p}.responses.capOmitted`, 'type', 'expected array'));
+              else
+                rs.capOmitted.forEach((c2, j) => {
+                  const cp = `${p}.responses.capOmitted[${j}]`;
+                  const co = reqObj(c2, cp, issues);
+                  if (co === null) return;
+                  const chid = reqId(co.challengeId, `${cp}.challengeId`, issues);
+                  const cid = reqId(co.claimId, `${cp}.claimId`, issues);
+                  const authorPid = reqId(co.authorPid, `${cp}.authorPid`, issues);
+                  if (chid !== null && cid !== null && authorPid !== null) capOmitted.push({ challengeId: chid, claimId: cid, authorPid });
+                });
+              const unroutable: ResponseRoutingRecord['unroutable'] = [];
+              if (!isArr(rs.unroutable)) issues.push(fail(`${p}.responses.unroutable`, 'type', 'expected array'));
+              else
+                rs.unroutable.forEach((u2, j) => {
+                  const up = `${p}.responses.unroutable[${j}]`;
+                  const uo = reqObj(u2, up, issues);
+                  if (uo === null) return;
+                  const chid = reqId(uo.challengeId, `${up}.challengeId`, issues);
+                  const cid = reqId(uo.claimId, `${up}.claimId`, issues);
+                  const reason = reqStr(uo.reason, `${up}.reason`, issues, { max: 500 });
+                  if (chid !== null && cid !== null && reason !== null) unroutable.push({ challengeId: chid, claimId: cid, reason });
+                });
+              responses = { routedChallengeIds, byteDropped, capOmitted, unroutable };
+            }
+          }
+          if (round !== null && challenges !== null) {
+            const rec: RoundRoutingRecord = { round, challenges };
+            if (responses !== undefined) rec.responses = responses;
+            rounds.push(rec);
+          }
+        });
+        discussion = { rounds };
+      }
+    }
+  }
+  if (issues.length || runId === null) return parseFail(issues);
+  const out: ClaimLedger = { schemaVersion: SCHEMA_VERSION, runId, claims, provenance };
+  if (strengths !== undefined && strengths.length > 0) out.strengths = strengths;
+  if (discussion !== undefined) out.discussion = discussion;
+  return ok(out);
+}
+
+/** Parse one runnerFacts.discussion round-accounting array (optional field). */
+function parseDiscussionFacts(u: unknown, path: string, issues: ValidationIssue[]): DiscussionRoundFacts[] | undefined {
+  if (u === undefined || u === null) return undefined;
+  if (!isArr(u)) {
+    issues.push(fail(path, 'type', 'expected array'));
+    return undefined;
+  }
+  const out: DiscussionRoundFacts[] = [];
+  u.forEach((r, i) => {
+    const p = `${path}[${i}]`;
+    const o = reqObj(r, p, issues);
+    if (o === null) return;
+    const num = (key: keyof DiscussionRoundFacts & string): number | null =>
+      reqInt(o[key], `${p}.${key}`, issues, { min: 0 });
+    const round = reqInt(o.round, `${p}.round`, issues, { min: 1, max: 3 });
+    const fields = {
+      challengesFiled: num('challengesFiled'),
+      challengesAnswered: num('challengesAnswered'),
+      challengesUnanswered: num('challengesUnanswered'),
+      claimsRouted: num('claimsRouted'),
+      claimsRoutedNoChallenge: num('claimsRoutedNoChallenge'),
+      claimsNeverRouted: num('claimsNeverRouted'),
+      claimsUnassigned: num('claimsUnassigned'),
+      claimsByteDropped: num('claimsByteDropped'),
+      responsesRouted: num('responsesRouted'),
+      responsesByteDropped: num('responsesByteDropped'),
+      responsesCapOmitted: num('responsesCapOmitted'),
+      responsesUnroutable: num('responsesUnroutable'),
+    };
+    if (round !== null && Object.values(fields).every((v) => v !== null)) {
+      out.push({ round, ...(fields as { [K in keyof typeof fields]: number }) });
+    }
+  });
   return out;
 }
 
@@ -1287,6 +1657,22 @@ export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseRes
     issues.push(fail('file.runId', 'mismatch', `expected ${ctx.runId}`));
   const generatedAt = reqStr(o.generatedAt, 'file.generatedAt', issues, { max: 40 });
   const summary = reqStr(o.summary, 'file.summary', issues, { max: 8000 });
+  // What was reviewed — optional; absent on pre-provenance reports.
+  let provenance: ReportProvenance | undefined;
+  if (o.provenance !== undefined && o.provenance !== null) {
+    const pv = reqObj(o.provenance, 'file.provenance', issues);
+    if (pv !== null) {
+      const snapshotId = reqId(pv.snapshotId, 'file.provenance.snapshotId', issues);
+      const gitHead = pv.gitHead === null || pv.gitHead === undefined
+        ? null
+        : reqStr(pv.gitHead, 'file.provenance.gitHead', issues, { max: 128 });
+      const targetRoot = reqStr(pv.targetRoot, 'file.provenance.targetRoot', issues, { max: 500 });
+      const objective = reqStr(pv.objective, 'file.provenance.objective', issues, { max: 8000 });
+      if (snapshotId !== null && gitHead !== undefined && targetRoot !== null && objective !== null) {
+        provenance = { snapshotId, gitHead, targetRoot, objective };
+      }
+    }
+  }
   const cov = reqObj(o.coverage, 'file.coverage', issues);
   let coverage: ReportCoverage | null = null;
   if (cov !== null) {
@@ -1334,6 +1720,17 @@ export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseRes
       if (parsed !== null) claims.push(parsed);
     });
   const limitations = reqStrArr(o.limitations, 'file.limitations', issues, { maxItems: 20, maxItemLen: 1000 });
+  // Canonical strengths — optional; absent on pre-strengths reports.
+  const strengths: CanonicalStrength[] = [];
+  if (o.strengths !== undefined && o.strengths !== null) {
+    if (!isArr(o.strengths)) issues.push(fail('file.strengths', 'type', 'expected array'));
+    else if (o.strengths.length > 100) issues.push(fail('file.strengths', 'too_many', 'at most 100 canonical strengths'));
+    else
+      o.strengths.forEach((s, i) => {
+        const parsed = parseCanonicalStrength(s, `file.strengths[${i}]`, issues);
+        if (parsed !== null) strengths.push(parsed);
+      });
+  }
   // Deterministic runner facts — optional (absent on pre-repair reports),
   // fully validated when present so a malformed fact block is a parse issue.
   let runnerFacts: RunnerFacts | undefined;
@@ -1365,17 +1762,31 @@ export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseRes
           maxItems: 500,
           maxItemLen: 128,
         });
+        const unansweredChallenges = reqStrArr(claimsObj.unansweredChallenges, 'file.runnerFacts.claims.unansweredChallenges', issues, {
+          maxItems: 500,
+          maxItemLen: 128,
+        });
         const withdrawn = reqInt(claimsObj.withdrawn, 'file.runnerFacts.claims.withdrawn', issues, { min: 0 });
         const escalated = reqInt(claimsObj.escalated, 'file.runnerFacts.claims.escalated', issues, { min: 0 });
         if (total !== null && withdrawn !== null && escalated !== null) {
           claimsFacts = { total, byStatus, withDissent, withdrawn, escalated };
+          // Optional — absent on facts computed before discussion accounting.
+          if (claimsObj.unansweredChallenges !== undefined && claimsObj.unansweredChallenges !== null) {
+            claimsFacts.unansweredChallenges = unansweredChallenges;
+          }
         }
       }
+      const strengthsCount = rf.strengths === undefined || rf.strengths === null
+        ? undefined
+        : (reqInt(rf.strengths, 'file.runnerFacts.strengths', issues, { min: 0 }) ?? undefined);
+      const discussion = parseDiscussionFacts(rf.discussion, 'file.runnerFacts.discussion', issues);
       if (
         seatsCompleted !== null && seatsSelected !== null && partialCoverage !== undefined &&
         partialCoverage !== null && summarySource !== null && claimsFacts !== null
       ) {
         runnerFacts = { seatsCompleted, seatsSelected, partialCoverage, uncoveredPerspectiveIds, summarySource, claims: claimsFacts };
+        if (strengthsCount !== undefined) runnerFacts.strengths = strengthsCount;
+        if (discussion !== undefined) runnerFacts.discussion = discussion;
       }
     }
   }
@@ -1395,7 +1806,9 @@ export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseRes
   }
   if (issues.length || runId === null || generatedAt === null || summary === null || coverage === null) return parseFail(issues);
   const out: CouncilReport = { schemaVersion: SCHEMA_VERSION, runId, generatedAt, summary, coverage, claims, limitations };
+  if (provenance !== undefined) out.provenance = provenance;
   if (runnerFacts !== undefined) out.runnerFacts = runnerFacts;
+  if (strengths.length > 0) out.strengths = strengths;
   if (limitationSources.length > 0) out.limitationSources = limitationSources;
   return ok(out);
 }
@@ -1686,6 +2099,59 @@ export function parseCouncilState(raw: unknown): ParseResult<CouncilState> {
     config, snapshotId, approvalHash, participants, discussion, supervisor,
     consumption, phaseEnteredAt, createdAt,
   });
+}
+
+// ─── Terminal-create custody records ────────────────────────────────────────
+
+/**
+ * Journal-before terminal-create intent — validated when the record is
+ * persisted to journal/state so a tampered or malformed custody record is a
+ * parse failure, never silently trusted.
+ */
+export function parseTerminalCreateIntent(raw: unknown): ParseResult<TerminalCreateIntent> {
+  const issues: ValidationIssue[] = [];
+  const o = reqObj(raw, 'intent', issues);
+  if (o === null) return parseFail(issues);
+  const intentId = reqId(o.intentId, 'intent.intentId', issues);
+  const participantId = optId(o.participantId, 'intent.participantId', issues);
+  const taskId = reqId(o.taskId, 'intent.taskId', issues);
+  const runId = reqId(o.runId, 'intent.runId', issues);
+  const worktree = reqStr(o.worktree, 'intent.worktree', issues, { max: 200 });
+  const title = reqStr(o.title, 'intent.title', issues, { max: 500 });
+  const command = reqStr(o.command, 'intent.command', issues, { max: 4000 });
+  const createdAt = optStr(o.createdAt, 'intent.createdAt', issues, { max: 40 });
+  if (issues.length || intentId === null || taskId === null || runId === null ||
+    worktree === null || title === null || command === null)
+    return parseFail(issues);
+  const out: TerminalCreateIntent = { intentId, taskId, runId, worktree, title, command };
+  if (participantId !== undefined) out.participantId = participantId;
+  if (createdAt !== undefined) out.createdAt = createdAt;
+  return ok(out);
+}
+
+/**
+ * After-create custody receipt — same persistence-validation stance as the
+ * intent: 'created' requires no handle (host may legitimately omit it),
+ * 'refused'/'uncertain' carry optional identity hints only.
+ */
+export function parseTerminalCreateReceipt(raw: unknown): ParseResult<TerminalCreateReceipt> {
+  const issues: ValidationIssue[] = [];
+  const o = reqObj(raw, 'receipt', issues);
+  if (o === null) return parseFail(issues);
+  const intentId = reqId(o.intentId, 'receipt.intentId', issues);
+  const taskId = reqId(o.taskId, 'receipt.taskId', issues);
+  const outcome = reqEnum(o.outcome, ['created', 'refused', 'uncertain'] as const, 'receipt.outcome', issues);
+  const terminalHandle = optId(o.terminalHandle, 'receipt.terminalHandle', issues);
+  const requestId = o.requestId === undefined || o.requestId === null ? undefined : (reqStr(o.requestId, 'receipt.requestId', issues, { max: 128 }) ?? undefined);
+  const detail = optStr(o.detail, 'receipt.detail', issues, { max: 1000 });
+  const observedAt = optStr(o.observedAt, 'receipt.observedAt', issues, { max: 40 });
+  if (issues.length || intentId === null || taskId === null || outcome === null) return parseFail(issues);
+  const out: TerminalCreateReceipt = { intentId, taskId, outcome };
+  if (terminalHandle !== undefined) out.terminalHandle = terminalHandle;
+  if (requestId !== undefined) out.requestId = requestId;
+  if (detail !== undefined) out.detail = detail;
+  if (observedAt !== undefined) out.observedAt = observedAt;
+  return ok(out);
 }
 
 export function parseJournalEvent(raw: unknown): ParseResult<JournalEvent> {

@@ -41,7 +41,9 @@ npm run build
 npm test
 ```
 
-Run the CLI as `node dist/src/cli.js <command>` from this checkout — the
+Ready-made config/roster templates with placeholder staff and seat choices
+ship under `skills/council/references/templates/` — see
+[Configuration](#configuration) below. Run the CLI as `node dist/src/cli.js <command>` from this checkout — the
 package `bin` maps `council` to `dist/src/cli.js` (see `package.json`). All
 commands accept `--json`; agent callers should prefer it. `council help`, no
 arguments, or `<command> --help` prints the command list.
@@ -91,8 +93,10 @@ roster.approved.json    # YOUR selected seats + explicit agent/model/permission 
 approval.json           # the persisted approval record + binding payload (hash-bound)
 
 findings/<pid>.json                     # each reviewer's independent findings
+                                        #  (findings[] + optional bounded strengths[])
 claims.json                             # the canonical claim ledger (grades, statuses,
-                                        #  evidence, provenance, dissent, history)
+                                        #  evidence, provenance, dissent, history,
+                                        #  canonical strengths, discussion routing)
 rounds/<n>/envelopes/challenge/<pid>.json   # per-recipient challenge envelope (only
 rounds/<n>/envelopes/response/<pid>.json    #  input a discussion worker may read)
 rounds/<n>/challenges/<pid>.json        # challenger outputs
@@ -102,6 +106,10 @@ scribe/notes.json                       # initial scribe notes over admitted fin
 scribe/report.json                     # scribe narrative (SynthesisFile); legacy full reports accepted
 rejected/                              # preserved rejected output and complete validation diagnostics
 report.json, report.md, summary.md      # the canonical final report artifacts
+
+progress/recipient.json                 # the persisted stage-wake recipient {to, source, recordedAt}
+progress/outbox.json                    # durable dedupe/delivery receipts for stage notices
+progress/helper.lease, helper.json      # the bounded progress helper's lease + diagnostics
 ```
 
 Nothing under the run directory requires the reviewed project to be modified.
@@ -124,6 +132,10 @@ Creates the run directory, snapshots the target (git HEAD plus a per-file hash
 manifest), resolves and validates the config, writes `meta.json` (including
 `launchBudgetFloor`, the minimum launches this config needs), and emits
 `prompts/supervisor.md` plus the exact `advanceCommand` the supervisor runs.
+It also captures the **progress-wake recipient** — the initiating
+orchestrator's mail target — into `progress/recipient.json` BEFORE any
+supervisor binding exists, so stage notices keep reaching you even if the
+supervisor identity later changes (see "Progress wakes" below).
 
 **Fresh runs require an explicit, complete staff.** `--config` must carry
 `staff.organiser`, `staff.scribe`, and `staff.supervisor` — each an
@@ -172,7 +184,7 @@ reported as such. `ready` is true when every required check verifies.
 ### `council start-supervisor` — launch the dedicated supervisor worker
 
 ```text
-council start-supervisor --run <runDir> [--wait-ms <n>] --json
+council start-supervisor --run <runDir> [--wait-ms <n>] [--replace] --json
 ```
 
 Creates the supervisor's Orca Task from `prompts/supervisor.md`, opens a
@@ -191,10 +203,15 @@ allowlisted tokens — nothing user-supplied ever becomes shell syntax.
 The idle wait is followed by a `terminal show` check of the exact terminal,
 connection, expected agent identity and explicit absence of an agent prompt.
 A trust or permission screen pauses setup; it is never accepted automatically.
-JSON callers must check `outcome`/`supervisorStarted`: a successful command can
-report `outcome:"paused"`, `supervisorStarted:false`, `needsAttention:true`,
-the existing Task/terminal IDs, and recovery instructions. It has not launched
-a supervisor in that case.
+JSON callers must check `outcome`/`supervisorStarted`: a command exiting 0
+with `ok:true` can still report `outcome:"paused"`,
+`supervisorStarted:false`, `needsAttention:true` — it has not launched a
+supervisor. The payload then carries `reason:{code,message}` naming the
+blocker (a trust/permission screen, an unresolved custody record, an
+ambiguous startup receipt), any partial `taskId`/`terminalHandle`/
+`boundRunId`, `startupRecord`, `recovery` instructions, and `requestIds`.
+Resolve the blocker, then rerun the same command — it reuses the recorded
+resources.
 
 `supervisor/startup.json` records startup intent, spec hash, caller binding,
 resource IDs and known request IDs under the run lock. After resolving a
@@ -208,6 +225,19 @@ binding is preserved, never rebound). When the caller has no bound Run — e.g.
 a first-time `init` followed directly by `start-supervisor` — the documented
 `worker-start --spec-file` path creates or joins a Run implicitly instead of
 failing. Either way the response reports `callerRun` and `lane` honestly.
+
+**`--replace` — guarded dead-supervisor replacement.** Orca terminal handles
+are runtime-scoped: an Orca restart makes the recorded handle permanently
+unmatchable, and plain `start-supervisor` refuses while a supervisor is
+recorded. `--replace` launches a new supervisor only when the old identity is
+**proven** stale — `terminal show` returns a definitive stale-handle code —
+and the original attach/dispatch custody is resolved (`worker-list` plus
+`request-show` on any issued-start receipt). Success prints
+`{outcome:"launched", replaced:true, retiredSupervisor:{...}}`; the old
+startup record is archived and the retirement journaled. It refuses on a
+still-live supervisor (`invalid_transition`) or unproven/contradictory
+evidence (`launch_unknown`) with `details.probes`/`details.recovery` — quiet
+or disconnected is never proof of death.
 
 ### `council supervise --advance` — one deterministic step
 
@@ -302,9 +332,13 @@ intent. Nothing is ever reset, erased, or retried blindly.
 council approve --run <runDir> --roster <file> [--note "<text>"] --json
 ```
 
-Validates your `roster.approved.json` (exactly `config.participants` seats, each
-selecting one proposed `perspectiveId` with unique `seatId`/`participantId` and
-an explicit `agent`/`model`/`permissionMode`), then persists `approval.json`:
+Validates your `roster.approved.json`, which is a **wrapper object**, not a
+bare seat array — `schemaVersion:1`, `runId` (must equal the run's id), and
+`seats[]` with exactly `config.participants` entries, each selecting one
+proposed `perspectiveId` with unique `seatId`/`participantId` and an explicit
+`agent`/`model`/`permissionMode` (a fill-in template ships at
+`skills/council/references/templates/roster.approved.template.json`).
+`approve` then persists `approval.json`:
 a record whose `hash` is SHA-256 over the canonical binding
 `{runId, objective, seats, proposedRosterHash, config, snapshotId,
 snapshotHeadHash}` — so the approval is bound to the exact proposed roster as
@@ -331,12 +365,20 @@ wake.
 council status --run <runDir> --json
 ```
 
-Prints the run status, per-participant status and active attempt, consumption
+Prints the run status, per-participant status and active attempt (with
+`dispatchId` for manual fencing), consumption
 (`launches` vs `maxLaunches`, `mailSent`), `approvalHash`, the quorum
 position (reviewers with admitted independent findings vs
-`ceil(quorumRatio × seats)` — a coverage diagnostic, not a gate), and `pendingDecisions`
-(e.g. re-approve after invalidation, reconcile an `unknown` attempt — never
-relaunch). Read-only.
+`ceil(quorumRatio × seats)` — a coverage diagnostic, not a gate), and
+`pendingDecisions`/`pendingActions` (e.g. re-approve after invalidation,
+reconcile an `intent_recorded` no-task attempt — never relaunch; an
+`unknown` attempt gets observation guidance, never the reconcile command).
+Additive diagnostics: `activity` (`lastEventAt`, `ageMs`, event count — a
+stalled run reads as stale, not as "working"), `phase` timing (`enteredAt`,
+`deadlineMs`, `graceMs`, `overDeadline`), `supervisorHealth` (`recorded`
+plus a `live|stale|unproven|none` probe — a recorded supervisor is not
+proof of life), and a `progress` block reporting the wake recipient,
+delivery counters, and helper state. Read-only.
 
 ### `council tail` — journal inspection
 
@@ -357,7 +399,9 @@ Reports integrity only: re-hashes the live target against `snapshot.json`
 (drift + changed paths), recomputes the approval binding hash against
 `approval.json` (`bindingIntact`, `matchesStateHash`), and compares the run's
 recorded execution fingerprint against the shipped catalog (`catalog`:
-`intact` / `drifted`, or `legacy` on pre-catalog runs). `verified: true`
+`intact` / `drifted`, or `legacy` on pre-catalog runs). Runs with a managed
+integrity policy also verify hash receipts on admitted artifacts — legacy
+runs report `untracked` honestly rather than retro-verified. `verified: true`
 means no changed pinned files, a current approval binding, and a matching catalog fingerprint — it
 is **not** a proof of truth of findings, and it never executes or validates
 cited code. Recovery differs by failure: a changed pinned file means the
@@ -386,11 +430,59 @@ prove process exit. Only an explicit stopped result confirms cancellation.
 Inspect the journal and host receipt for unresolved resources; never force-close
 them to make a run appear clean.
 
+## Progress wakes — the run mails the initiating orchestrator
+
+The run notifies the **initiating orchestrator** at every lifecycle change —
+stage transitions, the approval gate, blockers, failure, completion — and a
+bounded run-local **progress helper** mails periodic updates during long,
+otherwise-silent stages (~every 2 minutes while a stage runs). Subject form:
+`council <crun>: <stage>`; the body carries persisted facts — stage label,
+participant/attempt counts, launch consumption, elapsed/stage age, the next
+action, and report paths on finish — never worker-liveness claims.
+
+- The recipient is captured into `progress/recipient.json` at `init` (and
+  refreshed on explicit override) **before** any supervisor binding exists —
+  the first durable target wins; a run with no recipient file gets no stage
+  mail (legacy runs included).
+- Notices are deduplicated by durable intent and carry their own bounded
+  send budgets — a repeated stage does not re-mail; `unknown` delivery
+  outcomes stay visible rather than blind-retried.
+- The helper is an argv-spawned `node` child — no shell, no agents, no
+  provider jobs — with a singleton lease, bounded lifetime and message
+  budget, and clean exit on terminal council state. It reads persisted
+  state/journal only: **no host status polling**. `status`'s `progress`
+  block reports recipient, delivery counters, and helper health
+  (`running`/`stale`/`dead`/`exited`/`none`) — a dead helper is a
+  visibility gap, never claimed as guaranteed delivery.
+- The supervisor agent sends none of this itself — stage mail is
+  runner-emitted; its spec forbids forwarding it.
+
+## Recovery playbooks
+
+- **Dead/stale supervisor**: `start-supervisor --run <dir> --replace`
+  (evidence-gated — see above). Refused means the old identity is not
+  proven stale; manual driving remains the fallback.
+- **Corrupt `events.jsonl`**: `advance` and `cancel` both fail closed — the
+  journal is durable truth. Fence live workers manually
+  (`worker-stop --dispatch <id>` from `status`/state records), preserve the
+  directory, start a new run. No journal rebuild exists.
+- **Corrupt `state.json`**: every command fails `io_error` at load — no
+  state rebuild exists. Fence live workers by dispatch ids from
+  `events.jsonl`, keep the directory for audit.
+- **`lock_timeout`**: the lock names its live owner pid. Dead owner →
+  automatic stale reclaim after `COUNCIL_LOCK_STALE_MS` (60 s; waits
+  `COUNCIL_LOCK_WAIT_MS` 10 s). NEVER delete a lock its live pid still
+  owns — that races a real writer.
+
 ## Configuration
 
 `--config <file>` at `init` overrides these defaults; the resolved config is
 persisted, hashed into the approval binding, and journaled. Unknown keys are
-ignored; invalid values are refused. Enforcement is split honestly: limits the
+ignored; invalid values are refused. Fill-in templates ship at
+`skills/council/references/templates/`: `council.config.template.json`
+(every key below with `staff` placeholders) and
+`council.config.smoke.template.json` (a bounded rehearsal: 10 perspectives,
+2 seats, 1 round, tightened budgets). Enforcement is split honestly: limits the
 runner physically controls (concurrency, launches, rounds, envelope bytes,
 forwarded mail, findings/challenge/response caps at ingest, deadlines) are
 enforced by the CLI; limits inside a worker's own session (token/tool use,
@@ -410,7 +502,7 @@ only cap and validate outputs afterwards.
 | `maxResponsesPerSeatPerRound` | 3 | per-seat per-round author-response cap |
 | `envelopeBytes` | 8192 | per-recipient work-envelope byte cap (complete entries are trimmed visibly; JSON is never cut mid-token) |
 | `maxMailPerParticipant` | 6 | per-seat runner-originated mail cap |
-| `maxTextChars` | 4000 | cap on any single free-text field in worker output |
+| `maxTextChars` | 4000 | declared free-text bound — parsed, persisted and approval-bound, but **not currently wired into admission**; the enforced limits are the itemized per-field caps in each worker spec (`title` ≤200, `note` ≤2000, `argument` ≤4000, `summary` ≤8000, …) |
 | `deadlines` | object below | per-phase wall-clock limits in ms, checked inside `advance` (never real-time) |
 | `staff` | required on fresh runs | `{organiser, scribe, supervisor}` — each a complete AgentChoice `{agent, model, permissionMode, effort?, profile?}` from the shipped catalog; a partial staff object is invalid |
 | `execution` | captured by `init` | `{catalogVersion, policyHash}` — the shipped catalog fingerprint; a supplied fingerprint must match or init refuses |
@@ -430,11 +522,18 @@ catalog cannot launch is refused — no fallback, no substitution.
 With `participants=15` and `rounds=1` the launch floor is `15 + 30 + 3 = 48`,
 so the default `maxLaunches` is 56; with `rounds=3` the floor is
 `15 + 90 + 3 = 108`. Set `participants`/`rounds` lower to shrink the floor —
-e.g. the reduced smoke config is `requestedPerspectives=10`, `participants=2`.
+e.g. the bounded smoke template
+(`skills/council/references/templates/council.config.smoke.template.json`)
+uses `requestedPerspectives=10`, `participants=2`, `rounds=1` → a floor of
+`2 + 4 + 3 = 9` launches before retry slack, and tightens per-seat budgets
+and deadlines for a cheap end-to-end rehearsal.
 
 ## Flow recap for the calling agent
 
-1. `init` (with an explicit `staff` in `--config`) → `start-supervisor`
+0. `doctor --config <file> --json` — preflight Node/Orca plus the selected
+   staff's binaries before committing launches.
+1. `init` (with an explicit `staff` in `--config` — see the templates under
+   `skills/council/references/templates/`) → `start-supervisor`
    (which resolves the run's `staff.supervisor` catalog lane and records the
    supervisor's dispatch) — or drive `supervise --advance` yourself per wake.
    With a dedicated supervisor your Orca Run binding stays untouched; the
@@ -442,15 +541,19 @@ e.g. the reduced smoke config is `requestedPerspectives=10`, `participants=2`.
    advance. If you drive `advance` manually on a run that has no child Run
    yet, the host binds **you** to the child Run it creates — see the manual
    mode note under `supervise --advance` above.
-2. Wait for the supervisor's `needs_approval` mail; review
-   `roster.proposed.json`; write `roster.approved.json`; run `approve`; then
+2. Wait for the supervisor's `needs_approval` mail (council stage mail also
+   arrives — relay each notice's stage/counts/next action to the user);
+   review `roster.proposed.json`; write `roster.approved.json` (wrapper:
+   `schemaVersion`, `runId`, `seats[]`); run `approve`; then
    send the printed `send --to dispatch:<id>` nudge so the supervisor's next
    `advance` sees the approval (the engine also emits a journaled
    approval-wake notification — the explicit nudge is the reliable wake).
-3. Wait; `status` and `tail` are read-only and safe any time.
-4. Read `report.md` / `report.json` when the supervisor reports `finished`.
-   Partial results are visibly marked partial; a wholly failed run emits no
-   successful-looking report.
+3. Wait; `status` and `tail` are read-only and safe any time. Stage mail and
+   bounded heartbeats keep arriving — relay each to the user concisely;
+   silence until the final report is not acceptable.
+4. Read `report.md` / `report.json` when the supervisor reports `finished`,
+   then `verify` the run. Partial results are visibly marked partial; a
+   wholly failed run emits no successful-looking report.
 
 `skills/council/SKILL.md` carries the same recipe in agent-loadable form with
 full Orca command syntax, mail-consumption rules, cancellation, and uncertain-
@@ -465,9 +568,13 @@ outcome recovery.
   cooperative prompt rules; only admitted output is validated.
 - Does not claim `verified_defect` from reviewer output: in v1 the ledger caps
   reviewer-derived grades at `plausible_risk`; a matching citation or repeated
-  agreement never upgrades a claim.
+  agreement never upgrades a claim. Reviewer `strengths` are bounded
+  preservation records — never routed for challenge, never grade input.
 - Does not replay or rebuild state: `events.jsonl` is a durable, hash-chained
   record for audit and reconciliation, not a state-replay engine.
+- Does not promise notification delivery: stage/progress mail carries
+  persisted facts deduplicated durably — never a worker-liveness verdict —
+  and a dead helper or failed send is a visible gap, not hidden silence.
 - Does not install a skill for you or touch global config; the optional
   installer only copies the skill and records the runtime path (see
   [AI-INSTALL.md](AI-INSTALL.md)). The user-facing "bypass" posture maps to

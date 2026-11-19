@@ -57,6 +57,8 @@ import {
   type SourceSnapshot,
   type Store,
   type TaskListRow,
+  type TerminalCreateIntent,
+  type TerminalCreateReceipt,
   type WorkerListRow,
 } from './contracts.js';
 import {
@@ -67,6 +69,7 @@ import {
   err,
   parseApprovedRoster,
   parseChallengesFile,
+  parseClaimLedger,
   parseFindingsFile,
   parseProposedRoster,
   parseReportFile,
@@ -74,6 +77,19 @@ import {
   parseScribeNotesFile,
 } from './validation.js';
 import * as validationNs from './validation.js';
+import {
+  collectReceipts,
+  integrityPolicy,
+  journalHasPolicyMarker,
+  noteReceipt,
+  readVerifiedArtifact,
+  receiptJournalFields,
+  recordManagedWrite,
+  resolveIntegrityPolicy,
+  type ArtifactReceipt,
+  type IntegrityPolicy,
+  type ReceiptCategory,
+} from './artifacts.js';
 import {
   applyChallengesToLedger,
   applyResponsesToLedger,
@@ -85,6 +101,8 @@ import {
   fitEnvelope,
   indexAdmittedChallenges,
   makeEnvelopeBase,
+  recordChallengeRouting,
+  recordResponseRouting,
   type AdmittedFinding,
   type SourceAccess,
 } from './claims.js';
@@ -220,6 +238,29 @@ interface StepCtx {
   approvedRoster?: ApprovedRoster;
   /** Drift verdict cached once per advance — never re-scans per launch. */
   driftResult?: Result<SnapshotDrift>;
+  /**
+   * Resolved artifact-integrity policy for this run (marker agreement across
+   * council.json + journal). 'receipts-v1' runs mint/verify exact-byte
+   * receipts; 'legacy' runs stay honest and untracked — never retro-minted.
+   */
+  integrity: IntegrityPolicy;
+  /**
+   * Journal-authoritative receipt map (collectReceipts over events.jsonl).
+   * Updated in-step from the exact bytes held at mint/write time — never
+   * re-read from disk. An index-only orphan is invisible here, which is the
+   * point: only journaled receipts authorize anything.
+   */
+  receipts: Map<string, ArtifactReceipt>;
+  /**
+   * Envelope authorization, journal-derived: path → the claim/challenge ids
+   * the runner assigned when the envelope was built. NEVER re-derived from
+   * the worker-editable envelope file.
+   */
+  envelopeAssigned: Map<string, string[]>;
+  /** Envelope.built events that predate assignedIds journaling (legacy). */
+  legacyEnvelopes: Set<string>;
+  /** Journal-error details already emitted (anomaly dedupe across rebuilds). */
+  journaledErrors: Set<string>;
 }
 
 /** Corrective-attempt context handed to the spec builders (RepairContext). */
@@ -299,6 +340,118 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const abs = (rel: string): string => join(store.runDir, rel);
 
+  // ── Managed-artifact integrity (receipts-v1) ───────────────────────────────
+  //
+  // Write order for every managed write: bytes → integrity index → journal
+  // event carrying receiptJournalFields → flush (journal + state). The
+  // journal is authoritative; the index is its projection. A crash between
+  // index record and flush leaves an index-only orphan — invisible to the
+  // journal-authoritative ctx.receipts map — which idempotent replay heals
+  // (identical bytes re-record to the same receipt).
+
+  /**
+   * Runner-managed write with an exact-byte receipt on v1; plain write on
+   * legacy runs (they stay honestly untracked). Returns the minted receipt
+   * so the caller can merge receiptJournalFields into its journal event.
+   */
+  const mintedWrite = async (
+    ctx: StepCtx,
+    rel: string,
+    bytes: string,
+    category: ReceiptCategory,
+  ): Promise<Result<{ receipt?: ArtifactReceipt }>> => {
+    if (ctx.integrity !== 'receipts-v1') {
+      const w = await store.writeArtifact(rel, bytes);
+      if (!w.ok) return w as Result<never>;
+      return ok({});
+    }
+    const r = await recordManagedWrite(store, rel, bytes, category, {
+      prior: ctx.receipts,
+      now: ctx.now,
+    });
+    if (!r.ok) return r as Result<never>;
+    // Fold the returned receipt into the working journal-authoritative map
+    // from the bytes at hand — never a re-read (no read/write race).
+    ctx.receipts.set(rel, r.value.receipt);
+    if (r.value.indexAnomaly !== undefined) {
+      emit(ctx, 'error', { op: 'integrity-index', detail: r.value.indexAnomaly });
+    }
+    return ok({ receipt: r.value.receipt });
+  };
+
+  /**
+   * Read a managed artifact and verify exact bytes against the
+   * journal-authoritative receipt map. 'ok' or legacy-'untracked' pass;
+   * 'mismatch'/'missing'/v1-'untracked' are visible integrity violations —
+   * the caller journals + fails closed, never silently downgrades.
+   */
+  const verifiedRead = async (
+    ctx: StepCtx,
+    rel: string,
+  ): Promise<Result<{ text: string; verdict: 'ok' | 'mismatch' | 'missing' | 'untracked' }>> => {
+    const v = await readVerifiedArtifact(store, rel, { receipts: ctx.receipts });
+    if (!v.ok) return v as Result<never>;
+    const status = v.value.verdict.status;
+    if (
+      status === 'ok' ||
+      (status === 'untracked' && ctx.integrity !== 'receipts-v1')
+    ) {
+      return ok({ text: v.value.text, verdict: status });
+    }
+    return failRes(
+      err('untrusted_output', `integrity verification failed for ${rel}: ${status}`, {
+        details: {
+          reason: 'integrity_violation',
+          path: rel,
+          verdict: status,
+          ...(v.value.verdict.actualSha256 !== undefined ? { actualSha256: v.value.verdict.actualSha256 } : {}),
+          ...(v.value.verdict.receipt !== undefined ? { recordedSha256: v.value.verdict.receipt.sha256 } : {}),
+        },
+      }),
+    );
+  };
+
+  const integrityViolation = (ctx: StepCtx, rel: string, e: CouncilError): void => {
+    emit(ctx, 'error', {
+      op: 'integrity-verify',
+      path: rel,
+      detail: e.message,
+      ...(typeof e.details?.verdict === 'string' ? { verdict: e.details.verdict } : {}),
+    });
+  };
+
+  /**
+   * Envelope authorization — journaled assignedIds only (never worker-
+   * editable envelope bytes). A journaled envelope.built without assignedIds
+   * is a legacy artifact: verify its bytes on v1, pass through on legacy.
+   * Absent envelope ⇒ nothing was ever assigned ⇒ empty set.
+   */
+  const envelopeAssignedIds = async (ctx: StepCtx, envRel: string): Promise<Result<Set<string>>> => {
+    const journaled = ctx.envelopeAssigned.get(envRel);
+    if (journaled !== undefined) return ok(new Set(journaled));
+    if (ctx.legacyEnvelopes.has(envRel)) {
+      const v = await verifiedRead(ctx, envRel);
+      if (!v.ok) return v as Result<never>;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(v.value.text);
+      } catch {
+        return failRes(err('untrusted_output', `legacy envelope ${envRel} is not valid JSON`));
+      }
+      const assignments = (raw as { assignments?: unknown[] }).assignments ?? [];
+      const out = new Set<string>();
+      for (const a of assignments) {
+        const o = a as { claimId?: unknown; challenges?: { challengeId?: unknown }[] };
+        if (typeof o.claimId === 'string') out.add(o.claimId);
+        for (const c of o.challenges ?? []) {
+          if (typeof c.challengeId === 'string') out.add(c.challengeId);
+        }
+      }
+      return ok(out);
+    }
+    return ok(new Set());
+  };
+
   // ── Participant / attempt helpers ──────────────────────────────────────────
 
   const findParticipant = (state: CouncilState, pid: ParticipantId): Participant | undefined =>
@@ -348,6 +501,33 @@ export function createEngine(deps: EngineDeps): Engine {
     p.attempts.push(attempt);
     return attempt;
   };
+
+  /**
+   * Idempotent stage-entry mints (clm_0007): every phase-entry seed site
+   * creates exactly ONE base participant/attempt per id/tuple — but after an
+   * append-ok/save-fail the journal overlay has already re-materialized them.
+   * Pushing a second participant object or minting a second base attempt is
+   * the exact defect the council reproduced (duplicate task+launch per seat).
+   * Repair/fallback mints stay the ONLY legitimate extra attempts per tuple
+   * and never go through these helpers.
+   */
+  const ensureParticipant = (
+    state: CouncilState,
+    pid: ParticipantId,
+    role: Participant['role'],
+    agent: AgentChoice,
+    seatId: string | null,
+    perspectiveId: string | null,
+  ): Participant => {
+    const existing = findParticipant(state, pid);
+    if (existing !== undefined) return existing;
+    const p = makeParticipant(pid, role, agent, seatId, perspectiveId);
+    state.participants.push(p);
+    return p;
+  };
+
+  const ensureStageAttempt = (p: Participant, phase: PhaseKind, round: number | null): PhaseAttempt =>
+    attemptsFor(p, phase, round)[0] ?? addPlannedAttempt(p, phase, round);
 
   /**
    * Attempts occupying a concurrency slot: any whose worker might still be
@@ -1212,9 +1392,13 @@ export function createEngine(deps: EngineDeps): Engine {
       };
     }
     const specRel = paths.spec(attempt.attemptId);
-    const w = await store.writeArtifact(specRel, built.spec);
+    const w = await mintedWrite(ctx, specRel, built.spec, 'runner');
     if (!w.ok) return { kind: 'task_error', error: w.error };
-    emit(ctx, 'artifact.written', { path: specRel, kind: 'spec' }, { participantId: p.participantId, phase: attempt.phase });
+    emit(ctx, 'artifact.written', {
+      path: specRel,
+      kind: 'spec',
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    }, { participantId: p.participantId, phase: attempt.phase });
 
     if (attempt.taskId === null) {
       if (ctx.taskCreateFailed.has(attempt.attemptId)) {
@@ -1389,11 +1573,11 @@ export function createEngine(deps: EngineDeps): Engine {
 
   // ── Artifact admission ─────────────────────────────────────────────────────
 
-  const readJson = async (rel: string): Promise<{ ok: true; value: unknown } | { ok: false; reason: string }> => {
+  const readJson = async (rel: string): Promise<{ ok: true; value: unknown; text: string } | { ok: false; reason: string }> => {
     const r = await store.readArtifact(rel);
     if (!r.ok) return { ok: false, reason: `missing/unreadable: ${r.error.message}` };
     try {
-      return { ok: true, value: JSON.parse(r.value) };
+      return { ok: true, value: JSON.parse(r.value), text: r.value };
     } catch (e) {
       return { ok: false, reason: `malformed JSON: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -1460,7 +1644,7 @@ export function createEngine(deps: EngineDeps): Engine {
       return undefined;
     }
     const rel = `rejected/${attempt.attemptId}__${outRel.split('/').pop()}`;
-    const w = await store.writeArtifact(rel, existing.value);
+    const w = await mintedWrite(ctx, rel, existing.value, 'archive');
     if (!w.ok) {
       emit(ctx, 'error', {
         op: 'rejected-preserve',
@@ -1469,7 +1653,12 @@ export function createEngine(deps: EngineDeps): Engine {
       }, { participantId: attempt.participantId, phase: attempt.phase });
       return undefined;
     }
-    emit(ctx, 'artifact.written', { path: rel, kind: 'rejected-archive', supersedes: outRel }, {
+    emit(ctx, 'artifact.written', {
+      path: rel,
+      kind: 'rejected-archive',
+      supersedes: outRel,
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    }, {
       participantId: attempt.participantId,
       phase: attempt.phase,
     });
@@ -1504,10 +1693,15 @@ export function createEngine(deps: EngineDeps): Engine {
       issues,
       diagnostics: diag,
     }, null, 2);
-    const dw = await store.writeArtifact(diagRel, diagJson);
+    const dw = await mintedWrite(ctx, diagRel, diagJson, 'archive');
     const issuesRef = dw.ok ? diagRel : undefined;
     if (dw.ok) {
-      emit(ctx, 'artifact.written', { path: diagRel, kind: 'rejection-diagnostics', supersedes: outRel }, {
+      emit(ctx, 'artifact.written', {
+        path: diagRel,
+        kind: 'rejection-diagnostics',
+        supersedes: outRel,
+        ...(dw.value.receipt !== undefined ? receiptJournalFields(dw.value.receipt) : {}),
+      }, {
         participantId: attempt.participantId,
         phase: attempt.phase,
       });
@@ -1557,34 +1751,43 @@ export function createEngine(deps: EngineDeps): Engine {
     });
   };
 
-  const admit = (ctx: StepCtx, attempt: PhaseAttempt, path: string): void => {
+  /**
+   * Admit a validated worker output: on v1, receipt the EXACT text bytes
+   * just parsed (never a re-read) so every later consumption verifies
+   * against the journaled hash. The receipt rides the artifact.admitted
+   * event — journal-authoritative, like every other durable fact.
+   */
+  const admit = async (
+    ctx: StepCtx,
+    attempt: PhaseAttempt,
+    path: string,
+    rawText: string,
+  ): Promise<Result<void>> => {
+    let receipt: ArtifactReceipt | undefined;
+    if (ctx.integrity === 'receipts-v1') {
+      const r = await noteReceipt(store, path, rawText, 'worker_output', {
+        prior: ctx.receipts,
+        now: ctx.now,
+      });
+      if (!r.ok) return r as Result<never>;
+      receipt = r.value.receipt;
+      ctx.receipts.set(path, receipt);
+      if (r.value.indexAnomaly !== undefined) {
+        emit(ctx, 'error', { op: 'integrity-index', detail: r.value.indexAnomaly });
+      }
+    }
     attempt.artifacts.push(path);
     ctx.artifacts.push(path);
-    emit(ctx, 'artifact.admitted', { attemptId: attempt.attemptId, path }, {
+    emit(ctx, 'artifact.admitted', {
+      attemptId: attempt.attemptId,
+      path,
+      ...(receipt !== undefined ? receiptJournalFields(receipt) : {}),
+    }, {
       participantId: attempt.participantId,
       phase: attempt.phase,
       ...(attempt.round !== null ? { round: attempt.round } : {}),
     });
-  };
-
-  /** Claim ids this attempt was assigned (from the envelope we wrote). */
-  const assignedClaimIds = async (path: string): Promise<Set<string>> => {
-    const r = await readJson(path);
-    if (!r.ok) return new Set();
-    const assignments = (r.value as { assignments?: { claimId?: string }[] }).assignments ?? [];
-    return new Set(assignments.map((a) => a.claimId).filter((x): x is string => typeof x === 'string'));
-  };
-
-  /** Challenge ids assigned to this author (flattened over its assignments). */
-  const assignedChallengeIds = async (path: string): Promise<Set<string>> => {
-    const r = await readJson(path);
-    if (!r.ok) return new Set();
-    const assignments = (r.value as { assignments?: { challenges?: { challengeId?: string }[] }[] }).assignments ?? [];
-    const out = new Set<string>();
-    for (const a of assignments) for (const c of a.challenges ?? []) {
-      if (typeof c.challengeId === 'string') out.add(c.challengeId);
-    }
-    return out;
+    return ok(undefined);
   };
 
   /**
@@ -1621,7 +1824,8 @@ export function createEngine(deps: EngineDeps): Engine {
             };
             const w = await store.writeProposedRoster(roster);
             if (!w.ok) return w;
-            admit(ctx, attempt, outPath);
+            const a0 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a0.ok) return a0;
             emit(ctx, 'roster.proposed', { perspectives: roster.perspectives.length });
             state.status = 'awaiting_approval';
             state.phaseEnteredAt = ctx.now.toISOString();
@@ -1639,7 +1843,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a1 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a1.ok) return a1;
             break;
           }
           case 'scribe_notes': {
@@ -1651,7 +1856,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a2 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a2.ok) return a2;
             break;
           }
           case 'challenge': {
@@ -1665,8 +1871,14 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            const allowed = await assignedClaimIds(paths.challengeEnv(p.participantId, attempt.round ?? 1));
-            const bad = parsed.value.challenges.filter((c) => !allowed.has(c.claimId));
+            // Authorization is journal-derived (journaled assignedIds from
+            // envelope.built) — never the worker-editable envelope bytes.
+            const allowed = await envelopeAssignedIds(ctx, paths.challengeEnv(p.participantId, attempt.round ?? 1));
+            if (!allowed.ok) {
+              integrityViolation(ctx, paths.challengeEnv(p.participantId, attempt.round ?? 1), allowed.error);
+              return allowed as Result<never>;
+            }
+            const bad = parsed.value.challenges.filter((c) => !allowed.value.has(c.claimId));
             const ids = parsed.value.challenges.map((c) => c.challengeId);
             const dup = ids.length !== new Set(ids).size;
             if (bad.length > 0 || dup) {
@@ -1676,7 +1888,8 @@ export function createEngine(deps: EngineDeps): Engine {
               });
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a3 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a3.ok) return a3;
             break;
           }
           case 'author_response': {
@@ -1690,15 +1903,20 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            const allowed = await assignedChallengeIds(paths.responseEnv(p.participantId, attempt.round ?? 1));
-            const bad = parsed.value.responses.filter((r) => !allowed.has(r.challengeId));
+            const allowed = await envelopeAssignedIds(ctx, paths.responseEnv(p.participantId, attempt.round ?? 1));
+            if (!allowed.ok) {
+              integrityViolation(ctx, paths.responseEnv(p.participantId, attempt.round ?? 1), allowed.error);
+              return allowed as Result<never>;
+            }
+            const bad = parsed.value.responses.filter((r) => !allowed.value.has(r.challengeId));
             if (bad.length > 0) {
               await rejectOutput(ctx, p, attempt, outPath, {
                 unassignedChallengeIds: bad.map((r) => r.challengeId),
               });
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a4 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a4.ok) return a4;
             break;
           }
           case 'scribe_synthesis': {
@@ -1724,7 +1942,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a5 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a5.ok) return a5;
             break;
           }
         }
@@ -1733,34 +1952,146 @@ export function createEngine(deps: EngineDeps): Engine {
     return ok(undefined);
   };
 
-  /** Read back every admitted file of a phase (trusted, engine-admitted). */
-  const admittedFiles = async <T>(
+  /**
+   * Typed re-parse of an admitted artifact — never an unchecked cast. Same
+   * parser/options admission used, so a file that no longer parses is a
+   * visible corruption, not silent data loss.
+   */
+  const reparseAdmitted = (
     state: CouncilState,
+    p: Participant,
+    a: PhaseAttempt,
+    raw: unknown,
+  ): Result<unknown> => {
+    switch (a.phase) {
+      case 'organiser':
+        return parseProposedRoster(raw, {
+          runId: state.runId,
+          requestedPerspectives: state.config.requestedPerspectives,
+        }) as Result<unknown>;
+      case 'independent_review':
+        return parseFindingsFile(raw, {
+          runId: state.runId,
+          participantId: p.participantId,
+          perspectiveId: p.perspectiveId ?? undefined,
+          maxFindings: state.config.maxFindingsPerSeat,
+        }) as Result<unknown>;
+      case 'scribe_notes':
+        return parseScribeNotesFile(raw, { runId: state.runId, participantId: p.participantId }) as Result<unknown>;
+      case 'challenge':
+        return parseChallengesFile(raw, {
+          runId: state.runId,
+          round: a.round ?? undefined,
+          participantId: p.participantId,
+          max: state.config.maxChallengesPerSeatPerRound,
+        }) as Result<unknown>;
+      case 'author_response':
+        return parseResponsesFile(raw, {
+          runId: state.runId,
+          round: a.round ?? undefined,
+          participantId: p.participantId,
+          max: state.config.maxResponsesPerSeatPerRound,
+        }) as Result<unknown>;
+      case 'scribe_synthesis': {
+        const syn = (validationNs as {
+          parseSynthesisFile?: (
+            v: unknown,
+            o: { runId: string; participantId?: string },
+          ) => { ok: true; value: unknown } | { ok: false; issues?: unknown[] };
+        }).parseSynthesisFile?.(raw, { runId: state.runId, participantId: p.participantId });
+        if (syn !== undefined && syn.ok) return ok(syn.value);
+        return parseReportFile(raw, { runId: state.runId }) as Result<unknown>;
+      }
+    }
+  };
+
+  /**
+   * Read back every admitted file of a phase, verifying exact bytes against
+   * the journaled receipts (v1) and re-parsing typed — a file that verifies
+   * clean but no longer parses is corruption, both fail visibly.
+   */
+  const admittedFiles = async <T>(
+    ctx: StepCtx,
     phase: PhaseKind,
     round: number | null,
-  ): Promise<{ participantId: ParticipantId; file: T }[]> => {
+  ): Promise<Result<{ participantId: ParticipantId; file: T }[]>> => {
+    const { state } = ctx;
     const out: { participantId: ParticipantId; file: T }[] = [];
     for (const p of state.participants) {
       for (const a of attemptsFor(p, phase, round)) {
         for (const rel of a.artifacts) {
-          const raw = await readJson(rel);
-          if (raw.ok) out.push({ participantId: p.participantId, file: raw.value as T });
+          const v = await verifiedRead(ctx, rel);
+          if (!v.ok) {
+            integrityViolation(ctx, rel, v.error);
+            return v as Result<never>;
+          }
+          let raw: unknown;
+          try {
+            raw = JSON.parse(v.value.text);
+          } catch (e) {
+            return failRes(err('io_error', `admitted artifact ${rel} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`));
+          }
+          const parsed = reparseAdmitted(state, p, a, raw);
+          if (!parsed.ok) {
+            emit(ctx, 'error', {
+              op: 'admitted-reparse',
+              path: rel,
+              attemptId: a.attemptId,
+              detail: `admitted artifact ${rel} failed re-parse — corruption between admission and consumption`,
+            }, { participantId: p.participantId, phase: a.phase });
+            return failRes(
+              err('untrusted_output', `admitted artifact ${rel} failed typed re-parse`, {
+                details: { reason: 'admitted_reparse_failed', path: rel, attemptId: a.attemptId },
+              }),
+            );
+          }
+          out.push({ participantId: p.participantId, file: parsed.value as T });
         }
       }
     }
-    return out;
+    return ok(out);
   };
 
-  const readLedger = async (state: CouncilState): Promise<ClaimLedger | null> => {
-    const raw = await readJson(paths.ledger);
-    return raw.ok ? (raw.value as ClaimLedger) : null;
+  /**
+   * The canonical ledger is a managed artifact: verified bytes (v1) plus
+   * typed re-parse — null only when claims.json was never written.
+   */
+  const readLedger = async (ctx: StepCtx): Promise<Result<ClaimLedger | null>> => {
+    const exists = await store.artifactExists(paths.ledger);
+    if (!exists.ok) return exists as Result<never>;
+    if (!exists.value) return ok(null);
+    const v = await verifiedRead(ctx, paths.ledger);
+    if (!v.ok) {
+      integrityViolation(ctx, paths.ledger, v.error);
+      return v as Result<never>;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(v.value.text);
+    } catch (e) {
+      return failRes(err('io_error', `claims.json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`));
+    }
+    const parsed = parseClaimLedger(raw, { runId: ctx.state.runId });
+    if (!parsed.ok) {
+      return failRes(
+        err('schema_invalid', 'claims.json failed typed re-parse', {
+          issues: parsed.issues,
+          details: { reason: 'ledger_reparse_failed', path: paths.ledger },
+        }),
+      );
+    }
+    return ok(parsed.value);
   };
 
-  const writeLedger = async (ctx: StepCtx, ledger: ClaimLedger): Promise<Result<void>> => {
-    const w = await store.writeArtifact(paths.ledger, JSON.stringify(ledger, null, 2));
-    if (!w.ok) return w;
-    emit(ctx, 'claim.updated', { claims: ledger.claims.length });
-    return ok(undefined);
+  const writeLedger = async (ctx: StepCtx, ledger: ClaimLedger): Promise<Result<{ receipt?: ArtifactReceipt }>> => {
+    const w = await mintedWrite(ctx, paths.ledger, JSON.stringify(ledger, null, 2), 'ledger');
+    if (!w.ok) return w as Result<never>;
+    emit(ctx, 'claim.updated', {
+      claims: ledger.claims.length,
+      path: paths.ledger,
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    });
+    return ok({ receipt: w.value.receipt });
   };
 
   const sourceAccess = (state: CouncilState, snapshot: SourceSnapshot): SourceAccess => ({
@@ -1858,9 +2189,8 @@ export function createEngine(deps: EngineDeps): Engine {
         ...(run.value.requestId !== undefined ? { requestId: run.value.requestId } : {}),
       });
     }
-    const organiser = makeParticipant(ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
-    state.participants.push(organiser);
-    addPlannedAttempt(organiser, 'organiser', null);
+    const organiser = ensureParticipant(state, ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
+    ensureStageAttempt(organiser, 'organiser', null);
     state.status = 'organising';
     state.phaseEnteredAt = ctx.now.toISOString();
     emit(ctx, 'phase.entered', { status: 'organising' });
@@ -1874,7 +2204,6 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const p = findParticipant(state, ORGANISER_PID);
     if (p === undefined) return { kind: 'error', error: err('invalid_transition', 'organiser participant missing') };
-    const attempt = attemptsFor(p, 'organiser', null).at(-1)!;
     await reconcileAttempts(ctx);
     if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
@@ -1885,6 +2214,10 @@ export function createEngine(deps: EngineDeps): Engine {
     if (statusAfter === 'awaiting_approval') {
       return advanceResult('needs_approval', statusAfter, 'roster proposed — approve the exact seats/agents/config to launch reviewers');
     }
+    // Re-derive AFTER admission (clm_0020): a rejection this pass may have
+    // minted the corrective repair attempt — following the stale rejected
+    // reference would block on 'settled_ok' instead of launching the repair.
+    const attempt = attemptsFor(p, 'organiser', null).at(-1)!;
     switch (attempt.status) {
       case 'planned':
       case 'intent_recorded': {
@@ -1964,7 +2297,9 @@ export function createEngine(deps: EngineDeps): Engine {
     }
 
     // Barrier: phase closed. Build the canonical ledger from admitted findings.
-    const admittedFindings = await admittedFiles<FindingsFile>(state, 'independent_review', null);
+    const af = await admittedFiles<FindingsFile>(ctx, 'independent_review', null);
+    if (!af.ok) return { kind: 'error', error: af.error };
+    const admittedFindings = af.value;
     const rejected = all.filter((a) => ctx.rejectedAttempts.has(a.attemptId) || a.status === 'settled_failed' || a.status === 'timed_out' || a.status === 'unknown');
     const lingering = all.filter((a) => a.status === 'unknown');
     for (const a of lingering) {
@@ -2001,12 +2336,29 @@ export function createEngine(deps: EngineDeps): Engine {
         reason: rej.reason,
       });
     }
-    emit(ctx, 'artifact.written', { path: paths.ledger, claims: build.ledger.claims.length });
+    // Strengths carry the same evidence/citation rules as findings — a
+    // strength whose whole evidence list fails is dropped visibly, never
+    // admitted as bare praise.
+    for (const rej of build.strengthRejections) {
+      emit(ctx, 'artifact.rejected', {
+        kind: 'strength',
+        participantId: rej.participantId,
+        perspectiveId: rej.perspectiveId,
+        strengthId: rej.strengthId,
+        reason: rej.reason,
+      });
+    }
+    emit(ctx, 'artifact.written', {
+      path: paths.ledger,
+      claims: build.ledger.claims.length,
+      ...(build.ledger.strengths !== undefined ? { strengths: build.ledger.strengths.length } : {}),
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    });
 
-    // Enter scribe-notes phase with a fresh, distinct scribe participant.
-    const scribe = makeParticipant(SCRIBE_PID, 'scribe', staffAgent(state, 'scribe'), null, null);
-    state.participants.push(scribe);
-    addPlannedAttempt(scribe, 'scribe_notes', null);
+    // Enter scribe-notes phase with a fresh, distinct scribe participant —
+    // reusing the overlay-minted one after append-ok/save-fail (clm_0007).
+    const scribe = ensureParticipant(state, SCRIBE_PID, 'scribe', staffAgent(state, 'scribe'), null, null);
+    ensureStageAttempt(scribe, 'scribe_notes', null);
     state.status = 'scribe_notes';
     state.phaseEnteredAt = ctx.now.toISOString();
     emit(ctx, 'phase.entered', { status: 'scribe_notes' });
@@ -2028,8 +2380,9 @@ export function createEngine(deps: EngineDeps): Engine {
     if (p === undefined) return { kind: 'error', error: err('invalid_transition', 'scribe participant missing') };
     const attempt = attemptsFor(p, 'scribe_notes', null).at(-1)!;
     if (attempt.status === 'planned' || attempt.status === 'intent_recorded') {
-      const admitted = await admittedFiles<FindingsFile>(state, 'independent_review', null);
-      ctx.admittedFindingsPaths = admitted.map((f) => abs(paths.findingsOut(f.file.participantId)));
+      const admitted = await admittedFiles<FindingsFile>(ctx, 'independent_review', null);
+      if (!admitted.ok) return { kind: 'error', error: admitted.error };
+      ctx.admittedFindingsPaths = admitted.value.map((f) => abs(paths.findingsOut(f.file.participantId)));
       const lo = await launchAttempt(ctx, p, attempt);
       if (lo.kind === 'launched') return advanceResult('progress', state.status, 'scribe notes launched');
       if (lo.kind === 'failed') return blocked(state.status, 'scribe notes launch failed; reconcile');
@@ -2051,8 +2404,10 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const enterChallengeStage = async (ctx: StepCtx, round: number): Promise<StepResult> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at discussion entry') };
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at discussion entry') };
+    const ledger = ledgerR.value;
     const proposedR = await store.readProposedRoster();
     const perspectives = new Map<string, Perspective>(
       (proposedR.ok ? proposedR.value.perspectives : []).map((p) => [p.perspectiveId, p]),
@@ -2075,32 +2430,63 @@ export function createEngine(deps: EngineDeps): Engine {
     });
 
     let total = 0;
+    const routedClaimIds: string[] = [];
+    const byteDroppedClaimIds: string[] = [];
     for (const [pid, assignments] of plan.assignments) {
       if (assignments.length === 0) continue;
       const p = findParticipant(state, pid)!;
-      const base = makeEnvelopeBase<ChallengeAssignment>({
-        runId: state.runId,
-        phase: 'challenge',
-        round,
-        recipientId: pid,
-        outputPath: paths.challengeOut(pid, round),
-        outputContract: 'ChallengesFile',
-      });
-      const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
       const envRel = paths.challengeEnv(pid, round);
-      const w = await store.writeArtifact(envRel, JSON.stringify(fit.envelope, null, 2));
-      if (!w.ok) return { kind: 'error', error: w.error };
-      emit(ctx, 'envelope.built', {
-        path: envRel,
-        recipientId: pid,
-        round,
-        assigned: fit.envelope.assignments.length,
-        omitted: [...fit.omitted.map((a) => a.claimId), ...plan.unassigned.map((u) => u.claimId)],
-        bytes: fit.bytes,
-      }, { participantId: pid, phase: 'challenge', round });
-      addPlannedAttempt(p, 'challenge', round);
-      total += fit.envelope.assignments.length;
+      const alreadyBuilt = ctx.envelopeAssigned.has(envRel);
+      if (alreadyBuilt) {
+        // Replay: the journaled envelope.built is the durable plan. Never
+        // rewrite — on v1 verify the file against its journaled receipt
+        // (tamper/deletion is visible, not silently healed).
+        const v = await verifiedRead(ctx, envRel);
+        if (!v.ok) {
+          integrityViolation(ctx, envRel, v.error);
+          return { kind: 'error', error: v.error };
+        }
+        routedClaimIds.push(...ctx.envelopeAssigned.get(envRel)!);
+      } else {
+        const base = makeEnvelopeBase<ChallengeAssignment>({
+          runId: state.runId,
+          phase: 'challenge',
+          round,
+          recipientId: pid,
+          outputPath: paths.challengeOut(pid, round),
+          outputContract: 'ChallengesFile',
+        });
+        const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
+        const assignedIds = fit.envelope.assignments.map((a) => a.claimId);
+        const w = await mintedWrite(ctx, envRel, JSON.stringify(fit.envelope, null, 2), 'envelope');
+        if (!w.ok) return { kind: 'error', error: w.error };
+        emit(ctx, 'envelope.built', {
+          path: envRel,
+          recipientId: pid,
+          round,
+          assigned: fit.envelope.assignments.length,
+          assignedIds,
+          omitted: fit.omitted.map((a) => a.claimId),
+          bytes: fit.bytes,
+          ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+        }, { participantId: pid, phase: 'challenge', round });
+        ctx.envelopeAssigned.set(envRel, assignedIds);
+        routedClaimIds.push(...assignedIds);
+        byteDroppedClaimIds.push(...fit.omitted.map((a) => a.claimId));
+      }
+      ensureStageAttempt(p, 'challenge', round);
+      total += ctx.envelopeAssigned.get(envRel)!.length;
     }
+    // Routing record ONCE per stage — routed/byte-dropped/unassigned are
+    // disjoint families; persisted into the ledger so the report can
+    // distinguish never-routed from examined claims (clm_0016).
+    recordChallengeRouting(ledger, round, {
+      routedClaimIds: [...new Set(routedClaimIds)],
+      byteDroppedClaimIds: [...new Set(byteDroppedClaimIds)],
+      unassigned: plan.unassigned.map((u) => ({ claimId: u.claimId, reason: u.reason })),
+    });
+    const wl = await writeLedger(ctx, ledger);
+    if (!wl.ok) return { kind: 'error', error: wl.error };
     if (total === 0) {
       emit(ctx, 'envelope.built', {
         round,
@@ -2175,15 +2561,19 @@ export function createEngine(deps: EngineDeps): Engine {
    */
   const foldResponses = async (ctx: StepCtx, round: number): Promise<StepResult | null> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) {
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) {
       return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response fold') };
     }
-    const admittedResponses = await admittedFiles<ResponsesFile>(state, 'author_response', round);
-    if (admittedResponses.length === 0) return null;
-    const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    const ledger = ledgerR.value;
+    const admittedResponses = await admittedFiles<ResponsesFile>(ctx, 'author_response', round);
+    if (!admittedResponses.ok) return { kind: 'error', error: admittedResponses.error };
+    if (admittedResponses.value.length === 0) return null;
+    const admittedChallenges = await admittedFiles<ChallengesFile>(ctx, 'challenge', round);
+    if (!admittedChallenges.ok) return { kind: 'error', error: admittedChallenges.error };
     const challengeIndex = indexAdmittedChallenges(
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
     );
     let snapshot = ctx.snapshot;
     if (snapshot === undefined) {
@@ -2193,7 +2583,7 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const applied = applyResponsesToLedger(
       ledger,
-      admittedResponses.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedResponses.value.map((a) => ({ participantId: a.participantId, file: a.file })),
       challengeIndex,
       sourceAccess(state, snapshot),
       ctx.now,
@@ -2217,10 +2607,13 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const enterResponseStage = async (ctx: StepCtx, round: number): Promise<StepResult> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
+    const ledger = ledgerR.value;
 
-    const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    const admittedChallenges = await admittedFiles<ChallengesFile>(ctx, 'challenge', round);
+    if (!admittedChallenges.ok) return { kind: 'error', error: admittedChallenges.error };
     let snapshot = ctx.snapshot;
     if (snapshot === undefined) {
       const snapR = await store.readSnapshot();
@@ -2229,7 +2622,7 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const applied = applyChallengesToLedger(
       ledger,
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
       sourceAccess(state, snapshot),
       ctx.now,
     );
@@ -2250,13 +2643,75 @@ export function createEngine(deps: EngineDeps): Engine {
     }
 
     const challengeIndex = indexAdmittedChallenges(
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
     );
     const plan = assignResponses({
       challenges: challengeIndex,
       claimsById: claimsById(ledger),
       maxPerSeat: state.config.maxResponsesPerSeatPerRound,
     });
+    const routedChallengeIds: string[] = [];
+    const byteDropped: { claimId: string; authorPid: ParticipantId }[] = [];
+    let total = 0;
+    for (const [pid, assignments] of plan.assignments) {
+      if (assignments.length === 0) continue;
+      const p = findParticipant(state, pid);
+      if (p === undefined) continue;
+      const envRel = paths.responseEnv(pid, round);
+      if (ctx.envelopeAssigned.has(envRel)) {
+        // Replay: journaled qualified challengeIds are the durable plan —
+        // verify bytes on v1, never rewrite.
+        const v = await verifiedRead(ctx, envRel);
+        if (!v.ok) {
+          integrityViolation(ctx, envRel, v.error);
+          return { kind: 'error', error: v.error };
+        }
+        routedChallengeIds.push(...ctx.envelopeAssigned.get(envRel)!);
+      } else {
+        const base = makeEnvelopeBase<ResponseAssignment>({
+          runId: state.runId,
+          phase: 'author_response',
+          round,
+          recipientId: pid,
+          outputPath: paths.responseOut(pid, round),
+          outputContract: 'ResponsesFile',
+        });
+        const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
+        // Authorization units are the qualified challengeIds inside kept
+        // assignments — the ids admission checks responses against.
+        const assignedIds = fit.envelope.assignments.flatMap((a) =>
+          a.challenges.map((c) => c.challengeId),
+        );
+        const w = await mintedWrite(ctx, envRel, JSON.stringify(fit.envelope, null, 2), 'envelope');
+        if (!w.ok) return { kind: 'error', error: w.error };
+        emit(ctx, 'envelope.built', {
+          path: envRel,
+          recipientId: pid,
+          round,
+          assigned: fit.envelope.assignments.length,
+          assignedIds,
+          omitted: fit.omitted.map((a) => a.claimId),
+          bytes: fit.bytes,
+          ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+        }, { participantId: pid, phase: 'author_response', round });
+        ctx.envelopeAssigned.set(envRel, assignedIds);
+        routedChallengeIds.push(...assignedIds);
+        for (const o of fit.omitted) byteDropped.push({ claimId: o.claimId, authorPid: pid });
+      }
+      ensureStageAttempt(p, 'author_response', round);
+      total += ctx.envelopeAssigned.get(envRel)!.length;
+    }
+    // Response routing ONCE per stage: routed qualified ids + byte-dropped
+    // claim-level assignments + per-seat cap omissions + unroutables —
+    // persisted to the ledger alongside the round's challenge record.
+    recordResponseRouting(ledger, round, {
+      routedChallengeIds: [...new Set(routedChallengeIds)],
+      byteDropped,
+      capOmitted: plan.omitted.map((o) => ({ challengeId: o.challengeId, claimId: o.claimId, authorPid: o.authorPid })),
+      unroutable: plan.unroutable.map((u) => ({ challengeId: u.challengeId, claimId: u.claimId, reason: u.reason })),
+    });
+    const wl2 = await writeLedger(ctx, ledger);
+    if (!wl2.ok) return { kind: 'error', error: wl2.error };
     for (const u of plan.unroutable) {
       emit(ctx, 'envelope.built', {
         kind: 'response-unroutable',
@@ -2273,35 +2728,6 @@ export function createEngine(deps: EngineDeps): Engine {
         authorPid: o.authorPid,
         reason: 'author at cap',
       }, { round });
-    }
-
-    let total = 0;
-    for (const [pid, assignments] of plan.assignments) {
-      if (assignments.length === 0) continue;
-      const p = findParticipant(state, pid);
-      if (p === undefined) continue;
-      const base = makeEnvelopeBase<ResponseAssignment>({
-        runId: state.runId,
-        phase: 'author_response',
-        round,
-        recipientId: pid,
-        outputPath: paths.responseOut(pid, round),
-        outputContract: 'ResponsesFile',
-      });
-      const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
-      const envRel = paths.responseEnv(pid, round);
-      const wr = await store.writeArtifact(envRel, JSON.stringify(fit.envelope, null, 2));
-      if (!wr.ok) return { kind: 'error', error: wr.error };
-      emit(ctx, 'envelope.built', {
-        path: envRel,
-        recipientId: pid,
-        round,
-        assigned: fit.envelope.assignments.length,
-        omitted: fit.omitted.map((a) => a.claimId),
-        bytes: fit.bytes,
-      }, { participantId: pid, phase: 'author_response', round });
-      addPlannedAttempt(p, 'author_response', round);
-      total += fit.envelope.assignments.length;
     }
 
     if (total === 0) {
@@ -2325,7 +2751,7 @@ export function createEngine(deps: EngineDeps): Engine {
     const { state } = ctx;
     const scribe = findParticipant(state, SCRIBE_PID);
     if (scribe === undefined) return { kind: 'error', error: err('invalid_transition', 'scribe participant missing') };
-    addPlannedAttempt(scribe, 'scribe_synthesis', null);
+    ensureStageAttempt(scribe, 'scribe_synthesis', null);
     state.status = 'synthesising';
     state.discussion = null;
     state.phaseEnteredAt = ctx.now.toISOString();
@@ -2413,17 +2839,20 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const finalizeReport = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
-    const [proposedR, approvedR, ledger] = await Promise.all([
+    const [proposedR, approvedR, ledgerR] = await Promise.all([
       store.readProposedRoster(),
       store.readApprovedRoster(),
-      readLedger(state),
+      readLedger(ctx),
     ]);
-    if (!proposedR.ok || !approvedR.ok || ledger === null) {
+    if (!proposedR.ok || !approvedR.ok || !ledgerR.ok || ledgerR.value === null) {
       return {
         kind: 'error',
-        error: err('invalid_transition', 'cannot finalize: roster or ledger artifacts missing'),
+        error: !ledgerR.ok
+          ? ledgerR.error
+          : err('invalid_transition', 'cannot finalize: roster or ledger artifacts missing'),
       };
     }
+    const ledger = ledgerR.value;
 
     // Final drift check — detect, never claim prevention. Approval/snapshot
     // revalidation gates launches only; the tree may have drifted since the
@@ -2470,9 +2899,26 @@ export function createEngine(deps: EngineDeps): Engine {
 
     // Scribe narrative only — its claims/coverage are never trusted. Prefer
     // the narrative SynthesisFile contract; fall back to a legacy full
-    // ReportFile artifact (both carry summary + limitations).
+    // ReportFile artifact (both carry summary + limitations). The artifact
+    // is an admitted worker output: verify exact bytes on v1 — tampered or
+    // unadmitted bytes degrade to the runner-rendered narrative WITH a
+    // visible journal entry, never silently trusted.
     let scribe: ScribeNarrative | undefined;
-    const rawReport = await readJson(paths.scribeReportJson);
+    let rawReport: { ok: true; value: unknown } | { ok: false } = { ok: false };
+    const reportExists = await store.artifactExists(paths.scribeReportJson);
+    if (reportExists.ok && reportExists.value) {
+      const v = await verifiedRead(ctx, paths.scribeReportJson);
+      if (v.ok) {
+        try {
+          rawReport = { ok: true, value: JSON.parse(v.value.text) };
+        } catch {
+          emit(ctx, 'error', { op: 'scribe-narrative', path: paths.scribeReportJson, detail: 'verified scribe report is not valid JSON' });
+        }
+      } else {
+        integrityViolation(ctx, paths.scribeReportJson, v.error);
+        runnerLims.push(`scribe report failed integrity verification (${v.error.message}) — runner-rendered narrative used`);
+      }
+    }
     if (rawReport.ok) {
       const synParse = (validationNs as {
         parseSynthesisFile?: (
@@ -2489,6 +2935,9 @@ export function createEngine(deps: EngineDeps): Engine {
         }
       }
     }
+    const snapForProvenance = ctx.snapshot !== undefined
+      ? { ok: true as const, value: ctx.snapshot }
+      : await store.readSnapshot();
     const report = buildCouncilReport({
       runId: state.runId,
       generatedAt: ctx.now.toISOString(),
@@ -2499,6 +2948,16 @@ export function createEngine(deps: EngineDeps): Engine {
       ledger,
       scribe,
       runnerLimitations: runnerLims,
+      ...(snapForProvenance.ok
+        ? {
+            provenance: {
+              snapshotId: snapForProvenance.value.snapshotId,
+              gitHead: snapForProvenance.value.gitHead,
+              targetRoot: snapForProvenance.value.targetRoot,
+              objective: state.objective,
+            },
+          }
+        : {}),
     });
     // Drift detected after approval means the emitted report cannot claim
     // full coverage of the reviewed corpus — mark it visibly partial.
@@ -2518,9 +2977,12 @@ export function createEngine(deps: EngineDeps): Engine {
       [paths.summaryMd, renderSummaryMarkdown(report)],
     ];
     for (const [rel, content] of writes) {
-      const w = await store.writeArtifact(rel, content);
+      const w = await mintedWrite(ctx, rel, content, 'report');
       if (!w.ok) return { kind: 'error', error: w.error };
-      emit(ctx, 'report.written', { path: rel });
+      emit(ctx, 'report.written', {
+        path: rel,
+        ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+      });
       ctx.artifacts.push(rel);
     }
     state.status = 'reported';
@@ -2699,6 +3161,11 @@ export function createEngine(deps: EngineDeps): Engine {
       taskCreateStage: new Map(),
       workerLaunchStage: new Map(),
       intentProtocol: new Map(),
+      integrity: 'legacy',
+      receipts: new Map(),
+      envelopeAssigned: new Map(),
+      legacyEnvelopes: new Set(),
+      journaledErrors: new Set(),
     };
     const journal = await store.readJournal();
     if (!journal.ok) return journal as Result<never>;
@@ -2750,6 +3217,22 @@ export function createEngine(deps: EngineDeps): Engine {
         e.payload.assigned > 0
       ) {
         noteAttempt(`att_${e.participantId}_${e.phase}_r${e.round ?? 1}_0`, e.ts);
+      }
+      // Envelope authorization is journal-derived, NEVER file-derived: the
+      // assignedIds the runner journaled at build time are the only claim/
+      // challenge ids that worker output may legitimately reference.
+      if (e.type === 'envelope.built' && typeof e.payload?.path === 'string') {
+        const ids = e.payload?.assignedIds;
+        if (Array.isArray(ids) && ids.every((x) => typeof x === 'string')) {
+          ctx.envelopeAssigned.set(e.payload.path, ids as string[]);
+        } else {
+          ctx.legacyEnvelopes.add(e.payload.path);
+        }
+      }
+      // Dedupe keys for journaled anomaly/error lines so a rebuild never
+      // re-emits the same durable evidence.
+      if (e.type === 'error' && typeof e.payload?.detail === 'string') {
+        ctx.journaledErrors.add(e.payload.detail as string);
       }
       if (e.type === 'phase.entered') {
         if (e.payload?.status === 'organising') seedOrganiser = true;
@@ -2885,6 +3368,38 @@ export function createEngine(deps: EngineDeps): Engine {
       }
     }
     if (runOk) ctx.runCreateUnresolved = false;
+
+    // ── Integrity policy + journal-authoritative receipts ────────────────
+    // Marker agreement across council.json + journal (artifacts lane):
+    // 'receipts-v1' mints/verifies exact-byte receipts; 'legacy' stays
+    // honestly untracked; a marker CONFLICT fails closed, never downgrades.
+    const { receipts: collectedReceipts, anomalies: receiptAnomalies } = collectReceipts(journal.value);
+    ctx.receipts = collectedReceipts;
+    const policySignals = await integrityPolicy(store);
+    if (!policySignals.ok) return policySignals as Result<never>;
+    const resolved = resolveIntegrityPolicy({
+      metaPolicy: policySignals.value.metaPolicy,
+      journalHasMarker: journalHasPolicyMarker(journal.value),
+      indexPresent: policySignals.value.indexPresent,
+    });
+    if (!resolved.ok) return resolved as Result<never>;
+    ctx.integrity = resolved.value.policy;
+    // The journal marker is durable evidence of the run's policy — emit it
+    // once, at the head of the first real journal (absent ⇒ marker not yet
+    // journaled; collectReceipts keeps verdicts journal-authoritative).
+    if (ctx.integrity === 'receipts-v1' && journalHasPolicyMarker(journal.value) !== true) {
+      emit(ctx, 'run.initialized', {
+        runId: state.runId,
+        integrity: 'receipts-v1',
+        snapshotId: state.snapshotId,
+      });
+    }
+    for (const anomaly of receiptAnomalies) {
+      const detail = `receipt anomaly: ${anomaly}`;
+      if (ctx.journaledErrors.has(detail)) continue;
+      ctx.journaledErrors.add(detail);
+      emit(ctx, 'error', { op: 'integrity-receipts', detail });
+    }
 
     // ── Re-materialize state-side mints the journal proves existed ──────
     // RA-003: participant seeding and addPlannedAttempt are state-only;
@@ -3023,6 +3538,26 @@ export function createEngine(deps: EngineDeps): Engine {
     // it to disk; keep the in-memory count when it is ahead (pending events).
     state.consumption.launches = Math.max(state.consumption.launches, launchedAttempts.size);
     state.consumption.mailSent = Math.max(state.consumption.mailSent, journaledMailSent);
+
+    // clm_0007 invariant: replay reconstruction must never leave two
+    // participant objects sharing one participantId nor two attempts sharing
+    // one attemptId. Seed sites are idempotent now; this sweep is the
+    // belt-and-suspenders proof that a stale/crafted state.json cannot
+    // smuggle a duplicate past the overlay.
+    {
+      const seenPids = new Set<ParticipantId>();
+      state.participants = state.participants.filter((p) => {
+        if (seenPids.has(p.participantId)) return false;
+        seenPids.add(p.participantId);
+        const seenAids = new Set<AttemptId>();
+        p.attempts = p.attempts.filter((a) => {
+          if (seenAids.has(a.attemptId)) return false;
+          seenAids.add(a.attemptId);
+          return true;
+        });
+        return true;
+      });
+    }
 
     const snap = await store.readSnapshot();
     if (snap.ok) ctx.snapshot = snap.value;
@@ -3173,9 +3708,11 @@ export function createEngine(deps: EngineDeps): Engine {
         emit(ctx, 'approval.granted', { hash, approvalId: record.approvalId, approver: input.approver, seats: roster.seats.length, reApproval: reapproval });
         if (fresh) {
           for (const seat of roster.seats) {
-            const p = makeParticipant(seat.participantId, 'reviewer', seat.agent, seat.seatId, seat.perspectiveId);
-            state.participants.push(p);
-            addPlannedAttempt(p, 'independent_review', null);
+            // Idempotent (clm_0007): a retried approve after append-ok/
+            // save-fail finds the overlay-minted seat — never a second
+            // participant object nor a duplicate attempt id.
+            const p = ensureParticipant(state, seat.participantId, 'reviewer', seat.agent, seat.seatId, seat.perspectiveId);
+            ensureStageAttempt(p, 'independent_review', null);
           }
           state.status = 'independent_review';
           state.phaseEnteredAt = ctx.now.toISOString();

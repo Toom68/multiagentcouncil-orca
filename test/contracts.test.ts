@@ -11,14 +11,20 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
 import {
+  MAX_STRENGTHS_PER_FILE,
   SCHEMA_VERSION,
   type Challenge,
   type Claim,
+  type ClaimChallenge,
+  type ClaimLedger,
   type CouncilReport,
   type DissentRecord,
+  type FindingsFile,
   type ResponseAssignment,
   type RunnerFacts,
   type SynthesisFile,
+  type TerminalCreateIntent,
+  type TerminalCreateReceipt,
   type WorkEnvelope,
 } from '../src/contracts.js';
 
@@ -192,4 +198,135 @@ test('CouncilReport JSON round-trips runnerFacts + limitationSources', () => {
   const rtL = JSON.parse(JSON.stringify(legacy)) as CouncilReport;
   assert.equal('runnerFacts' in rtL, false);
   assert.equal('limitationSources' in rtL, false);
+});
+
+// ─── next-release additive shapes ────────────────────────────────────────────
+
+test('Strength contract is pinned: optional on FindingsFile, bounded, worker-local id', () => {
+  assert.equal(MAX_STRENGTHS_PER_FILE, 3);
+  const file: FindingsFile = {
+    schemaVersion: SCHEMA_VERSION,
+    runId: 'crun_t',
+    participantId: 'rev_a',
+    perspectiveId: 'p1',
+    findings: [],
+    strengths: [
+      {
+        strengthId: 'S-1',
+        feature: 'bounded queue',
+        benefit: 'predictable load',
+        preserve: 'keep the cap',
+        evidence: [{ kind: 'reasoned', note: 'n' }],
+      },
+    ],
+  };
+  const rt = JSON.parse(JSON.stringify(file)) as FindingsFile;
+  assert.deepEqual(rt.strengths![0], file.strengths![0]);
+  // Absent stays absent — legacy files carry no strengths key at all.
+  const legacy = { ...file } as Record<string, unknown>;
+  delete legacy.strengths;
+  assert.equal('strengths' in JSON.parse(JSON.stringify(legacy)), false);
+});
+
+test('ClaimChallenge lifecycle round-trips; answered stays a fact, not a verdict', () => {
+  const ch: ClaimChallenge = {
+    challengeId: 'ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    round: 1,
+    challengerPid: 'rev_b',
+    kind: 'missing_evidence',
+    answered: true,
+    response: { participantId: 'rev_a', disposition: 'defend' },
+  };
+  const rt = JSON.parse(JSON.stringify(ch)) as ClaimChallenge;
+  assert.deepEqual(rt, ch);
+  // Unanswered state carries no response field at all.
+  const un: ClaimChallenge = { ...ch, answered: false };
+  delete un.response;
+  assert.equal('response' in JSON.parse(JSON.stringify(un)), false);
+});
+
+test('ClaimLedger discussion routing + canonical strengths round-trip byte-exactly', () => {
+  const ledger: ClaimLedger = {
+    schemaVersion: SCHEMA_VERSION,
+    runId: 'crun_t',
+    claims: [],
+    provenance: {},
+    strengths: [
+      {
+        strengthId: 'S-1', feature: 'f', benefit: 'b', preserve: 'p',
+        evidence: [{ kind: 'reasoned', note: 'n' }],
+        participantId: 'rev_a', perspectiveId: 'p1',
+      },
+    ],
+    discussion: {
+      rounds: [{
+        round: 1,
+        challenges: {
+          routedClaimIds: ['clm_0001'],
+          byteDroppedClaimIds: ['clm_0002'],
+          unassigned: [{ claimId: 'clm_0003', reason: 'at cap' }],
+        },
+        responses: {
+          routedChallengeIds: ['ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+          byteDropped: [{ claimId: 'clm_0002', authorPid: 'rev_a' }],
+          capOmitted: [{ challengeId: 'ch-r1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', claimId: 'clm_0004', authorPid: 'rev_c' }],
+          unroutable: [{ challengeId: 'ch-r1-cccccccccccccccccccccccccccccccc', claimId: 'clm_0005', reason: 'withdrawn' }],
+        },
+      }],
+    },
+  };
+  const rt = JSON.parse(JSON.stringify(ledger)) as ClaimLedger;
+  assert.deepEqual(rt, ledger);
+});
+
+test('CouncilReport provenance + strengths round-trip; legacy absents stay absent', () => {
+  const report: CouncilReport = {
+    schemaVersion: SCHEMA_VERSION,
+    runId: 'crun_t',
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    provenance: { snapshotId: 'snap_1', gitHead: 'abc', targetRoot: '/t', objective: 'o' },
+    summary: 's',
+    coverage: {
+      requestedPerspectives: 10, proposedPerspectives: 10, selectedSeats: 1,
+      seats: [], uncoveredPerspectiveIds: [], partial: false,
+    },
+    claims: [],
+    limitations: [],
+    strengths: [
+      {
+        strengthId: 'S-1', feature: 'f', benefit: 'b', preserve: 'p',
+        evidence: [{ kind: 'reasoned', note: 'n' }],
+        participantId: 'rev_a', perspectiveId: 'p1',
+      },
+    ],
+  };
+  const rt = JSON.parse(JSON.stringify(report)) as CouncilReport;
+  assert.deepEqual(rt, report);
+  const legacy = { ...report } as Record<string, unknown>;
+  delete legacy.provenance;
+  delete legacy.strengths;
+  const rtL = JSON.parse(JSON.stringify(legacy)) as CouncilReport;
+  assert.equal('provenance' in rtL, false);
+  assert.equal('strengths' in rtL, false);
+});
+
+test('TerminalCreateIntent/Receipt round-trip — custody identity never on argv', () => {
+  const intent: TerminalCreateIntent = {
+    intentId: 'tci_1',
+    participantId: 'rev_a',
+    taskId: 'task_1',
+    runId: 'run_1',
+    worktree: 'current',
+    title: 'review seat',
+    command: 'devin --model swe-2-max --permission-mode dangerous',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(intent)), intent);
+  const receipt: TerminalCreateReceipt = {
+    intentId: 'tci_1',
+    taskId: 'task_1',
+    outcome: 'uncertain',
+    requestId: 'req_7',
+    detail: 'host call timed out',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(receipt)), receipt);
 });

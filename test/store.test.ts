@@ -749,3 +749,35 @@ test('verifySourceSnapshot reports manifest tampering and id mismatch', async ()
   assert.ok(!r.ok);
   assert.equal(r.error.details?.reason, 'manifest_integrity');
 });
+
+// ─── integrity policy marker + index (src/artifacts.ts seam) ────────────────
+
+test('initialize stamps integrityPolicy and an empty receipt index', async () => {
+  const runDir = path.join(tmp(), 'run');
+  await initStore(runDir);
+  const meta = JSON.parse(readFileSync(path.join(runDir, STORE_PATHS.council), 'utf8'));
+  assert.equal(meta.integrityPolicy, 'receipts-v1');
+  const indexPath = path.join(runDir, STORE_PATHS.integrityIndex);
+  assert.ok(existsSync(indexPath), 'integrity/index.json must exist at init');
+  const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+  assert.equal(index.policy, 'receipts-v1');
+  assert.equal(index.runId, RUN_ID);
+  assert.deepEqual(index.entries, {});
+});
+
+test('initialize refuses to clobber a stray integrity index', async () => {
+  const runDir = path.join(tmp(), 'run');
+  const { targetRoot, snapshot } = await makeTarget();
+  mkdirSync(path.join(runDir, 'integrity'), { recursive: true });
+  writeFileSync(path.join(runDir, 'integrity', 'index.json'), '{}');
+  const store = createStore({ runDir });
+  const r = await store.initialize({
+    runId: RUN_ID,
+    targetRoot,
+    objective: OBJECTIVE,
+    config: config(),
+    snapshot,
+  });
+  assert.ok(!r.ok);
+  assert.equal(r.error.details?.reason, 'already_initialized');
+});

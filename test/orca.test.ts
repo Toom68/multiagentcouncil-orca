@@ -27,6 +27,8 @@ import {
 } from '../src/host/process.js';
 import {
   buildAgentCommandText,
+  isNoEffectRefusal,
+  isUncertainFailure,
   mapLiveness,
   OrcaAdapter,
   OrcaHost,
@@ -942,6 +944,460 @@ describe('OrcaAdapter mutation recovery', () => {
     if (!res.ok) return;
     assert.equal(res.value.state, 'refused');
     assert.ok(calls.every((a) => !a.includes('--retry-request')));
+  });
+});
+
+describe('mutation failure classification (clm_0028)', () => {
+  it('unknown/future mutation error codes stay UNCERTAIN — never a guessed clean failure', async () => {
+    // clm_0028 reproduced: a code outside the closed uncertain set used to be
+    // classified definite-failure, which could authorize a duplicate effect.
+    // Familiar-looking post-create codes are uncertain too — the refusal may
+    // follow a partial effect.
+    for (const code of [
+      'future_post_create_denied',
+      'new_resource_not_found',
+      'some_unseen_conflict',
+      'already_exists',
+      'busy',
+    ]) {
+      const { adapter } = makeAdapter((args) =>
+        args[1] === 'worker-start'
+          ? failMut(code, 'req-orca-x')
+          : args[1] === 'create'
+            ? okTerm({ terminal: { handle: 'term_x' } }, 'rcpt-tc-1')
+            : args[1] === 'wait'
+              ? okEnv({ idle: true })
+              : args[1] === 'show'
+                ? okTerm(readyTerm('term_x'))
+                : failEnv('unexpected'),
+      );
+      const res = await adapter.launchWorker(launchSpec());
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.outcome, 'unknown', `${code} must stay uncertain`);
+    }
+  });
+
+  it('a proven no-effect refusal (invalid_argument) on a mutation stays definite', async () => {
+    // argv validation refuses BEFORE any effect — the only generally-proven
+    // no-effect vocabulary.
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-start'
+        ? failMut('invalid_argument', 'req-orca-argv')
+        : args[1] === 'create'
+          ? okTerm({ terminal: { handle: 'term_x' } }, 'rcpt-tc-1')
+          : args[1] === 'wait'
+            ? okEnv({ idle: true })
+            : args[1] === 'show'
+              ? okTerm(readyTerm('term_x'))
+              : failEnv('unexpected'),
+    );
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed');
+    assert.match(res.value.detail ?? '', /invalid_argument/);
+    // Exactly one worker-start attempt — a definite refusal permits retry
+    // at the engine's discretion, the adapter never retries on its own.
+    assert.equal(calls.filter((a) => a[1] === 'worker-start').length, 1);
+  });
+
+  it('classifier units: mutations default uncertain, reads classify any known code', () => {
+    const ws = ['orchestration', 'worker-start'];
+    assert.equal(isUncertainFailure(ws, 'future_post_create_denied', true), true);
+    assert.equal(isUncertainFailure(ws, 'new_resource_not_found', true), true);
+    assert.equal(isUncertainFailure(ws, 'invalid_argument', true), false);
+    assert.equal(isUncertainFailure(ws, 'outcome_unknown', true), true);
+    // Reads: no mutation could have landed — a failed read is a clean failure.
+    assert.equal(isUncertainFailure(ws, 'future_post_create_denied', false), false);
+    // Command-scoped proven refusal: worker-stop invalid_state is a
+    // pre-effect state check on that command only.
+    assert.equal(isNoEffectRefusal(['orchestration', 'worker-stop'], 'invalid_state'), true);
+    assert.equal(isNoEffectRefusal(ws, 'invalid_state'), false);
+  });
+
+  it('a generic exception after a mutation may have landed is uncertain, not a token error', async () => {
+    // spawnFn throws mid-flight on worker-start — the effect may have been
+    // issued. This must surface 'unknown' with evidence, never a definite
+    // failure that could authorize a duplicate launch.
+    const { adapter } = makeAdapter((args) => {
+      if (args[1] === 'worker-start') throw new Error('socket hangup');
+      if (args[1] === 'create') return okTerm({ terminal: { handle: 'term_x' } }, 'rcpt-tc-1');
+      if (args[1] === 'wait') return okEnv({ idle: true });
+      if (args[1] === 'show') return okTerm(readyTerm('term_x'));
+      return failEnv('unexpected');
+    });
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.match(res.value.detail ?? '', /unexpected_after_mutation|socket hangup/);
+  });
+});
+
+describe('strict worker/task ledger reads (clm_0029)', () => {
+  const settledReuse = (workers: unknown) => (args: readonly string[]) =>
+    args[1] === 'worker-list'
+      ? okEnv({ workers })
+      : args[1] === 'show'
+        ? okTerm(readyTerm('term_keep'))
+        : args[1] === 'worker-start'
+          ? okEnv({ dispatchId: 'ctx_d9' })
+          : okEnv({});
+
+  it('a MISSING workers array never becomes [] — reuse is refused', async () => {
+    // clm_0029 reproduced: `workers ?? []` used to authorize custody on an
+    // unreadable ledger.
+    for (const receipt of [{}, { items: 'not-an-array' }, { workers: 'oops' }, null]) {
+      const { adapter, calls } = makeAdapter((args) =>
+        args[1] === 'worker-list'
+          ? okEnv(receipt)
+          : args[1] === 'show'
+            ? okTerm(readyTerm('term_keep'))
+            : args[1] === 'worker-start'
+              ? okEnv({ dispatchId: 'ctx_d9' })
+              : okEnv({}),
+      );
+      const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.notEqual(res.value.outcome, 'started', JSON.stringify(receipt));
+      assert.ok(
+        calls.every((a) => a[1] !== 'worker-start'),
+        `malformed ledger ${JSON.stringify(receipt)} must never authorize reuse`,
+      );
+    }
+  });
+
+  it('a truncated ledger (hasMore, no cursor) is unproven — reuse refused', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', outcome: 'succeeded' }], hasMore: true })
+        : args[1] === 'show'
+          ? okTerm(readyTerm('term_keep'))
+          : args[1] === 'worker-start'
+            ? okEnv({ dispatchId: 'ctx_d9' })
+            : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.notEqual(res.value.outcome, 'started');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('a ledger row without dispatch/terminal identity is unproven', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ outcome: 'succeeded', liveness: 'idle' }] })
+        : args[1] === 'show'
+          ? okTerm(readyTerm('term_keep'))
+          : args[1] === 'worker-start'
+            ? okEnv({ dispatchId: 'ctx_d9' })
+            : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.notEqual(res.value.outcome, 'started');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('follows a bounded nextCursor — a busy row on a later page still blocks reuse', async () => {
+    const { adapter, calls } = makeAdapter((args) => {
+      if (args[1] === 'worker-list') {
+        return args.includes('--cursor')
+          ? okEnv({ workers: [{ dispatchId: 'ctx_late', terminal: 'term_keep', outcome: 'in_progress', liveness: 'live' }] })
+          : okEnv({
+              workers: [{ dispatchId: 'ctx_old', terminal: 'term_other', outcome: 'succeeded' }],
+              nextCursor: 'page-2',
+            });
+      }
+      if (args[1] === 'show') return okTerm(readyTerm('term_keep'));
+      if (args[1] === 'worker-start') return okEnv({ dispatchId: 'ctx_d9' });
+      return okEnv({});
+    });
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed', 'page-2 owner must block reuse');
+    const lists = calls.filter((a) => a[1] === 'worker-list');
+    assert.equal(lists.length, 2, 'bounded follow of exactly one cursor');
+    assert.ok(lists[1]?.includes('--cursor') && lists[1].includes('page-2'));
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('a repeating cursor is a pagination cycle — the ledger stays unproven', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ dispatchId: 'ctx_o', terminal: 'term_other', outcome: 'succeeded' }], nextCursor: 'loop' })
+        : args[1] === 'show'
+          ? okTerm(readyTerm('term_keep'))
+          : args[1] === 'worker-start'
+            ? okEnv({ dispatchId: 'ctx_d9' })
+            : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.notEqual(res.value.outcome, 'started');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+    // Bounded: the repeated cursor is detected after the second page, not 10.
+    assert.equal(calls.filter((a) => a[1] === 'worker-list').length, 2);
+  });
+
+  it('a verdict-less row on the terminal is custody_unproven, never silently free', async () => {
+    // cli.ts supervisor convention: only an explicit verdict frees a
+    // terminal. state 'settling' is not a verdict and not an active marker.
+    const { adapter, calls } = makeAdapter(
+      settledReuse([{ dispatchId: 'ctx_amb', terminal: 'term_keep', state: 'settling' }]),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.notEqual(res.value.outcome, 'started');
+    assert.match(res.value.detail ?? '', /custody_unproven|no explicit verdict/i);
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('worker-list --full fallback: one bounded legacy retry on invalid_argument only', async () => {
+    // A host that refuses the newer flags gets ONE legacy-argv retry — reads
+    // are idempotent; any other failure is a failure, never a fallback.
+    const { adapter, calls } = makeAdapter((args) => {
+      if (args[1] === 'worker-list') {
+        return args.includes('--full')
+          ? failEnv('invalid_argument', 'Unknown flag --full')
+          : okEnv({ workers: [{ dispatchId: 'ctx_o', terminal: 'term_keep', outcome: 'succeeded' }] });
+      }
+      if (args[1] === 'show') return okTerm(readyTerm('term_keep'));
+      if (args[1] === 'worker-start') return okEnv({ dispatchId: 'ctx_d9' });
+      return okEnv({});
+    });
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'started');
+    const lists = calls.filter((a) => a[1] === 'worker-list');
+    assert.equal(lists.length, 2, 'exactly one bounded fallback');
+    assert.ok(lists[0]?.includes('--full'));
+    assert.ok(!lists[1]?.includes('--full'));
+  });
+
+  it('no fallback on a non-argument worker-list failure', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? failEnv('runtime_unavailable', 'daemon down')
+        : okEnv({}),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.notEqual(res.value.outcome, 'started');
+    assert.equal(calls.filter((a) => a[1] === 'worker-list').length, 1, 'no retry');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('task-list completeness: scope mismatch and advertised-more fail the read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'council fake orca '));
+    const exe = join(dir, 'fake orca.exe');
+    writeFileSync(exe, '');
+    for (const receipt of [
+      { scope: { run: 'run_other' }, tasks: [] },
+      { tasks: [], nextCursor: 'more' },
+      { tasks: [{ id: 'task_x' }], hasMore: true },
+    ]) {
+      const { calls, spawnFn } = recorder(() => okEnv(receipt));
+      const host = new OrcaHost({ executablePath: exe, spawnFn });
+      const res = await host.listTasks('run_c1');
+      assert.equal(res.ok, false, JSON.stringify(receipt));
+      if (!res.ok) assert.match(res.error.code, /malformed_task_list|truncated_task_list/);
+      assert.ok(calls.length >= 1);
+    }
+  });
+});
+
+describe('terminal-create custody hooks', () => {
+  const devinLikeHandler = (): ((args: readonly string[]) => ProcessResult) => (args) => {
+    const cmd = args[1];
+    if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
+    if (cmd === 'wait') return okEnv({ idle: true });
+    if (cmd === 'show') return okTerm(readyTerm('term_new1'));
+    if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+    if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
+    return failEnv('unexpected_command', String(cmd));
+  };
+  const custodyOk = () => {
+    const seen: { intents: unknown[]; receipts: unknown[] } = { intents: [], receipts: [] };
+    return {
+      seen,
+      hooks: {
+        beforeTerminalCreate: async (i: never) => {
+          seen.intents.push(i);
+          return { ok: true as const, value: undefined };
+        },
+        afterTerminalCreate: async (r: never) => {
+          seen.receipts.push(r);
+          return { ok: true as const, value: undefined };
+        },
+      },
+    };
+  };
+
+  it('journals intent before create and the created receipt after — same intentId', async () => {
+    const c = custodyOk();
+    const { adapter, calls } = makeAdapter(devinLikeHandler());
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'started');
+    assert.equal(c.seen.intents.length, 1);
+    assert.equal(c.seen.receipts.length, 1);
+    const intent = c.seen.intents[0] as { intentId: string; command: string; taskId: string };
+    const receipt = c.seen.receipts[0] as { intentId: string; outcome: string; terminalHandle?: string; requestId?: string };
+    assert.equal(receipt.intentId, intent.intentId);
+    assert.equal(intent.taskId, 'task_aaa');
+    assert.match(intent.command, /devin --model swe-2-max/);
+    assert.equal(receipt.outcome, 'created');
+    assert.equal(receipt.terminalHandle, 'term_new1');
+    assert.equal(receipt.requestId, 'rcpt-tc-1', 'terminal envelope id is the receipt evidence');
+    assert.equal(calls[0]?.[1], 'create', 'create is the first mutation');
+  });
+
+  it('a failed intent journal aborts BEFORE terminal create — definite failed', async () => {
+    const { adapter, calls } = makeAdapter(devinLikeHandler());
+    const res = await adapter.launchWorker(
+      launchSpec({
+        custody: {
+          beforeTerminalCreate: async () => ({
+            ok: false as const,
+            error: { code: 'io_error' as const, message: 'disk' },
+          }),
+          afterTerminalCreate: async () => ({ ok: true as const, value: undefined }),
+        },
+      }),
+    );
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed');
+    assert.match(res.value.detail ?? '', /custody_intent|custody_journal_failed/);
+    assert.equal(calls.length, 0, 'no host command — the intent could not be journaled');
+  });
+
+  it('a failed receipt journal stops ALL further mutation and reports uncertain', async () => {
+    const { adapter, calls } = makeAdapter(devinLikeHandler());
+    const res = await adapter.launchWorker(
+      launchSpec({
+        custody: {
+          beforeTerminalCreate: async () => ({ ok: true as const, value: undefined }),
+          afterTerminalCreate: async () => ({
+            ok: false as const,
+            error: { code: 'io_error' as const, message: 'disk' },
+          }),
+        },
+      }),
+    );
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown', 'the terminal may exist unjournaled');
+    assert.equal(res.value.terminalHandle, 'term_new1', 'observed identity retained');
+    assert.equal(res.value.requestId, 'rcpt-tc-1', 'receipt evidence retained');
+    assert.match(res.value.detail ?? '', /custody_receipt|custody_journal_failed/);
+    // One create, zero further mutations — no wait, show, or worker-start.
+    assert.deepEqual(
+      calls.map((a) => a[1]),
+      ['create'],
+    );
+  });
+
+  it('an ambiguous create is never auto-repeated and the receipt records uncertain', async () => {
+    const c = custodyOk();
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'create' ? failEnv('outcome_unknown', 'lost') : failEnv('unexpected'),
+    );
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    const creates = calls.filter((a) => a[1] === 'create');
+    assert.equal(creates.length, 1, 'ambiguous create must never auto-repeat');
+    const receipt = c.seen.receipts[0] as { outcome: string } | undefined;
+    assert.equal(receipt?.outcome, 'uncertain');
+  });
+
+  it('a created reply without a handle is uncertain — no wait/show/start', async () => {
+    const c = custodyOk();
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'create' ? okTerm({ unexpected: true }, 'rcpt-tc-2') : failEnv('unexpected'),
+    );
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    const receipt = c.seen.receipts[0] as { outcome: string; requestId?: string } | undefined;
+    assert.equal(receipt?.outcome, 'uncertain');
+    assert.equal(receipt?.requestId, 'rcpt-tc-2');
+    assert.deepEqual(calls.map((a) => a[1]), ['create']);
+  });
+
+  it('a THROWING receipt hook retains the created handle + receipt evidence', async () => {
+    // Audit regression: afterTerminalCreate threw after a successful create —
+    // the generic catch must still surface the observed terminalHandle and
+    // the create's requestId, and must stop all further mutation (no wait,
+    // no show, no worker-start).
+    const { adapter, calls } = makeAdapter(devinLikeHandler());
+    const res = await adapter.launchWorker(
+      launchSpec({
+        custody: {
+          beforeTerminalCreate: async () => ({ ok: true as const, value: undefined }),
+          afterTerminalCreate: async () => {
+            throw new Error('journal write crashed');
+          },
+        },
+      }),
+    );
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.terminalHandle, 'term_new1', 'created handle must be retained even when the hook throws');
+    assert.equal(res.value.requestId, 'rcpt-tc-1', 'create receipt id must be retained');
+    assert.match(res.value.detail ?? '', /custody_receipt|custody_journal_failed|unexpected_after_mutation/);
+    assert.deepEqual(calls.map((a) => a[1]), ['create'], 'one create, zero further mutation');
+  });
+
+  it('a created reply without a handle retains the create requestId evidence', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'create' ? okTerm({ unexpected: true }, 'rcpt-tc-2') : failEnv('unexpected'),
+    );
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.requestId, 'rcpt-tc-2', 'partial receipt evidence must be retained for reconcile');
+    assert.deepEqual(calls.map((a) => a[1]), ['create']);
+  });
+
+  it('a definite create refusal journals refused and reports failed — no repeat', async () => {
+    const c = custodyOk();
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'create' ? failEnv('invalid_argument', 'bad worktree') : failEnv('unexpected'),
+    );
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed');
+    const receipt = c.seen.receipts[0] as { outcome: string } | undefined;
+    assert.equal(receipt?.outcome, 'refused');
+    assert.equal(calls.filter((a) => a[1] === 'create').length, 1);
+  });
+
+  it('no custody hooks: the lane still works and nothing is journaled', async () => {
+    // Legacy launches keep prior behavior — hooks are optional.
+    const { adapter, calls } = makeAdapter(devinLikeHandler());
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'started');
+    assert.equal(calls.filter((a) => a[1] === 'create').length, 1);
   });
 });
 

@@ -11,6 +11,7 @@ import {
   parseApprovalBinding,
   parseChallengeEnvelope,
   parseChallengesFile,
+  parseClaimLedger,
   parseCouncilState,
   parseFindingsFile,
   parseJournalEvent,
@@ -21,6 +22,8 @@ import {
   parseScribeNotesFile,
   parseSourceSnapshot,
   parseSynthesisFile,
+  parseTerminalCreateIntent,
+  parseTerminalCreateReceipt,
   resolveConfig,
 } from '../src/validation.js';
 import type {
@@ -836,4 +839,222 @@ test('parseReportFile round-trips runnerFacts and limitationSources', () => {
   // Malformed fact block fails parse, never silently accepted.
   const bad = mkReportWithClaims([claim], { runnerFacts: { seatsCompleted: 'two' } });
   assert.ok(!parseReportFile(bad, { runId: RUN }).ok);
+});
+
+// ─── strengths on findings files ─────────────────────────────────────────────
+
+const mkStrength = (id = 'S-1', over: Record<string, unknown> = {}) => ({
+  strengthId: id,
+  feature: 'bounded launch queue',
+  benefit: 'a reliability seat can reason about worst-case load',
+  preserve: 'never launch without a cap',
+  evidence: [ev('reasoned')],
+  ...over,
+});
+
+test('parseFindingsFile: strengths optional — absent, empty and valid all parse', () => {
+  const base = { schemaVersion: 1, runId: RUN, participantId: 'rev0', perspectiveId: 'p0', findings: [] };
+  assert.ok(parseFindingsFile(base, {}).ok, 'absent strengths — legacy file');
+  assert.ok(parseFindingsFile({ ...base, strengths: [] }, {}).ok, 'empty strengths — zero is valid');
+  const r = parseFindingsFile({ ...base, strengths: [mkStrength()] }, {});
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.strengths![0]!.strengthId, 'S-1');
+});
+
+test('parseFindingsFile: strength cap, duplicate ids and missing evidence rejected', () => {
+  const base = { schemaVersion: 1, runId: RUN, participantId: 'rev0', perspectiveId: 'p0', findings: [] };
+  const tooMany = { ...base, strengths: [mkStrength('S-1'), mkStrength('S-2'), mkStrength('S-3'), mkStrength('S-4')] };
+  assert.ok(hasCode(parseFindingsFile(tooMany, {}), 'too_many'), '4 > MAX_STRENGTHS_PER_FILE');
+  const dup = { ...base, strengths: [mkStrength('S-1'), mkStrength('S-1')] };
+  assert.ok(hasCode(parseFindingsFile(dup, {}), 'duplicate'));
+  const noEv = { ...base, strengths: [mkStrength('S-1', { evidence: [] })] };
+  assert.ok(hasCode(parseFindingsFile(noEv, {}), 'required'), 'strength evidence is required');
+  const badField = { ...base, strengths: [mkStrength('S-1', { benefit: '' })] };
+  assert.ok(hasCode(parseFindingsFile(badField, {}), 'too_short'));
+});
+
+test('worker-file parsers consume ctx.maxTextChars as an approval-bound clamp', () => {
+  const file = {
+    schemaVersion: 1, runId: RUN, participantId: 'rev0', perspectiveId: 'p0',
+    findings: [{ ...mkFinding('f1'), title: 'x'.repeat(150) }],
+  };
+  // Under the itemized cap alone (200) the title passes; the bound clamps it.
+  assert.ok(parseFindingsFile(file, {}).ok);
+  const r = parseFindingsFile(file, { maxTextChars: 100 });
+  assert.ok(hasCode(r, 'too_long'), issues(r));
+  // Challenges + responses honor it too — and absence preserves itemized caps.
+  const ch = { schemaVersion: 1, runId: RUN, round: 1, participantId: 'rev0',
+    challenges: [{ challengeId: 'C-1', claimId: 'c1', kind: 'other', argument: 'y'.repeat(500), evidence: [] }] };
+  assert.ok(parseChallengesFile(ch, {}).ok);
+  assert.ok(hasCode(parseChallengesFile(ch, { maxTextChars: 300 }), 'too_long'));
+});
+
+test('parseFindingsFile: duplicate findingId is a file-level rejection, not first-wins', () => {
+  const r = parseFindingsFile(
+    {
+      schemaVersion: 1, runId: RUN, participantId: 'rev0', perspectiveId: 'p0',
+      findings: [mkFinding('f1'), mkFinding('f1'), mkFinding('f2')],
+    },
+    {},
+  );
+  assert.ok(hasCode(r, 'duplicate'), issues(r));
+});
+
+// ─── scribe notes expectedKeys ───────────────────────────────────────────────
+
+test('parseScribeNotesFile: expectedKeys rejects unknown and reports incomplete', () => {
+  const notes = (ids: string[]) => ({
+    schemaVersion: 1, runId: RUN, participantId: 'scribe0',
+    claimSummaries: ids.map((claimId) => ({ claimId, summary: 's', possibleDuplicates: [], openQuestions: [] })),
+  });
+  const ctx = { runId: RUN, participantId: 'scribe0', expectedKeys: ['clm_0001', 'clm_0002'] };
+  assert.ok(parseScribeNotesFile(notes(['clm_0001', 'clm_0002']), ctx).ok, 'complete coverage');
+  const unknown = parseScribeNotesFile(notes(['clm_0001', 'clm_9999']), ctx);
+  assert.ok(hasCode(unknown, 'unknown'), 'summary keyed outside the expected set');
+  const missing = parseScribeNotesFile(notes(['clm_0001']), ctx);
+  assert.ok(hasCode(missing, 'incomplete'), 'an expected id unsummarised is reported');
+  // Legacy: no expectedKeys → the same unknown key passes (pre-binding files).
+  assert.ok(parseScribeNotesFile(notes(['clm_9999']), { runId: RUN, participantId: 'scribe0' }).ok);
+});
+
+// ─── parseClaimLedger — reread integrity ────────────────────────────────────
+
+const mkLedgerRaw = (over: Record<string, unknown> = {}) => ({
+  schemaVersion: 1,
+  runId: RUN,
+  claims: [
+    {
+      claimId: 'clm_0001', title: 't', kind: 'defect', grade: 'plausible_risk',
+      status: 'challenged', severity: 'high', confidence: 0.8,
+      evidence: [ev('reasoned')], counterEvidence: [],
+      sourceFindings: [{ participantId: 'rev0', findingId: 'f1' }],
+      history: [], dissent: [],
+      challenges: [
+        { challengeId: 'ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', round: 1, challengerPid: 'rev1', kind: 'other', answered: true, response: { participantId: 'rev0', disposition: 'defend' } },
+      ],
+      dedupeKey: 'defect|t',
+      rejectedEvidence: 1,
+    },
+  ],
+  provenance: { clm_0001: ['rev0'] },
+  strengths: [
+    {
+      strengthId: 'S-1', feature: 'f', benefit: 'b', preserve: 'p',
+      evidence: [ev('reasoned')], participantId: 'rev0', perspectiveId: 'p0',
+    },
+  ],
+  discussion: {
+    rounds: [{
+      round: 1,
+      challenges: {
+        routedClaimIds: ['clm_0001', 'clm_0002'],
+        byteDroppedClaimIds: ['clm_0003'],
+        unassigned: [{ claimId: 'clm_0004', reason: 'at cap' }],
+      },
+      responses: {
+        routedChallengeIds: ['ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+        byteDropped: [],
+        capOmitted: [{ challengeId: 'ch-r1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', claimId: 'clm_0005', authorPid: 'rev0' }],
+        unroutable: [{ challengeId: 'ch-r1-cccccccccccccccccccccccccccccccc', claimId: 'clm_0009', reason: 'withdrawn' }],
+      },
+    }],
+  },
+  ...over,
+});
+
+test('parseClaimLedger: full ledger with strengths and discussion round-trips', () => {
+  const r = parseClaimLedger(mkLedgerRaw(), { runId: RUN });
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.claims[0]!.challenges![0]!.answered, true);
+  assert.equal(r.value.strengths![0]!.participantId, 'rev0');
+  const rec = r.value.discussion!.rounds[0]!;
+  assert.deepEqual(rec.challenges.routedClaimIds, ['clm_0001', 'clm_0002']);
+  assert.equal(rec.responses!.capOmitted.length, 1);
+});
+
+test('parseClaimLedger: legacy ledger without optional fields still parses', () => {
+  const r = parseClaimLedger(
+    {
+      schemaVersion: 1, runId: RUN,
+      claims: [{
+        claimId: 'clm_0001', title: 't', kind: 'defect', grade: 'unsupported',
+        status: 'proposed', severity: 'low', confidence: 0.5,
+        evidence: [], counterEvidence: [],
+        sourceFindings: [{ participantId: 'rev0', findingId: 'f1' }],
+        history: [], dissent: [],
+      }],
+      provenance: { clm_0001: ['rev0'] },
+    },
+    { runId: RUN },
+  );
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.strengths, undefined);
+  assert.equal(r.value.discussion, undefined);
+  assert.equal(r.value.claims[0]!.challenges, undefined);
+});
+
+test('parseClaimLedger: malformed reread content fails closed — no JSON.parse cast', () => {
+  assert.ok(!parseClaimLedger({ runId: RUN, claims: [], provenance: {} }, {}).ok, 'missing schemaVersion');
+  assert.ok(hasCode(parseClaimLedger(mkLedgerRaw({ runId: 'crun_other' }), { runId: RUN }), 'mismatch'));
+  assert.ok(hasCode(parseClaimLedger(mkLedgerRaw({ provenance: { clm_0001: 'rev0' } }), {}), 'type'));
+  const badDiscussion = mkLedgerRaw({ discussion: { rounds: [{ round: 'one', challenges: {} }] } });
+  assert.ok(!parseClaimLedger(badDiscussion, {}).ok, 'malformed discussion record');
+  const badStrength = mkLedgerRaw({ strengths: [{ strengthId: 'S-1' }] });
+  assert.ok(!parseClaimLedger(badStrength, {}).ok, 'malformed strength');
+});
+
+// ─── report provenance + strengths + enhanced runnerFacts ───────────────────
+
+test('parseReportFile: provenance, canonical strengths and discussion facts round-trip', () => {
+  const extra = {
+    provenance: { snapshotId: 'snap_1', gitHead: 'deadbeef', targetRoot: '/t', objective: 'review' },
+    strengths: [
+      {
+        strengthId: 'S-1', feature: 'f', benefit: 'b', preserve: 'p',
+        evidence: [ev('reasoned')], participantId: 'rev0', perspectiveId: 'p0',
+      },
+    ],
+    runnerFacts: {
+      seatsCompleted: 1, seatsSelected: 1, partialCoverage: false,
+      uncoveredPerspectiveIds: [], summarySource: 'runner',
+      claims: { total: 0, byStatus: {}, withDissent: [], unansweredChallenges: ['clm_0007'], withdrawn: 0, escalated: 0 },
+      strengths: 1,
+      discussion: [{
+        round: 1, challengesFiled: 2, challengesAnswered: 1, challengesUnanswered: 1,
+        claimsRouted: 3, claimsRoutedNoChallenge: 1, claimsNeverRouted: 1,
+        claimsUnassigned: 0, claimsByteDropped: 1,
+        responsesRouted: 1, responsesByteDropped: 0, responsesCapOmitted: 0, responsesUnroutable: 1,
+      }],
+    },
+  };
+  const r = parseReportFile(mkReportWithClaims([], extra), { runId: RUN });
+  assert.ok(r.ok, issues(r));
+  assert.equal(r.value.provenance!.gitHead, 'deadbeef');
+  assert.equal(r.value.strengths![0]!.strengthId, 'S-1');
+  assert.deepEqual(r.value.runnerFacts!.claims.unansweredChallenges, ['clm_0007']);
+  assert.equal(r.value.runnerFacts!.discussion![0]!.claimsByteDropped, 1);
+  // Malformed provenance fails parse — never silently dropped.
+  const bad = mkReportWithClaims([], { provenance: { snapshotId: 'snap_1' } });
+  assert.ok(!parseReportFile(bad, { runId: RUN }).ok);
+});
+
+// ─── terminal-create custody records ────────────────────────────────────────
+
+test('parseTerminalCreateIntent/Receipt: adapter-confirmed shape validates and round-trips', () => {
+  const intent = {
+    intentId: 'tci_1', participantId: 'rev0', taskId: 'task_1', runId: 'run_1',
+    worktree: 'current', title: 'review', command: 'devin --model swe-2-max',
+  };
+  const ri = parseTerminalCreateIntent(intent);
+  assert.ok(ri.ok, issues(ri));
+  assert.equal(ri.value.createdAt, undefined, 'ts is journal-authoritative, optional');
+  assert.ok(hasCode(parseTerminalCreateIntent({ intentId: 'tci_1' }), 'type'));
+  const receipt = {
+    intentId: 'tci_1', taskId: 'task_1', outcome: 'uncertain',
+    requestId: 'req_9', detail: 'create timed out',
+  };
+  const rr = parseTerminalCreateReceipt(receipt);
+  assert.ok(rr.ok, issues(rr));
+  assert.equal(rr.value.outcome, 'uncertain');
+  assert.ok(!parseTerminalCreateReceipt({ ...receipt, outcome: 'unknown' }).ok, 'legacy vocabulary rejected');
 });

@@ -16,6 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -58,8 +59,27 @@ function cli(args: readonly string[], env: NodeJS.ProcessEnv = {}): Promise<CliR
 }
 
 function cliJson(args: readonly string[], env: NodeJS.ProcessEnv = {}) {
-  return cli(args, env).then((r) => ({ ...r, body: JSON.parse(r.stdout) as Record<string, unknown> }));
+  return cli(args, env).then((r) => {
+    const body = JSON.parse(r.stdout) as Record<string, unknown>;
+    // A payload.helper.pid means the progress lane spawned a real detached
+    // argv helper — track every spawn so afterEach never leaks one (bounded
+    // to 24h by the module itself, but tests clean up immediately).
+    const h = body !== null && typeof body === 'object' ? (body.helper as Record<string, unknown> | undefined) : undefined;
+    if (h !== undefined && typeof h.pid === 'number') spawnedHelperPids.push(h.pid);
+    return { ...r, body };
+  });
 }
+
+const spawnedHelperPids: number[] = [];
+test.afterEach(() => {
+  for (const pid of spawnedHelperPids.splice(0)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+});
 
 function tmp(prefix: string): string {
   return mkdtempSync(path.join(tmpdir(), `council-cli-${prefix}-`));
@@ -2132,6 +2152,568 @@ test('start-supervisor on a legacy (staff-less) run keeps the original Devin pin
   assert.equal(rec.supervisor.command, 'devin --model swe-2-max --permission-mode dangerous');
   assert.equal(rec.supervisor.choice, null);
   assert.equal(rec.execution, null);
+});
+
+// ─── supervisor replacement (--replace, clm_0037) ────────────────────────────
+//
+// The dead-supervisor dead end: a recorded supervisor whose terminal is gone
+// (Orca restart invalidates runtime-scoped handles) had NO supported path —
+// start-supervisor refused on the recorded identity, --as-supervisor refused
+// on a different handle, and an attached record refused a relaunch. --replace
+// is the only door out: journal-first retirement allowed ONLY when the old
+// terminal is provably stale (documented code, never guessed from quiet or
+// released) AND every recorded attach/dispatch custody resolves. All cases
+// below use the fake host; nothing here is a live integration test.
+
+const STALE_SHOW = {
+  ok: false,
+  error: { code: 'terminal_handle_stale', message: 'terminal not found — handle is stale' },
+};
+
+/** sha256 of the run's supervisor spec — required for a valid startup record. */
+function specSha(runDir: string): string {
+  return createHash('sha256')
+    .update(readFileSync(path.join(runDir, 'prompts', 'supervisor.md')))
+    .digest('hex');
+}
+
+function journalAll(runDir: string): { seq: number; type: string; payload?: Record<string, unknown> }[] {
+  return readFileSync(path.join(runDir, 'events.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { seq: number; type: string; payload?: Record<string, unknown> });
+}
+
+/**
+ * Persist a recorded supervisor identity + (optionally) its startup record —
+ * the shape a live-or-crashed supervisor leaves behind.
+ */
+async function seedSupervisor(
+  f: InitFixture,
+  opts: {
+    terminal?: string;
+    dispatch?: string | null;
+    recordStatus?: string;
+    boundRunId?: string;
+    requestIds?: Record<string, string>;
+    noRecord?: boolean;
+  } = {},
+): Promise<void> {
+  const terminal = opts.terminal ?? 'term_dead';
+  const dispatch = opts.dispatch === undefined ? 'ctx_dead' : opts.dispatch;
+  const store = createStore({ runDir: f.runDir });
+  const w = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    st.value.supervisor = { terminalHandle: terminal, dispatchId: dispatch };
+    return store.saveState(st.value);
+  });
+  assert.ok(w.ok, `seed failed: ${JSON.stringify(w)}`);
+  if (opts.noRecord === true) return;
+  const rec = {
+    schemaVersion: 1,
+    runId: f.runId,
+    specSha256: specSha(f.runDir),
+    supervisor: {
+      command: 'devin --model swe-2-max --permission-mode dangerous',
+      expectedAgent: 'devin',
+      choice: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' },
+    },
+    execution: { catalogVersion: CATALOG_VERSION, policyHash: LAUNCH_POLICY_HASH },
+    lane: 'task-under-caller-run',
+    boundRunId: opts.boundRunId ?? 'run_caller',
+    taskId: 'task_dead',
+    terminalHandle: terminal,
+    requestIds: opts.requestIds ?? { taskCreate: 'req_t', terminalCreate: 'req_term', workerStart: 'req_ws' },
+    status: opts.recordStatus ?? 'attached',
+    dispatchId: dispatch,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  mkdirSync(path.join(f.runDir, 'supervisor'), { recursive: true });
+  writeFileSync(
+    path.join(f.runDir, 'supervisor', 'startup.json'),
+    JSON.stringify(rec, null, 2) + '\n',
+  );
+}
+
+/** The fresh-launch half of a replace scenario (new resources attach cleanly). */
+function freshLaunchScenario(newHandle = 'term_new', newDispatch = 'ctx_new'): Record<string, unknown[]> {
+  return {
+    'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+    'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new' } } }],
+    'terminal create': [{ ok: true, result: { terminal: { handle: newHandle } } }],
+    'terminal wait': [{ ok: true, result: {} }],
+    'terminal show': [
+      { ok: true, result: { terminal: { handle: newHandle, connected: true, agentIdentity: 'devin', agentWait: null } } },
+    ],
+    'orchestration worker-start': [{ ok: true, result: { dispatch: { id: newDispatch } } }],
+  };
+}
+
+test('start-supervisor --replace refuses when nothing is recorded and no retirement is journaled', async () => {
+  const f = await initRun();
+  const { env } = fakeOrca(tmp('sup-rep-none'), {}, 'term_primary');
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'invalid_transition');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /nothing to replace/i);
+  assert.equal(readState(f.runDir).supervisor, null);
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+});
+
+test('start-supervisor --replace refuses a still-resolving recorded terminal — stale never inferred', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-live'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      // The handle still resolves — even disconnected. A live record is NOT stale.
+      'terminal show': [
+        { ok: true, result: { terminal: { handle: 'term_dead', connected: false, agentIdentity: 'devin', agentWait: null } } },
+      ],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'invalid_transition');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /still resolves/i);
+  // Identity, journal and record are all untouched — nothing was retired.
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_dead');
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+  assert.equal(hasCall(log, 'terminal create'), false);
+});
+
+test('start-supervisor --replace refuses unproven staleness — a generic show failure is not proof', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-unproven'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      // Timeout-shaped failure: NOT the documented staleness verdict.
+      'terminal show': [{ ok: false, error: { code: 'transient_timeout', message: 'connection timed out' } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'launch_unknown');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /not provably gone|definitive staleness/i);
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_dead');
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+});
+
+test('start-supervisor --replace refuses while the recorded worker-start request is pending', async () => {
+  const f = await initRun();
+  await seedSupervisor(f, { recordStatus: 'start_issued' });
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-pending'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [STALE_SHOW],
+      'orchestration request-show': [{ ok: true, result: { state: 'pending' } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'launch_unknown');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /still pending/i);
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_dead');
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+});
+
+test('start-supervisor --replace refuses a live recorded dispatch — custody unresolved', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-livedispatch'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [STALE_SHOW],
+      'orchestration worker-show': [
+        { ok: true, result: { dispatch: { id: 'ctx_dead', outcome: 'in_progress', liveness: 'live' } } },
+      ],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'invalid_transition');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /still live/i);
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+});
+
+test('start-supervisor --replace refuses a verdict-less worker row — released is not custody', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-verdictless'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [STALE_SHOW],
+      // worker-show can't settle the dispatch → a scoped ledger must.
+      'orchestration worker-show': [{ ok: false, error: { code: 'unknown_dispatch', message: 'no such dispatch' } }],
+      'orchestration worker-list': [
+        { ok: true, result: { workers: [{ dispatchId: 'ctx_dead', terminal: 'term_dead', outcome: 'released' }] } },
+      ],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--json'], env);
+  assert.notEqual(r.code, 0);
+  assert.equal((r.body.error as Record<string, unknown>).code, 'launch_unknown');
+  assert.match((r.body.error as Record<string, unknown>).message as string, /no decisive verdict/i);
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 0);
+  assert.equal(hasCall(log, 'orchestration task-create'), false);
+});
+
+test('start-supervisor --replace retires a provably-stale supervisor — journaled, archived, fresh launch', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const dir = tmp('sup-rep-ok');
+  const { env, log } = fakeOrca(
+    dir,
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [
+        STALE_SHOW, // the recorded supervisor's terminal is provably stale
+        { ok: true, result: { terminal: { handle: 'term_new', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-show': [
+        { ok: true, result: { dispatch: { id: 'ctx_dead', outcome: 'stopped' } } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_new' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_new' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  const replacedFrom = r.body.replacedFrom as { retired: string; archivePath: string | null };
+  assert.equal(replacedFrom.retired, 'term_dead');
+  assert.ok(replacedFrom.archivePath !== null, 'old record archived before the new launch');
+
+  // New identity persisted — the old one is fully retired, not overwritten.
+  const after = readState(f.runDir);
+  assert.equal(after.supervisor?.terminalHandle, 'term_new');
+  assert.equal(after.supervisor?.dispatchId, 'ctx_new');
+
+  // Journal-first durable retirement with the evidence + original record.
+  const retiredEvents = journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired');
+  assert.equal(retiredEvents.length, 1);
+  const payload = retiredEvents[0].payload!;
+  assert.equal(payload.terminalHandle, 'term_dead');
+  assert.equal(payload.dispatchId, 'ctx_dead');
+  const probes = payload.probes as Record<string, Record<string, unknown>>;
+  assert.equal(probes.terminalShow.state, 'stale');
+  assert.equal((payload.record as Record<string, unknown>).status, 'attached');
+  assert.equal((payload.record as Record<string, unknown>).terminalHandle, 'term_dead');
+
+  // The archive preserves the full original record + probes.
+  const archive = JSON.parse(readFileSync(path.join(f.runDir, replacedFrom.archivePath!), 'utf8')) as {
+    kind: string;
+    identity: { terminalHandle: string };
+    record: { status: string; terminalHandle: string };
+    probes: Record<string, unknown>;
+  };
+  assert.equal(archive.identity.terminalHandle, 'term_dead');
+  assert.equal(archive.record.status, 'attached');
+  assert.equal(archive.record.terminalHandle, 'term_dead');
+  assert.match(replacedFrom.archivePath!, /^supervisor\/retired\//);
+
+  // Fresh resources exactly once — never a duplicate of the old pair.
+  const taskCreates = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration task-create');
+  const termCreates = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'terminal create');
+  const starts = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start');
+  assert.equal(taskCreates.length, 1);
+  assert.equal(termCreates.length, 1);
+  assert.equal(starts.length, 1);
+  // No rebinding: the caller's Run stays the caller's.
+  assert.equal(hasCall(log, 'orchestration run-use'), false);
+  assert.equal(r.body.callerRun, 'run_caller');
+});
+
+test('start-supervisor --replace resolves an unverifiable dispatch via complete scoped-ledger absence', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  const { env } = fakeOrca(
+    tmp('sup-rep-ledger'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [
+        STALE_SHOW,
+        { ok: true, result: { terminal: { handle: 'term_new', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-show': [{ ok: false, error: { code: 'unknown_dispatch', message: 'no such dispatch' } }],
+      // Complete scoped ledger, zero rows → the unproven dispatch is absent.
+      'orchestration worker-list': [{ ok: true, result: { workers: [] } }],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_new' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_new' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  const retired = journalAll(f.runDir).find((e) => e.type === 'supervisor.retired')!;
+  const probes = retired.payload!.probes as Record<string, Record<string, unknown>>;
+  assert.equal(probes.workerShow.ctx_dead.state, 'absent_on_complete_ledger');
+});
+
+test('start-supervisor --replace replays a journaled retirement idempotently after a crash', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  // Simulate the crash seam: the durable supervisor.retired decision exists,
+  // but archive/tombstone/state-clear never ran.
+  const store = createStore({ runDir: f.runDir });
+  const j = await store.appendJournal([
+    {
+      ts: new Date().toISOString(),
+      type: 'supervisor.retired',
+      actor: 'orchestrator',
+      payload: {
+        terminalHandle: 'term_dead',
+        dispatchId: 'ctx_dead',
+        reason: 'explicit --replace',
+        probes: { terminalShow: { state: 'stale', code: 'terminal_handle_stale' } },
+        record: { status: 'attached', terminalHandle: 'term_dead' },
+      },
+    },
+  ]);
+  assert.ok(j.ok);
+
+  const { env, log } = fakeOrca(
+    tmp('sup-rep-replay'),
+    freshLaunchScenario(),
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  // The recorded decision is reused — not re-proven, not duplicated.
+  assert.equal(journalAll(f.runDir).filter((e) => e.type === 'supervisor.retired').length, 1);
+  // No terminal-show probe for term_dead ran (only the new terminal's
+  // readiness show): one 'terminal show' call total.
+  const shows = orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'terminal show');
+  assert.equal(shows.length, 1);
+  assert.ok(shows[0].includes('term_new'));
+  assert.equal(readState(f.runDir).supervisor?.terminalHandle, 'term_new');
+  // The old record was still archived by the replayed retirement.
+  assert.ok(existsSync(path.join(f.runDir, 'supervisor', 'retired')), 'archive dir exists');
+});
+
+test('start-supervisor --replace on a self-recorded supervisor (no startup record) preserves identity evidence', async () => {
+  const f = await initRun();
+  await seedSupervisor(f, { noRecord: true });
+  const { env } = fakeOrca(
+    tmp('sup-rep-norec'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+      'terminal show': [
+        STALE_SHOW,
+        { ok: true, result: { terminal: { handle: 'term_new', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-show': [
+        { ok: true, result: { dispatch: { id: 'ctx_dead', outcome: 'failed' } } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_new' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_new' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  const replacedFrom = r.body.replacedFrom as { archivePath: string | null };
+  assert.ok(replacedFrom.archivePath !== null);
+  assert.match(replacedFrom.archivePath!, /identity-term_dead\.json$/);
+  const archive = JSON.parse(readFileSync(path.join(f.runDir, replacedFrom.archivePath!), 'utf8')) as {
+    kind: string;
+    identity: { terminalHandle: string; dispatchId: string };
+  };
+  assert.equal(archive.kind, 'supervisor-identity');
+  assert.equal(archive.identity.dispatchId, 'ctx_dead');
+});
+
+test('status is read-only and reports supervisor health, activity age, phase deadline and actions', async () => {
+  const f = await recoveryRun(); // intent_recorded attempt + journaled task-create refusal + recorded supervisor
+  const { env, log } = fakeOrca(
+    tmp('status-ro'),
+    {
+      'terminal show': [STALE_SHOW],
+      'orchestration worker-show': [
+        { ok: true, result: { dispatch: { id: 'ctx_sup', outcome: 'stopped' } } },
+      ],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['status', '--run', f.runDir, '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+
+  const health = r.body.supervisorHealth as Record<string, unknown>;
+  assert.equal(health.probe, 'stale');
+  assert.equal(health.dispatch, 'ended:stopped');
+  const activity = r.body.activity as { lastEventAt: string | null; ageMs: number | null; events: number };
+  assert.ok(activity.events > 0);
+  assert.ok(activity.ageMs !== null && activity.ageMs >= 0);
+  const phase = r.body.phase as { status: string; deadlineMs: number | null; overDeadline: boolean };
+  assert.equal(phase.status, 'independent_review');
+  assert.equal(typeof phase.deadlineMs, 'number');
+
+  const actions = r.body.pendingActions as { kind: string; detail: string; command?: string }[];
+  // The journaled no-task intent → the exact reconcile command.
+  const recon = actions.find((a) => a.kind === 'reconcile');
+  assert.ok(recon !== undefined, 'expected an actionable reconcile pending action');
+  assert.match(recon!.command!, /--attempt att_rev-1_independent_review_r0_0 --confirm-no-effects 74a45889-c510-491e-9598-26264fc8f5c7/);
+  // A provably-stale supervisor → the exact replacement command.
+  const rep = actions.find((a) => a.kind === 'replace');
+  assert.ok(rep !== undefined, 'expected a replace pending action for the stale supervisor');
+  assert.match(rep!.command!, /start-supervisor --run .* --replace/);
+  // Attempt-level dispatch exposure for manual fencing.
+  const attempts = r.body.attempts as { attempts: { dispatchId: unknown }[] }[];
+  assert.ok(Array.isArray(attempts) && attempts.length > 0);
+
+  // Progress + integrity blocks are present and honest.
+  assert.ok('notify' in r.body);
+  assert.ok('integrity' in r.body);
+
+  // Read-only proof: no host mutation ran — only the two documented reads.
+  const mutating = orcaCalls(log).filter((a) =>
+    ['orchestration task-create', 'orchestration worker-start', 'orchestration run-use', 'orchestration send', 'terminal create', 'terminal wait'].includes(
+      a.slice(0, 2).join(' '),
+    ),
+  );
+  assert.equal(mutating.length, 0, `status mutated the host: ${JSON.stringify(mutating)}`);
+});
+
+test('status does not advertise reconcile for an intent with no journaled request id', async () => {
+  const f = await recoveryRun({ failureMessage: 'task-create failed: adapter exploded with no request id' });
+  const { env } = fakeOrca(
+    tmp('status-nointent'),
+    {
+      'terminal show': [STALE_SHOW],
+      'orchestration worker-show': [{ ok: true, result: { dispatch: { id: 'ctx_sup', outcome: 'stopped' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['status', '--run', f.runDir, '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const actions = r.body.pendingActions as { kind: string; detail: string; command?: string }[];
+  // The intent must surface as observation guidance — NEVER an invented
+  // reconcile command (there is no journaled request id to confirm).
+  const reconcile = actions.find((a) => a.kind === 'reconcile');
+  assert.equal(reconcile, undefined);
+  const inspect = actions.find((a) => a.kind === 'inspect' && /intent_recorded/.test(a.detail));
+  assert.ok(inspect !== undefined, 'expected observation guidance for the intent_recorded attempt');
+  assert.equal(inspect!.command, undefined);
+});
+
+test('init captures the caller bound Run as the wake recipient; --notify overrides', async () => {
+  // Caller-bound capture: init inside an Orca terminal bound to run_parent
+  // persists progress/recipient.json BEFORE any supervisor exists.
+  const dir = tmp('init-recipient');
+  const target = path.join(dir, 'target');
+  writeTree(target, { 'src/a.js': 'const a = 1;\n' });
+  const objective = path.join(dir, 'objective.md');
+  writeFileSync(objective, 'Objective.\n');
+  const councilHome = path.join(dir, 'council-home');
+  const { env } = fakeOrca(
+    dir,
+    { 'orchestration run-current': [{ ok: true, result: { runId: 'run_parent' } }] },
+    'term_primary',
+  );
+  env.COUNCIL_HOME = councilHome;
+  const r = await cliJson(
+    ['init', '--objective', objective, '--target', target, '--config', staffConfig(dir), '--json'],
+    env,
+  );
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const recipient = JSON.parse(
+    readFileSync(path.join(r.body.runDir as string, 'progress', 'recipient.json'), 'utf8'),
+  ) as { to: string; source: string };
+  assert.equal(recipient.to, 'run:run_parent');
+  assert.equal(recipient.source, 'caller_run');
+  const notify = r.body.notifyRecipient as { captured: boolean; recipient?: string };
+  assert.equal(notify.captured, true);
+  assert.equal(notify.recipient, 'run:run_parent');
+
+  // Explicit --notify beats caller evidence.
+  const dir2 = tmp('init-notify');
+  const target2 = path.join(dir2, 'target');
+  writeTree(target2, { 'src/a.js': 'const a = 1;\n' });
+  const objective2 = path.join(dir2, 'objective.md');
+  writeFileSync(objective2, 'Objective.\n');
+  const { env: env2 } = fakeOrca(
+    dir2,
+    { 'orchestration run-current': [{ ok: true, result: { runId: 'run_parent' } }] },
+    'term_primary',
+  );
+  env2.COUNCIL_HOME = path.join(dir2, 'council-home');
+  const r2 = await cliJson(
+    ['init', '--objective', objective2, '--target', target2, '--config', staffConfig(dir2), '--notify', 'run:run_explicit', '--json'],
+    env2,
+  );
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr);
+  const recipient2 = JSON.parse(
+    readFileSync(path.join(r2.body.runDir as string, 'progress', 'recipient.json'), 'utf8'),
+  ) as { to: string; source: string };
+  assert.equal(recipient2.to, 'run:run_explicit');
+  assert.equal(recipient2.source, 'explicit');
+});
+
+test('start-supervisor --replace preserves the first durable recipient — never recaptured from the child context', async () => {
+  const f = await initRun();
+  await seedSupervisor(f);
+  // Pre-persisted recipient — the initiating primary's original parent Run.
+  mkdirSync(path.join(f.runDir, 'progress'), { recursive: true });
+  writeFileSync(
+    path.join(f.runDir, 'progress', 'recipient.json'),
+    JSON.stringify({ schemaVersion: 1, to: 'run:run_origin', source: 'caller_run', recordedAt: new Date().toISOString() }, null, 2) + '\n',
+  );
+  const { env } = fakeOrca(
+    tmp('sup-rep-recipient'),
+    {
+      'orchestration run-current': [{ ok: true, result: { runId: 'run_different' } }],
+      'terminal show': [
+        STALE_SHOW,
+        { ok: true, result: { terminal: { handle: 'term_new', connected: true, agentIdentity: 'devin', agentWait: null } } },
+      ],
+      'orchestration worker-show': [
+        { ok: true, result: { dispatch: { id: 'ctx_dead', outcome: 'stopped' } } },
+      ],
+      'orchestration task-create': [{ ok: true, result: { task: { id: 'task_new' } } }],
+      'terminal create': [{ ok: true, result: { terminal: { handle: 'term_new' } } }],
+      'terminal wait': [{ ok: true, result: {} }],
+      'orchestration worker-start': [{ ok: true, result: { dispatch: { id: 'ctx_new' } } }],
+    },
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--replace', '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  // The replacing operator's own bound Run (run_different) must NOT displace
+  // the persisted parent target — first durable wins without --notify.
+  const recipient = JSON.parse(
+    readFileSync(path.join(f.runDir, 'progress', 'recipient.json'), 'utf8'),
+  ) as { to: string };
+  assert.equal(recipient.to, 'run:run_origin');
+  const notify = r.body.notifyRecipient as { recipient?: string; changed?: boolean };
+  assert.equal(notify.recipient, 'run:run_origin');
+  assert.notEqual(notify.changed, true);
 });
 
 test('catalog --json is honest when a supported CLI is absent from PATH', async () => {

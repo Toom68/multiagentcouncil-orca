@@ -44,6 +44,7 @@ import {
   type CouncilReport,
 } from '../src/contracts.js';
 import { createEngine } from '../src/engine.js';
+import { INTEGRITY_POLICY } from '../src/artifacts.js';
 import {
   canonicalRosterHash,
   err,
@@ -406,7 +407,19 @@ function makeEnv(
       phaseEnteredAt: new Date(clock.t).toISOString(),
       createdAt: new Date(clock.t).toISOString(),
     },
-    artifacts: new Map(),
+    // council.json — the run's immutable identity + integrity policy stamp,
+    // exactly what FileStore.initialize writes for a new (receipts-v1) run.
+    artifacts: new Map([
+      ['council.json', JSON.stringify({
+        schemaVersion: SCHEMA_VERSION,
+        runId: RUN,
+        targetRoot,
+        objective: 'review the target project',
+        snapshotId: snapshot.snapshotId,
+        integrityPolicy: INTEGRITY_POLICY,
+        createdAt: new Date(clock.t).toISOString(),
+      })],
+    ]),
     journal: [],
     proposed: null,
     approved: null,
@@ -2199,4 +2212,166 @@ test('RA-008: mail intent+outcome pair charges the cap once, not twice', async (
   await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
   assert.equal(env.host.notifications.length, 1, 'pair deduped — wake send fits under cap 2');
   assert.equal(env.db.state.consumption.mailSent, 2, 'seeded sent + wake sent');
+});
+
+/* ================= clm_0007: phase-entry append-ok/save-fail ====================
+ * The crash window the council reproduced: a phase-entering flush appends
+ * journal events (approval.granted / phase.entered) but saveState fails, so
+ * state.json stays behind the journal. The journal overlay then re-materializes
+ * the minted participants/attempts — and every state-side seed site must reuse
+ * them, not push duplicates. Retried operations must yield exactly one
+ * participant per id, one attempt per (participantId, phase, round), one task
+ * and one launch per seat. */
+
+const uniq = <T>(xs: T[]): T[] => [...new Set(xs)];
+
+const participantCounts = (env: Env): Map<string, number> => {
+  const m = new Map<string, number>();
+  for (const p of env.db.state.participants) m.set(p.participantId, (m.get(p.participantId) ?? 0) + 1);
+  return m;
+};
+
+const attemptCounts = (env: Env): Map<string, number> => {
+  const m = new Map<string, number>();
+  for (const p of env.db.state.participants) {
+    for (const a of p.attempts) m.set(a.attemptId, (m.get(a.attemptId) ?? 0) + 1);
+  }
+  return m;
+};
+
+test('clm_0007: retried approve after append-ok/save-fail → no duplicate seat/attempt/task/launch', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  const roster = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  // Reproduce: approval.granted + phase.entered journaled; saveState dies.
+  env.store.failNextSaveState = err('io_error', 'simulated crash: approval journaled, state save lost');
+  const r1 = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(!r1.ok, 'first approve dies at the save');
+  assert.ok(env.db.journal.some((e) => e.type === 'approval.granted'), 'grant durably journaled');
+  assert.equal(env.db.state.status, 'awaiting_approval', 'state.json stayed behind the journal');
+  // Retry — the journal proves the grant landed and seats were minted.
+  const r2 = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(r2.ok, JSON.stringify(r2.ok ? r2.value : r2.error));
+  const pids = participantCounts(env);
+  assert.deepEqual([...pids.keys()].sort(), ['organiser', 'rev_1', 'rev_2']);
+  assert.ok([...pids.values()].every((n) => n === 1), `duplicate participant objects: ${JSON.stringify([...pids])}`);
+  const aids = attemptCounts(env);
+  assert.ok(
+    [...aids.values()].every((n) => n === 1),
+    `duplicate attempt ids: ${JSON.stringify([...aids])}`,
+  );
+  for (const pid of ['rev_1', 'rev_2']) {
+    assert.equal(
+      env.db.state.participants.flatMap((p) => p.attempts.filter((a) => a.participantId === pid && a.phase === 'independent_review')).length,
+      1,
+      `exactly one independent_review attempt for ${pid}`,
+    );
+  }
+  // Advance — exactly one task and one launch per seat.
+  const adv = await env.engine.advance();
+  assert.ok(adv.ok, JSON.stringify(adv.ok ? adv.value : adv.error));
+  const launches = env.host.launches.filter((l) => l.spec.phase === 'independent_review');
+  assert.equal(launches.length, 2, `one launch per seat, got ${launches.length}`);
+  assert.equal(uniq(launches.map((l) => l.spec.participantId)).length, 2);
+  assert.equal(uniq(launches.map((l) => l.spec.taskId)).length, 2, 'one task per seat');
+  assert.equal(env.host.createTaskCalls, 3, 'organiser task + exactly one task per seat');
+});
+
+test('clm_0007: organiser phase-entry append-ok/save-fail → retried advance mints no duplicate organiser', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Crash window: the flush inside launchAttempt appends
+  // [task.created(run), phase.entered(organising), launch.intent(att)] — the
+  // SECOND saveState of the advance dies.
+  let saves = 0;
+  const realSave = env.store.saveState.bind(env.store);
+  env.store.saveState = async (s) =>
+    (++saves === 2 ? failRes(err('io_error', 'simulated crash: phase-entry journaled, state save lost')) : realSave(s));
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'advance dies at the phase-entry save');
+  assert.equal(env.db.state.status, 'initialized', 'state.json stayed at initialized');
+  assert.ok(env.db.state.participants.length === 0, 'no participants persisted');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'phase.entered' && e.payload?.status === 'organising'),
+    'phase.entered journaled',
+  );
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.attemptId === 'att_organiser_organiser_r0_0'),
+    'organiser attempt intent journaled',
+  );
+  // Retry on a fresh engine — the overlay re-materializes organiser+attempt;
+  // the re-entered step must reuse them.
+  env.store.saveState = realSave;
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok, JSON.stringify(r2.ok ? r2.value : r2.error));
+  const orgs = env.db.state.participants.filter((p) => p.participantId === 'organiser');
+  assert.equal(orgs.length, 1, `duplicate organiser participants: ${orgs.length}`);
+  assert.equal(
+    orgs[0]!.attempts.filter((a) => a.attemptId === 'att_organiser_organiser_r0_0').length,
+    1,
+    'exactly one organiser attempt id',
+  );
+  assert.equal(orgs[0]!.attempts.filter((a) => a.phase === 'organiser').length, 1, 'one organiser attempt');
+  // Journaled intent resolves by observation: one task, one launch total.
+  const orgLaunches = env.host.launches.filter((l) => l.spec.phase === 'organiser');
+  assert.equal(orgLaunches.length, 1, `organiser launched exactly once, got ${orgLaunches.length}`);
+  assert.equal(env.host.createTaskCalls, 1, 'exactly one task created');
+});
+
+test('clm_0007: challenge-entry append-ok/save-fail → no duplicate round attempts or envelopes', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Drive until challenge envelopes are built (state enters discussing), then
+  // simulate the crash: journal appended envelope.built + phase.entered but
+  // the save died — rewind state to the pre-entry snapshot.
+  await drive(env, () => env.db.state.status === 'discussing');
+  assert.equal(env.db.state.status, 'discussing');
+  const journaledEnvs = env.db.journal.filter((e) => e.type === 'envelope.built' && e.phase === 'challenge').length;
+  assert.ok(journaledEnvs >= 1, 'envelope.built journaled');
+  // Rewind durable state to before the transition (append-ok/save-fail).
+  env.db.state.status = 'scribe_notes';
+  env.db.state.discussion = null;
+  for (const p of env.db.state.participants) {
+    p.attempts = p.attempts.filter((a) => a.phase !== 'challenge');
+  }
+  // Re-enter: overlay re-mints challenge attempts; the step must reuse them.
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  const aids = attemptCounts(env);
+  assert.ok([...aids.values()].every((n) => n === 1), `duplicate attempt ids: ${JSON.stringify([...aids])}`);
+  for (const pid of ['rev_1', 'rev_2']) {
+    const n = env.db.state.participants.flatMap((p) =>
+      p.attempts.filter((a) => a.participantId === pid && a.phase === 'challenge' && a.round === 1),
+    ).length;
+    assert.ok(n <= 1, `${pid} has ${n} challenge attempts for round 1 — duplicate stage mint`);
+  }
+});
+
+test('clm_0020: rejected organiser output launches the journaled repair attempt, not a stale "cancel and restart"', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Settle the organiser with an INVALID proposal — admission rejects it and
+  // mints exactly one corrective attempt in the same pass.
+  await env.engine.advance(); // organiser launched
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  const orig = org.attempts[0]!;
+  await env.store.writeArtifact(outPaths.organiser, JSON.stringify({ not: 'a roster' }));
+  env.host.settle(orig.dispatchId!);
+  const r = await env.engine.advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'artifact.rejected' && e.payload?.attemptId === orig.attemptId),
+    'rejection journaled',
+  );
+  const repair = org.attempts.find((a) => a.attemptId === 'att_organiser_organiser_r0_1');
+  assert.ok(repair !== undefined, 'corrective attempt minted');
+  // The SAME advance must launch the repair — not block on the stale
+  // settled_ok reference of the rejected original.
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.attemptId === repair.attemptId),
+    `repair launched immediately, status ${repair.status}`,
+  );
+  assert.notEqual(r.value.action, 'blocked', 'must not stale-block on the rejected attempt');
+  // Repair produces a valid proposal → run reaches the approval gate.
+  const r2 = await drive(env);
+  assert.equal(r2.action, 'needs_approval', JSON.stringify(r2));
 });

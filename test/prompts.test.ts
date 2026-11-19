@@ -323,6 +323,31 @@ describe('independent reviewer', () => {
     assert.match(spec, /peer claims do not exist yet/i);
     assert.match(spec, /bounded discussion envelopes/i);
   });
+  test('documents bounded optional strengths — specific, evidenced, never a quota', () => {
+    // Next-release additive contract (ledger-report owns schema): strengths
+    // record role-specific features worth preserving — optional, capped at
+    // 3, validated like findings, never routed for challenge or grading.
+    assert.match(spec, /`strengths`/);
+    assert.match(spec, /strengthId/);
+    assert.match(spec, /at most `3` `strengths`/);
+    assert.match(spec, /zero strengths/i);
+    assert.match(spec, /never a quota/i);
+    assert.match(spec, /never manufacture/i);
+    assert.match(spec, /never routed for challenge/i);
+    assert.match(spec, /never upgrade claim\s+grades/i);
+    assert.match(spec, /`feature`/);
+    assert.match(spec, /`benefit`/);
+    assert.match(spec, /`preserve`/);
+  });
+  test('states the real strength validator caps verbatim', () => {
+    assert.match(spec, /absent or `\[\]` are both valid/i);
+    assert.match(spec, /at most 3 entries/i);
+    assert.match(spec, /unique `strengthId`s/);
+    assert.match(spec, /`feature` ≤200 chars/);
+    assert.match(spec, /`benefit`\/`preserve` ≤2000/);
+    assert.match(spec, /`evidence` 1–20 items under the same citation rules/i);
+    assert.match(spec, /ENTIRE evidence list fails/i);
+  });
 });
 
 describe('scribe notes', () => {
@@ -335,6 +360,13 @@ describe('scribe notes', () => {
     assert.match(spec, /ScribeNotesFile/);
     assert.match(spec, /findingId/);
     assert.match(spec, /cannot invent verification/i);
+  });
+  test('frames strengths as input context, never claims to summarize', () => {
+    // Strengths are read for context but get no claimSummaries entries —
+    // the runner records them separately.
+    assert.match(spec, /`strengths`/);
+    assert.match(spec, /not claims/i);
+    assert.match(spec, /no `claimSummaries` entries/i);
   });
 });
 
@@ -462,6 +494,14 @@ describe('scribe synthesis', () => {
     assert.match(spec, /self-check it against the record/i);
     assert.doesNotMatch(spec, /your narrative is checked against/i);
   });
+  test('names canonical strengths without inflating them', () => {
+    // The ledger carries runner-stamped strengths; the scribe may discuss
+    // but must not present them as endorsements or council-verified.
+    assert.match(spec, /`strengths`/);
+    assert.match(spec, /runner-stamped participant\/perspective provenance/i);
+    assert.match(spec, /preservation section/i);
+    assert.match(spec, /endorsements outweighing findings|as council-verified/i);
+  });
 });
 
 describe('boundary honesty', () => {
@@ -582,6 +622,15 @@ describe('supervisor', () => {
   test('forbids orchestration mutations and foreign mailboxes', () => {
     assert.match(spec, /Never run `orca orchestration` mutations/);
     assert.match(spec, /Consume only YOUR OWN mailbox/i);
+  });
+  test('expects stage/progress wakes without sending stage mail itself', () => {
+    // User amendment: bounded progress wakes reach the run — the supervisor
+    // treats them like any other wake (run advance). Stage mail is emitted
+    // by the runner's progress machinery, never by the supervisor agent.
+    assert.match(spec, /stage\/progress notification/i);
+    assert.match(spec, /no new directive/i);
+    assert.match(spec, /never by you/i);
+    assert.match(spec, /do not forward or answer it/i);
   });
   test('asks coordinator to nudge after approval', () => {
     assert.match(spec, /send --to dispatch:<yourDispatchId>/);

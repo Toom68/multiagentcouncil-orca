@@ -33,6 +33,7 @@ import {
   type CouncilErrorCode,
   type CouncilState,
   type HostAdapter,
+  type JournalEvent,
   type Participant,
   type PhaseAttempt,
   type Result,
@@ -52,11 +53,14 @@ import {
   extractDispatchInfo,
   extractRequestId,
   createOrcaAdapter,
+  isStaleTerminalCode,
   type OrcaEnvelope,
   parseOrcaEnvelope,
 } from './host/orca.js';
 import { resolveExecutable, runProcess } from './host/process.js';
 import { createPromptBuilder } from './prompts.js';
+import * as artifacts from './artifacts.js';
+import * as progress from './progress.js';
 import { captureSnapshot } from './snapshot.js';
 import { createStore, STORE_PATHS } from './store.js';
 import {
@@ -459,11 +463,208 @@ function requireDedicatedSupervisor(state: CouncilState, handle: string | undefi
   if (recorded !== null && recorded.terminalHandle !== handle) {
     fail(
       'invalid_transition',
-      `this run's recorded supervisor is ${recorded.terminalHandle} — refusing to take over another supervisor's run; launch a fresh supervisor via \`council start-supervisor\` or run from the recorded terminal`,
+      `this run's recorded supervisor is ${recorded.terminalHandle} — refusing to take over another supervisor's run; if the recorded supervisor is dead, replace it via \`council start-supervisor --run <runDir> --replace\` (provably-stale identity only), or run this command from the recorded terminal`,
       { details: { recordedSupervisor: recorded } },
     );
   }
   return handle;
+}
+
+// ─── Progress stage-wake seam (src/progress.ts — progress lane) ─────────────
+// Thin best-effort wrappers over the progress lane's API v1: recipient
+// capture (progress/recipient.json — canonical destination), deduplicated
+// stage/lifecycle wakes, the bounded argv helper, and read-only status.
+// Every call is non-fatal to the command carrying it: a progress failure is
+// reported honestly, never allowed to corrupt the lifecycle step itself.
+
+/**
+ * Persist the initiating orchestrator's wake recipient BEFORE any binding
+ * mutation; first durable target wins, explicit override replaces. Never
+ * throws.
+ */
+async function captureRecipientBest(input: {
+  runDir: string;
+  to?: string;
+  callerHandle?: string;
+  callerRunId?: string;
+  self?: { orcaRunId?: string; supervisorHandle?: string; councilDispatchIds?: string[] };
+}): Promise<{ captured: boolean; recipient?: string; changed?: boolean; reason?: string }> {
+  try {
+    const r = await progress.captureRecipient({
+      runDir: input.runDir,
+      ...(input.to !== undefined ? { to: input.to } : {}),
+      ...(input.callerHandle !== undefined ? { callerHandle: input.callerHandle } : {}),
+      ...(input.callerRunId !== undefined ? { callerRunId: input.callerRunId } : {}),
+      ...(input.self !== undefined
+        ? {
+            self: {
+              orcaRunId: input.self.orcaRunId ?? null,
+              supervisorHandle: input.self.supervisorHandle ?? null,
+              councilDispatchIds: input.self.councilDispatchIds ?? [],
+            },
+          }
+        : {}),
+    });
+    if (!r.ok) return { captured: false, reason: r.error.message };
+    return { captured: true, recipient: r.value.recipient.to, changed: r.value.changed };
+  } catch (e) {
+    return { captured: false, reason: `captureRecipient threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * Fire one deduplicated stage/lifecycle wake to the persisted recipient.
+ * Durable dedupe in the outbox collapses repeats with the engine's own calls;
+ * the returned outcome is reported, never thrown.
+ */
+async function notifyProgress(runDir: string, event: progress.ProgressEvent): Promise<progress.ProgressNotifyResult | { outcome: 'error'; error: string }> {
+  try {
+    const notifier = progress.createProgressNotifier({
+      runDir,
+      sendMail: (i) => lazyHost().sendNotification(i),
+    });
+    const r = await notifier.notify(event);
+    return r.ok ? r.value : { outcome: 'error', error: r.error.message };
+  } catch (e) {
+    return { outcome: 'error', error: `notify threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * Idempotent bounded-helper ensure. The argv-based helper self-exits on a
+ * terminal run state; this NEVER runs from read-only commands (status/verify).
+ */
+async function ensureProgressHelper(runDir: string): Promise<progress.HelperEnsureResult | { state: 'error'; detail: string }> {
+  try {
+    const r = await progress.ensureHelper({ runDir });
+    return r.ok ? r.value : { state: 'error', detail: r.error.message };
+  } catch (e) {
+    return { state: 'error', detail: `ensureHelper threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/** Read-only progress status for `council status` — never starts anything. */
+async function readProgressStatus(runDir: string): Promise<progress.ProgressStatusView | { error: string } | null> {
+  try {
+    const r = await progress.progressStatus(runDir);
+    return r.ok ? r.value : { error: r.error.message };
+  } catch (e) {
+    return { error: `progressStatus threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// ─── Managed-artifact integrity (src/artifacts.ts — artifacts lane) ─────────
+// Read-only audit for verify/status — legacy runs report legacy/untracked,
+// never a false "verified".
+
+/** Read-only managed-artifact audit; unavailable ⇒ honest 'untracked'. */
+async function verifyManagedBest(
+  store: Store,
+  events?: readonly JournalEvent[],
+): Promise<artifacts.IntegrityAudit | { unavailable: true; reason: string }> {
+  try {
+    const r = await artifacts.verifyManagedArtifacts(store, events !== undefined ? { events } : {});
+    return r.ok ? r.value : { unavailable: true, reason: r.error.message };
+  } catch (e) {
+    return { unavailable: true, reason: `verifyManagedArtifacts threw: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// ─── Phase deadline mirror (engine.ts phaseDeadlineMs — keep in sync) ────────
+
+/** The per-phase deadline the engine evaluates on advance, for read-only display. */
+function phaseDeadlineMsFor(state: CouncilState): number | undefined {
+  const d = state.config.deadlines;
+  switch (state.status) {
+    case 'organising':
+      return d.organiserMs;
+    case 'independent_review':
+      return d.independentMs;
+    case 'scribe_notes':
+      return d.scribeNotesMs;
+    case 'discussing':
+      return state.discussion?.stage === 'responses' ? d.responseMs : d.challengeMs;
+    case 'synthesising':
+      return d.synthesisMs;
+    default:
+      return undefined;
+  }
+}
+
+// ─── Worker-ledger custody classifiers ───────────────────────────────────────
+// NOTE: mirrors the adapter's published workerLedgerRows/dispatchVerdict/
+// isActiveWorkerRow semantics (src/host/orca.ts) — swap to those exports when
+// they land; do not let the vocabularies drift.
+
+/** Explicit dispatch verdicts — proof a dispatch logically ended WITH that result. */
+const DISPATCH_VERDICTS = new Set(['succeeded', 'failed', 'cancelled', 'abandoned', 'stopped']);
+/**
+ * Lifecycle markers that mean a dispatch may still be in flight. Generic
+ * physical markers ('released', 'settled', 'done') without a verdict are NOT
+ * proof of safe reuse — custody stays unproven, never guessed.
+ */
+const DISPATCH_ACTIVE = new Set([
+  'in_progress', 'dispatched', 'dispatching', 'ready', 'working', 'running', 'queued', 'assigned', 'active',
+]);
+
+function dispatchVerdictOf(w: Record<string, unknown>): { verdict?: string; conflict?: { outcome: string; state: string } } {
+  const outcome = firstStr(w.outcome, asRec(w.result)?.outcome);
+  const st = firstStr(w.state);
+  const dOutcome = outcome !== undefined && DISPATCH_VERDICTS.has(outcome) ? outcome : undefined;
+  const dState = st !== undefined && DISPATCH_VERDICTS.has(st) ? st : undefined;
+  if (dOutcome !== undefined && dState !== undefined && dOutcome !== dState) {
+    return { conflict: { outcome: dOutcome, state: dState } };
+  }
+  return { verdict: dOutcome ?? dState };
+}
+
+function dispatchIsActive(w: Record<string, unknown>): boolean {
+  return (
+    (typeof w.outcome === 'string' && DISPATCH_ACTIVE.has(w.outcome)) ||
+    (typeof w.state === 'string' && DISPATCH_ACTIVE.has(w.state)) ||
+    w.liveness === 'live'
+  );
+}
+
+/**
+ * worker-list rows — refuse malformed or incomplete receipts rather than let
+ * a bad read masquerade as "zero matching workers" and unlock a duplicate
+ * launch. A paged ledger cannot prove absence either.
+ */
+function workerRowsStrict(listed: unknown, scope: string): Record<string, unknown>[] {
+  const r = asRec(listed);
+  const list = r?.workers ?? r?.items ?? (Array.isArray(listed) ? listed : undefined);
+  if (!Array.isArray(list)) {
+    fail('launch_unknown', `worker-list for ${scope} returned no workers array — the ledger is unreadable or incomplete; custody is unproven`, {
+      details: { adapterCode: 'malformed_worker_list' },
+    });
+  }
+  const pageTotal = asRec(r?.page)?.total;
+  if (
+    (r !== undefined && r.nextCursor !== undefined && r.nextCursor !== null) ||
+    r?.hasMore === true ||
+    (typeof pageTotal === 'number' && pageTotal > list.length)
+  ) {
+    fail('launch_unknown', `worker-list for ${scope} is paginated — absence on a partial ledger is unproven; re-run with the complete ledger`, {
+      details: { adapterCode: 'paged_worker_list' },
+    });
+  }
+  for (const row of list) {
+    if (typeof row !== 'object' || row === null) {
+      fail('launch_unknown', `worker-list for ${scope} contains a non-object row — refusing to treat the read as reliable`, {
+        details: { adapterCode: 'malformed_worker_list' },
+      });
+    }
+    const identifiable = ['dispatchId', 'id', 'taskId', 'terminal', 'terminalHandle'].some(
+      (k) => typeof (row as Record<string, unknown>)[k] === 'string',
+    );
+    if (!identifiable) {
+      fail('launch_unknown', `worker-list for ${scope} contains a row with no dispatch/task/terminal identity — refusing to treat the read as reliable`, {
+        details: { adapterCode: 'incomplete_worker_list' },
+      });
+    }
+  }
+  return list as Record<string, unknown>[];
 }
 
 function emit(payload: Record<string, unknown>, json: boolean, human: string): void {
@@ -497,10 +698,12 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
     objective: { type: 'string' },
     target: { type: 'string' },
     config: { type: 'string' },
+    notify: { type: 'string' },
   });
   const objectivePath = reqStr(v, 'objective', '--objective <file>');
   const targetArg = reqStr(v, 'target', '--target <path>');
   const configPath = optStr(v, 'config');
+  const notifyFlag = optStr(v, 'notify');
 
   let objective: string;
   try {
@@ -606,6 +809,31 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
   };
   unwrap(await store.writeArtifact('meta.json', `${JSON.stringify(meta, null, 2)}\n`));
 
+  // Wake recipient: the initiating orchestrator is the CALLER — capture its
+  // bound Run (or an explicit --notify target) BEFORE any supervisor binding
+  // exists, so lifecycle stage wakes keep reaching the primary even if the
+  // supervisor identity is later replaced. Read-only run-current is only
+  // attempted inside Orca; a recipient is never invented or derived later
+  // from the dedicated supervisor's own context.
+  let notifyRecipient: { captured: boolean; recipient?: string; changed?: boolean; reason?: string } = {
+    captured: false,
+    reason: 'skipped — no Orca terminal identity and no --notify target',
+  };
+  if (notifyFlag !== undefined || process.env.ORCA_TERMINAL_HANDLE !== undefined) {
+    let callerRunId: string | undefined;
+    if (process.env.ORCA_TERMINAL_HANDLE !== undefined) {
+      const cur = await tryOrcaCli(['orchestration', 'run-current', '--json']);
+      callerRunId = cur.ok ? extractRunId(cur.value) ?? undefined : undefined;
+    }
+    notifyRecipient = await captureRecipientBest({
+      runDir,
+      to: notifyFlag,
+      callerHandle: process.env.ORCA_TERMINAL_HANDLE,
+      callerRunId,
+    });
+  }
+  const initializedWake = await notifyProgress(runDir, { kind: 'stage', status: 'initialized' });
+
   return {
     payload: {
       runId,
@@ -615,6 +843,8 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
       launchBudgetFloor: meta.launchBudgetFloor,
       supervisorSpec: 'prompts/supervisor.md',
       advanceCommand,
+      notifyRecipient,
+      ...(initializedWake !== null ? { initializedWake } : {}),
       hint: 'launch the supervisor worker with `council start-supervisor --run <runDir>` or per skills/council/SKILL.md, then let it drive `council supervise --advance`',
     },
     human: [
@@ -623,6 +853,7 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
       `  snapshot:  ${snapshot.snapshotId} (${Object.keys(snapshot.files).length} files)`,
       `  seats:     ${config.participants} reviewers from ${config.requestedPerspectives} perspectives`,
       `  budget:    maxLaunches ${config.maxLaunches} (floor ${meta.launchBudgetFloor})`,
+      `  wake recipient: ${notifyRecipient.recipient ?? `none captured${notifyRecipient.reason !== undefined ? ` (${notifyRecipient.reason})` : ''}`}`,
       `  supervisor spec written to prompts/supervisor.md`,
       `next: council start-supervisor --run <runDir>  (or launch it manually per skills/council/SKILL.md)`,
     ].join('\n'),
@@ -944,7 +1175,62 @@ async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<
     void identified;
   }
 
+  // Recipient backfill (only when the module reports none — never an implicit
+  // recapture of a child/self target): the dedicated supervisor's PRIOR Run
+  // binding is the parent it was started under; a manual driver's own bound
+  // Run is the caller's. Captured here — before engine.advance may create the
+  // child Run — still precedes every binding mutation it could affect.
+  const selfCtx = {
+    orcaRunId: state.orcaRunId ?? undefined,
+    supervisorHandle: state.supervisor?.terminalHandle,
+    councilDispatchIds: [
+      ...(state.supervisor?.dispatchId !== null && state.supervisor?.dispatchId !== undefined
+        ? [state.supervisor.dispatchId]
+        : []),
+      ...state.participants.flatMap((p) =>
+        p.attempts.map((a) => a.dispatchId).filter((d): d is string => d !== null),
+      ),
+    ],
+  };
+  const recipientNow = await readProgressStatus(runDir);
+  const hasRecipient =
+    recipientNow !== null &&
+    !('error' in recipientNow) &&
+    recipientNow.recipient !== null;
+  if (!hasRecipient) {
+    let callerRunId: string | undefined;
+    if (binding !== null && binding.prior !== null && binding.prior !== state.orcaRunId) {
+      callerRunId = binding.prior;
+    } else if (!dedicated) {
+      const cur = await tryOrcaCli(['orchestration', 'run-current', '--json']);
+      callerRunId = cur.ok ? extractRunId(cur.value) ?? undefined : undefined;
+      if (callerRunId === state.orcaRunId) callerRunId = undefined; // never the child Run
+    }
+    await captureRecipientBest({
+      runDir,
+      callerHandle: handle,
+      callerRunId,
+      self: selfCtx,
+    });
+  }
+
   const res = unwrap(await engine.advance());
+
+  // Stage wake + bounded progress helper (dedupe collapses the engine's own
+  // post-flush calls; a terminal outcome lets the helper self-exit).
+  const wake =
+    res.action === 'blocked'
+      ? await notifyProgress(runDir, { kind: 'blocked', reason: res.note ?? 'advance blocked' })
+      : res.action === 'finished'
+        ? await notifyProgress(runDir, {
+            kind: 'finished',
+            outcome: res.outcome ?? 'failed',
+            ...(res.reportPaths !== undefined ? { reportPaths: res.reportPaths } : {}),
+          })
+        : await notifyProgress(runDir, { kind: 'stage', status: res.status });
+  const helper =
+    res.action === 'finished' ? null : await ensureProgressHelper(runDir);
+
   return {
     payload: {
       state: res.status,
@@ -955,6 +1241,8 @@ async function cmdSupervise(argv: readonly string[]): Promise<{ payload: Record<
       ...(res.artifacts !== undefined ? { artifacts: res.artifacts } : {}),
       ...(res.outcome !== undefined ? { outcome: res.outcome } : {}),
       ...(res.reportPaths !== undefined ? { reportPaths: res.reportPaths } : {}),
+      ...(wake !== null ? { wake } : {}),
+      ...(helper !== null ? { helper } : {}),
       runDir,
     },
     human: [
@@ -1439,6 +1727,10 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
 
   const res = unwrap(await engine.approve({ roster, approver }));
 
+  // Approval is a lifecycle stage — wake the persisted initiating
+  // orchestrator (dedupe collapses the engine's own notify).
+  const approvalWake = await notifyProgress(runDir, { kind: 'approval', approver });
+
   const supDispatch = state.supervisor?.dispatchId;
   const wakeCommand =
     supDispatch !== null && supDispatch !== undefined
@@ -1451,6 +1743,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
       approver,
       seats: roster.seats.length,
       supervisor: state.supervisor,
+      ...(approvalWake !== null ? { approvalWake } : {}),
       wakeCommand,
       note: 'approving does NOT wake the supervisor by itself — send the wakeCommand above (a file write is not an Orca wake); when you drive `council supervise --advance` yourself, your next call IS the wake',
     },
@@ -1474,6 +1767,223 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
   const { store, engine } = makeEngine(runDir);
   const state = await loadRun(store);
   const st = unwrap(await engine.status());
+  // Everything below is READ-ONLY: persisted state/journal plus documented
+  // read receipts (terminal show / worker-show / progress status). Status
+  // never mutates the run, never rebinds the host, and never starts helpers.
+
+  const journal = unwrap(await store.readJournal());
+  const now = Date.now();
+  const lastEvent = journal.length > 0 ? journal[journal.length - 1] : null;
+  const activity = {
+    lastEventAt: lastEvent !== null ? lastEvent.ts : null,
+    ageMs: lastEvent !== null ? Math.max(0, now - Date.parse(lastEvent.ts)) : null,
+    events: journal.length,
+    note: 'age of the last persisted journal event — journal silence is not proof of life',
+  };
+
+  const phaseAgeMs = Math.max(0, now - Date.parse(state.phaseEnteredAt));
+  const runAgeMs = Math.max(0, now - Date.parse(state.createdAt));
+  const deadlineMs = phaseDeadlineMsFor(state);
+  const phase = {
+    status: state.status,
+    enteredAt: state.phaseEnteredAt,
+    ageMs: phaseAgeMs,
+    deadlineMs: deadlineMs ?? null,
+    graceMs: deadlineMs !== undefined ? state.config.deadlines.graceMs : null,
+    overDeadline: deadlineMs !== undefined ? phaseAgeMs > deadlineMs + state.config.deadlines.graceMs : false,
+    runAgeMs,
+    runDeadlineMs: state.config.deadlines.runMs,
+    overRunDeadline: runAgeMs > state.config.deadlines.runMs,
+    note: 'deadlines are enforced on advance, not in real time',
+  };
+
+  // Recorded supervisor health: 'live' only when the handle still resolves to
+  // an identifiable terminal; 'stale' only on the documented definitive code;
+  // everything else is honestly 'unproven' — never guess from quiet/released.
+  const supervisorHealth: Record<string, unknown> = { recorded: state.supervisor };
+  if (state.supervisor === null) {
+    supervisorHealth.probe = 'none';
+    supervisorHealth.detail = 'no supervisor identity recorded';
+  } else {
+    const handle = state.supervisor.terminalHandle;
+    const shown = await tryOrcaCli(['terminal', 'show', '--terminal', handle, '--json']);
+    if (!shown.ok) {
+      const code = firstStr(asRec(shown.error.details)?.adapterCode as string | undefined);
+      supervisorHealth.probe =
+        code !== undefined && isStaleTerminalCode(code) ? 'stale' : 'unproven';
+      supervisorHealth.detail = shown.error.message;
+    } else {
+      const t = asRec(asRec(shown.value)?.terminal ?? shown.value);
+      if (t === undefined || firstStr(t.handle) !== handle) {
+        supervisorHealth.probe = 'unproven';
+        supervisorHealth.detail = 'terminal show returned an unidentifiable record';
+      } else {
+        supervisorHealth.probe = 'live';
+        supervisorHealth.detail = `terminal resolves (connected=${t.connected === true}, agent=${firstStr(t.agentIdentity) ?? 'unidentified'}${t.agentWait !== undefined && t.agentWait !== null ? `, waiting=${JSON.stringify(t.agentWait)}` : ''})`;
+      }
+    }
+    if (state.supervisor.dispatchId !== null) {
+      const ws = await tryOrcaCli([
+        'orchestration',
+        'worker-show',
+        '--dispatch',
+        state.supervisor.dispatchId,
+        '--json',
+      ]);
+      if (!ws.ok) {
+        supervisorHealth.dispatch = 'unproven';
+        supervisorHealth.dispatchDetail = ws.error.message;
+      } else {
+        const rec = asRec(asRec(ws.value)?.dispatch ?? ws.value);
+        if (rec === undefined) {
+          supervisorHealth.dispatch = 'unproven';
+          supervisorHealth.dispatchDetail = 'worker-show returned an unidentifiable record';
+        } else {
+          const { verdict, conflict } = dispatchVerdictOf(rec);
+          supervisorHealth.dispatch =
+            conflict !== undefined
+              ? 'conflicting'
+              : verdict !== undefined
+                ? `ended:${verdict}`
+                : dispatchIsActive(rec)
+                  ? 'live'
+                  : 'no-verdict';
+        }
+      }
+    }
+  }
+  // Supervisor startup custody record (paused/start_issued visibility).
+  const startup = await store.readArtifact('supervisor/startup.json');
+  let startupInfo: Record<string, unknown> | null = null;
+  if (startup.ok) {
+    const sr = asRec(JSON.parse(startup.value));
+    startupInfo = {
+      status: firstStr(sr?.status) ?? 'unknown',
+      taskId: firstStr(sr?.taskId) ?? null,
+      terminalHandle: firstStr(sr?.terminalHandle) ?? null,
+      dispatchId: firstStr(sr?.dispatchId) ?? null,
+      ...(asRec(sr?.paused) !== undefined ? { paused: sr!.paused } : {}),
+    };
+  }
+
+  // Precise pending actions: exact commands ONLY where the persisted record
+  // makes them actionable — never suggest reconcile where it refuses, never
+  // invent a request id the journal does not carry.
+  const failureByAttempt = new Map<string, { seq: number; requestIds: string[] }>();
+  for (const e of journal) {
+    if (e.type === 'error' && e.payload?.op === 'task-create' && typeof e.payload.attemptId === 'string') {
+      failureByAttempt.set(e.payload.attemptId as string, {
+        seq: e.seq,
+        requestIds: journaledRequestIds(e),
+      });
+    }
+  }
+  const pendingActions: { kind: string; detail: string; command?: string }[] = [];
+  if (state.status === 'awaiting_approval') {
+    pendingActions.push({
+      kind: 'approve',
+      detail: 'approve the proposed roster (exact seats/agents/config) to launch reviewers',
+      command: `council approve --run ${cmdToken(runDir)} --roster <file>`,
+    });
+  }
+  if (
+    state.approvalHash === null &&
+    ['independent_review', 'scribe_notes', 'discussing', 'synthesising'].includes(state.status)
+  ) {
+    pendingActions.push({
+      kind: 'approve',
+      detail: 'approval invalidated — re-approve the exact same roster to resume',
+      command: `council approve --run ${cmdToken(runDir)} --roster <file>`,
+    });
+  }
+  for (const p of state.participants) {
+    for (const a of p.attempts) {
+      if (a.status === 'intent_recorded') {
+        const f = failureByAttempt.get(a.attemptId);
+        if (f !== undefined && f.requestIds.length > 0) {
+          pendingActions.push({
+            kind: 'reconcile',
+            detail: `${p.participantId}/${a.phase} attempt ${a.attemptId} is a persisted no-task launch intent (journaled request ${f.requestIds.join(', ')})`,
+            command: `council reconcile --run ${cmdToken(runDir)} --attempt ${a.attemptId} --confirm-no-effects ${f.requestIds[0]}`,
+          });
+        } else {
+          pendingActions.push({
+            kind: 'inspect',
+            detail:
+              f === undefined
+                ? `${p.participantId}/${a.phase} attempt ${a.attemptId} is intent_recorded but no task-create failure is journaled — inspect events.jsonl before any retry`
+                : `${p.participantId}/${a.phase} attempt ${a.attemptId} is intent_recorded but its journaled failure (events.jsonl seq ${f.seq}) carries no request id — reconcile manually, never blind-retry`,
+          });
+        }
+      } else if (a.status === 'unknown') {
+        pendingActions.push({
+          kind: 'observe',
+          detail: `${p.participantId}/${a.phase} attempt ${a.attemptId} outcome is unknown (dispatch ${a.dispatchId ?? 'none'}, request ${a.requestId ?? 'none'}) — observe via worker-list/request-show; the engine re-checks each advance — never relaunch`,
+          ...(a.requestId !== null
+            ? { command: `orca orchestration request-show --request ${a.requestId} --json` }
+            : {}),
+        });
+      } else if (
+        state.status === 'cancelled' &&
+        (a.status === 'dispatched' || a.status === 'working' || a.status === 'timed_out') &&
+        a.dispatchId !== null
+      ) {
+        pendingActions.push({
+          kind: 'fence',
+          detail: `dispatch ${a.dispatchId} may still be running after cancel; stop was refused or unconfirmed`,
+          command: `orca orchestration worker-stop --dispatch ${a.dispatchId}`,
+        });
+      }
+    }
+  }
+  if (startupInfo !== null && startupInfo.status === 'start_issued') {
+    pendingActions.push({
+      kind: 'inspect',
+      detail: `supervisor worker-start was issued but its outcome is unconfirmed (task ${startupInfo.taskId ?? 'implicit'}, terminal ${startupInfo.terminalHandle ?? '?'}) — start-supervisor refuses until reconciled`,
+      command: `orca orchestration request-show --request <workerStart request id from supervisor/startup.json> --json`,
+    });
+  }
+  if (startupInfo !== null && startupInfo.status === 'paused') {
+    pendingActions.push({
+      kind: 'advance',
+      detail: `supervisor startup is paused (${firstStr(asRec(startupInfo.paused)?.code) ?? 'see record'}) — resolve the pause cause, then resume the recorded resources`,
+      command: `council start-supervisor --run ${cmdToken(runDir)}`,
+    });
+  }
+  if (phase.overDeadline) {
+    pendingActions.push({
+      kind: 'advance',
+      detail: 'phase is past its deadline+grace — deadlines enforce on advance, not in real time',
+      command: `council supervise --run ${cmdToken(runDir)} --advance --as-supervisor --json`,
+    });
+  }
+  if (supervisorHealth.probe === 'stale') {
+    pendingActions.push({
+      kind: 'replace',
+      detail: `recorded supervisor terminal ${state.supervisor!.terminalHandle} is provably stale — a guarded replacement can retire it`,
+      command: `council start-supervisor --run ${cmdToken(runDir)} --replace`,
+    });
+  }
+
+  // Per-participant attempt detail — dispatchIds exposed so manual fencing
+  // (a wedged run) never needs a raw state.json read.
+  const participantDetail = state.participants.map((p) => ({
+    participantId: p.participantId,
+    role: p.role,
+    status: p.status,
+    attempts: p.attempts.map((a) => ({
+      attemptId: a.attemptId,
+      phase: a.phase,
+      round: a.round,
+      status: a.status,
+      taskId: a.taskId,
+      dispatchId: a.dispatchId,
+      terminalHandle: a.terminalHandle,
+    })),
+  }));
+
+  const progress = await readProgressStatus(runDir);
+  const integrity = await verifyManagedBest(store, journal);
 
   const reviewers = state.participants.filter((p) => p.role === 'reviewer');
   const settled = reviewers.filter((p) => p.status === 'settled').length;
@@ -1484,28 +1994,43 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
       status: st.status,
       discussion: st.discussion,
       participants: st.participants,
+      attempts: participantDetail,
       consumption: st.consumption,
       approvalHash: st.approvalHash,
       pendingDecisions: st.pendingDecisions,
+      pendingActions,
+      activity,
+      phase,
+      supervisor: state.supervisor,
+      supervisorHealth,
+      supervisorStartup: startupInfo,
       quorum: {
         seats: reviewers.length,
         settled,
         required: reviewers.length === 0 ? 0 : quorum,
         met: reviewers.length > 0 && settled >= quorum,
       },
-      supervisor: state.supervisor,
+      notify:
+        progress !== null
+          ? progress
+          : { recipient: null, note: 'progress module unavailable — delivery/helper state unverifiable' },
+      integrity,
       orcaRunId: state.orcaRunId,
       runDir,
     },
     human: [
       `run ${state.runId} — ${st.status}${st.discussion !== null ? ` (round ${st.discussion.round}, ${st.discussion.stage})` : ''}`,
+      `  activity:   last journal event ${activity.lastEventAt ?? 'none'}${activity.ageMs !== null ? ` (${Math.round(activity.ageMs / 1000)}s ago)` : ''}`,
+      `  phase:      ${phase.status} for ${Math.round(phase.ageMs / 1000)}s${phase.deadlineMs !== null ? ` / deadline ${Math.round((phase.deadlineMs + (phase.graceMs ?? 0)) / 1000)}s${phase.overDeadline ? ' OVER' : ''}` : ''}`,
       `  seats:      ${reviewers.length} reviewers, ${settled} settled (quorum ${quorum})`,
       `  budget:     ${st.consumption.launches}/${state.config.maxLaunches} launches, ${st.consumption.mailSent} mail`,
       `  approval:   ${st.approvalHash ?? 'none'}`,
+      `  supervisor: ${state.supervisor === null ? 'none recorded' : `${state.supervisor.terminalHandle} — ${supervisorHealth.probe}${typeof supervisorHealth.dispatch === 'string' ? `, dispatch ${supervisorHealth.dispatch}` : ''}`}`,
       ...st.participants.map(
         (p) => `  ${p.status.padEnd(10)} ${p.participantId} (${p.role})${p.activeAttempt !== null ? ` — ${p.activeAttempt}` : ''}`,
       ),
       ...st.pendingDecisions.map((d) => `  pending:  ${d}`),
+      ...pendingActions.map((a) => `  action:   [${a.kind}] ${a.detail}${a.command !== undefined ? `\n            → ${a.command}` : ''}`),
     ].join('\n'),
   };
 }
@@ -1535,6 +2060,10 @@ async function cmdCancel(argv: readonly string[]): Promise<{ payload: Record<str
       }
     }
   }
+  // Terminal wake to the persisted recipient (dedupe collapses the engine's
+  // own notify). The bounded helper self-exits on the terminal state — never
+  // re-ensured from here.
+  const wake = await notifyProgress(runDir, { kind: 'finished', outcome: 'cancelled' });
   return {
     payload: {
       runId: after.runId,
@@ -1542,6 +2071,7 @@ async function cmdCancel(argv: readonly string[]): Promise<{ payload: Record<str
       reason,
       confirmedStopped: confirmed,
       unverifiable,
+      ...(wake !== null ? { wake } : {}),
       note:
         unverifiable.length === 0
           ? 'every live participant confirmed stopped'
@@ -1703,6 +2233,34 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
       'objective.md diverges from state.objective — approval binds the state copy; the file is stale or was edited',
     );
   }
+  // Managed-artifact integrity — read-only audit via the artifacts lane.
+  // Legacy runs report legacy/untracked honestly; the audit never rebuilds
+  // indexes or mutates anything, and drift here is surfaced as a warning —
+  // `verified` keeps its documented launch-gate-parity meaning.
+  const managed = await verifyManagedBest(store);
+  if ('unavailable' in managed) {
+    warnings.push(`managed artifacts: ${managed.reason}`);
+  } else {
+    const bad = managed.artifacts.filter((a) => a.status !== 'ok');
+    if (bad.length > 0) {
+      warnings.push(
+        `managed artifacts: ${bad.length} entr${bad.length === 1 ? 'y is' : 'ies are'} not clean (${bad
+          .slice(0, 5)
+          .map((a) => `${a.path}:${a.status}`)
+          .join(', ')}${bad.length > 5 ? ', …' : ''})`,
+      );
+    }
+    if (managed.untracked.length > 0) {
+      warnings.push(
+        `managed artifacts: ${managed.untracked.length} untracked path(s) present (index does not cover them)`,
+      );
+    }
+    if (managed.journalOnly.length > 0) {
+      warnings.push(
+        `managed artifacts: ${managed.journalOnly.length} journaled receipt(s) missing from the index — index is a stale projection`,
+      );
+    }
+  }
   const artifactsWord =
     artifactsHashMatch === true
       ? 'match'
@@ -1713,6 +2271,7 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
     payload: {
       runId: state.runId,
       verified,
+      managedArtifacts: managed,
       snapshot: {
         drift: drift.drift,
         changed: drift.changed,
@@ -1754,6 +2313,11 @@ async function cmdVerify(argv: readonly string[]): Promise<{ payload: Record<str
             : 'DIVERGED from state.objective — human-facing file only; approval binds the state copy'
       }`,
       `  catalog: ${catalog.status}${catalog.detail !== undefined ? ` — ${catalog.detail}` : ''}`,
+      `  managed:  ${
+        'unavailable' in managed
+          ? `untracked (${managed.reason})`
+          : `${managed.policy}, index ${managed.indexStatus}${managed.journalBinding === 'unbound' ? ' (unbound — journal not supplied)' : ''} — ${managed.summary.verified}/${managed.summary.tracked} verified${managed.summary.untracked > 0 ? `, ${managed.summary.untracked} untracked` : ''}${managed.summary.legacy ? ' (legacy run)' : ''}`
+      }`,
       ...warnings.map((w) => `  warning: ${w}`),
     ].join('\n'),
   };
@@ -1837,11 +2401,30 @@ interface SupervisorStartup {
   taskId: string | null;
   terminalHandle: string | null;
   requestIds: Record<string, string>;
-  status: 'intent' | 'task_created' | 'terminal_created' | 'paused' | 'start_issued' | 'attached';
+  /**
+   * 'retired' is a tombstone left by --replace after the old identity was
+   * provably retired: the loader treats it as absent so a fresh startup can
+   * proceed, while the archived original preserves the full history.
+   */
+  status:
+    | 'intent'
+    | 'task_created'
+    | 'terminal_created'
+    | 'paused'
+    | 'start_issued'
+    | 'attached'
+    | 'retired';
   dispatchId?: string | null;
   paused?: { code: string; message: string; at: string };
+  retiredAt?: string;
+  archivedTo?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Filesystem-safe token for archive paths (handles/dispatch ids only). */
+function archiveToken(id: string): string {
+  return id.replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 /**
@@ -1924,13 +2507,441 @@ async function proveTerminalReady(
   };
 }
 
+/**
+ * Parse a persisted supervisor startup record WITHOUT the pin check — pin
+ * decides whether recorded resources may be REUSED, never whether history
+ * may be read. runId/specSha corruption still fails closed: unknown evidence
+ * is never overwritten. 'retired' tombstones parse like any other record.
+ */
+function recordFromParsed(p: Record<string, unknown>, state: CouncilState, specSha256: string): SupervisorStartup {
+  return {
+    schemaVersion: 1,
+    runId: state.runId,
+    specSha256,
+    supervisor: (asRec(p.supervisor) ?? { command: '', expectedAgent: '', choice: null }) as SupervisorStartup['supervisor'],
+    execution: (asRec(p.execution) ?? null) as SupervisorStartup['execution'],
+    lane: p.lane === 'implicit-run' ? 'implicit-run' : 'task-under-caller-run',
+    boundRunId: typeof p.boundRunId === 'string' ? p.boundRunId : null,
+    taskId: typeof p.taskId === 'string' ? p.taskId : null,
+    terminalHandle: typeof p.terminalHandle === 'string' ? p.terminalHandle : null,
+    requestIds: (asRec(p.requestIds) ?? {}) as Record<string, string>,
+    status: p.status as SupervisorStartup['status'],
+    dispatchId: typeof p.dispatchId === 'string' ? p.dispatchId : null,
+    paused: asRec(p.paused) as SupervisorStartup['paused'],
+    retiredAt: typeof p.retiredAt === 'string' ? p.retiredAt : undefined,
+    archivedTo: typeof p.archivedTo === 'string' ? p.archivedTo : undefined,
+    createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/** Raw record read for retirement — {raw receipt, parsed fields} or null. */
+async function readStartupRecordRaw(
+  store: Store,
+  state: CouncilState,
+  specSha256: string,
+): Promise<{ raw: Record<string, unknown>; rec: SupervisorStartup } | null> {
+  const text = await store.readArtifact(SUPERVISOR_STARTUP_ARTIFACT);
+  if (!text.ok) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.value);
+  } catch {
+    fail('config_invalid', `${SUPERVISOR_STARTUP_ARTIFACT} is corrupt — inspect it manually; replacement never destroys unknown evidence`);
+  }
+  const p = asRec(parsed);
+  if (p === undefined || p.runId !== state.runId || p.specSha256 !== specSha256) {
+    fail(
+      'config_invalid',
+      `${SUPERVISOR_STARTUP_ARTIFACT} does not match this run/spec — inspect it manually; never replace over another startup's record`,
+      { details: { record: p } },
+    );
+  }
+  return { raw: p, rec: recordFromParsed(p, state, specSha256) };
+}
+
+/**
+ * Prove the recorded supervisor identity is provably gone — BOTH halves:
+ * (1) the recorded terminal is stale by the DOCUMENTED definitive code
+ *     (never inferred from quietness, disconnect, 'released', 'settled', or
+ *     a generic show failure), and
+ * (2) every recorded attach/dispatch custody trace resolves: worker-show on
+ *     each known dispatch must carry an explicit verdict, a journaled
+ *     start_issued request must resolve through request-show, and only a
+ *     complete scoped worker ledger may stand in for an absent answer.
+ * Anything live, pending, absent-on-an-incomplete-ledger, or unreadable
+ * fails here with an actionable refusal — replacement never guesses.
+ */
+async function proveSupervisorReplaceable(
+  recorded: { terminalHandle: string; dispatchId: string | null },
+  prior: SupervisorStartup | null,
+): Promise<Record<string, unknown>> {
+  const probes: Record<string, unknown> = {};
+
+  // ── 1. Terminal staleness ─────────────────────────────────────────────
+  const shown = await tryOrcaCli(['terminal', 'show', '--terminal', recorded.terminalHandle, '--json']);
+  if (shown.ok) {
+    const t = asRec(asRec(shown.value)?.terminal ?? shown.value);
+    if (t !== undefined && firstStr(t.handle) === recorded.terminalHandle) {
+      fail(
+        'invalid_transition',
+        `recorded supervisor terminal ${recorded.terminalHandle} still resolves (connected=${t.connected === true}, agent=${firstStr(t.agentIdentity) ?? 'unidentified'}) — the old supervisor may still drive this run; replacement refused. Repair or stop it in place; --replace only retires a provably stale identity`,
+        { details: { probe: 'terminal_live', connected: t.connected === true } },
+      );
+    }
+    fail(
+      'launch_unknown',
+      `terminal show for ${recorded.terminalHandle} returned an unidentifiable record — staleness is unproven; inspect the terminal before replacing`,
+      { details: { probe: 'terminal_unidentifiable', receipt: shown.value } },
+    );
+  }
+  const showCode = firstStr(asRec(shown.error.details)?.adapterCode as string | undefined);
+  if (showCode === undefined || !isStaleTerminalCode(showCode)) {
+    fail(
+      'launch_unknown',
+      `terminal show for ${recorded.terminalHandle} failed without a definitive staleness verdict (${showCode ?? shown.error.code}: ${shown.error.message}) — the old supervisor is not provably gone; reconcile the terminal (\`orca terminal show --terminal ${recorded.terminalHandle} --json\`) before replacing`,
+      { details: { probe: 'terminal_unproven', error: shown.error } },
+    );
+  }
+  probes.terminalShow = { state: 'stale', code: showCode };
+
+  // ── 2. Attach-request custody (a recorded start_issued means a mutation
+  // went out unconfirmed — its outcome must be resolved, never dropped) ────
+  let issuedStartUnaccounted = false;
+  if (prior !== null && prior.status === 'start_issued') {
+    const reqId = prior.requestIds.workerStart;
+    if (reqId === undefined) {
+      fail(
+        'launch_unknown',
+        `the recorded startup is start_issued but carries no worker-start request id — attach custody is unresolvable; reconcile ${SUPERVISOR_STARTUP_ARTIFACT} manually before replacing`,
+        { details: { record: prior } },
+      );
+    }
+    const rshow = await tryOrcaCli(['orchestration', 'request-show', '--request', reqId, '--json']);
+    if (!rshow.ok) {
+      fail(
+        'launch_unknown',
+        `request-show for the recorded worker-start ${reqId} failed (${rshow.error.message}) — the original attach outcome is unproven; reconcile it (\`orca orchestration request-show --request ${reqId} --json\`) before replacing`,
+        { details: { requestId: reqId } },
+      );
+    }
+    const rstate = firstStr(asRec(rshow.value)?.state, asRec(rshow.value)?.status) ?? 'unknown';
+    probes.requestShow = { requestId: reqId, state: rstate };
+    if (rstate === 'pending' || rstate === 'in_progress' || rstate === 'running') {
+      fail(
+        'launch_unknown',
+        `the recorded worker-start request ${reqId} is still pending — the original attach may still be in flight; wait for it to settle and request-show it again before replacing (never launch over an in-flight mutation)`,
+        { details: { requestId: reqId, state: rstate } },
+      );
+    }
+    if (rstate === 'completed') {
+      // A completed start means a dispatch exists somewhere — pull its id
+      // from the receipt if present so worker-show can settle its verdict.
+      const d = firstStr(
+        asRec(rshow.value)?.dispatchId,
+        asRec(asRec(rshow.value)?.dispatch)?.id,
+        asRec(asRec(rshow.value)?.request)?.dispatchId,
+      );
+      if (d !== undefined) {
+        if (prior.dispatchId === null || prior.dispatchId === undefined) {
+          prior.dispatchId = d;
+        }
+      } else {
+        issuedStartUnaccounted = true;
+      }
+    }
+    // 'absent' proves nothing either way — if the record names no dispatch
+    // and no request id landed, the scoped ledger below must show absence.
+    // 'failed'/'refused' is a definitive no-land.
+    if (rstate === 'absent' || rstate === 'unknown') {
+      issuedStartUnaccounted = true;
+    }
+  }
+
+  // ── 3. Dispatch custody — worker-show every known dispatch ────────────
+  const dispatchIds = new Set<string>();
+  if (recorded.dispatchId !== null) dispatchIds.add(recorded.dispatchId);
+  if (prior?.dispatchId !== null && prior?.dispatchId !== undefined) dispatchIds.add(prior.dispatchId);
+  const dispatchProbes: Record<string, unknown> = {};
+  for (const d of dispatchIds) {
+    const ws = await tryOrcaCli(['orchestration', 'worker-show', '--dispatch', d, '--json']);
+    if (!ws.ok) {
+      dispatchProbes[d] = { state: 'unproven', error: ws.error.message };
+      continue; // a ledger read may still prove absence below
+    }
+    const rec = asRec(asRec(ws.value)?.dispatch ?? ws.value);
+    if (rec === undefined) {
+      dispatchProbes[d] = { state: 'unproven', detail: 'worker-show returned an unidentifiable record' };
+      continue;
+    }
+    const { verdict, conflict } = dispatchVerdictOf(rec);
+    if (conflict !== undefined) {
+      fail(
+        'launch_unknown',
+        `worker-show for dispatch ${d} reports conflicting outcome/state (${conflict.outcome} vs ${conflict.state}) — custody is unproven; reconcile the host ledger before replacing`,
+        { details: { dispatchId: d, record: rec } },
+      );
+    }
+    if (verdict !== undefined) {
+      dispatchProbes[d] = { state: 'ended', verdict };
+      continue;
+    }
+    if (dispatchIsActive(rec)) {
+      fail(
+        'invalid_transition',
+        `dispatch ${d} is still live (state=${JSON.stringify(rec.state ?? rec.outcome ?? 'active')}) — the old supervisor may still be running; stop it or reconcile before replacing`,
+        { details: { dispatchId: d, record: rec } },
+      );
+    }
+    dispatchProbes[d] = { state: 'no_verdict', outcome: rec.outcome ?? rec.state ?? null };
+  }
+  probes.workerShow = dispatchProbes;
+  const unprovenDispatches = Object.entries(dispatchProbes)
+    .filter(([, v]) => (v as Record<string, unknown>).state !== 'ended')
+    .map(([d]) => d);
+
+  // ── 4. Ledger coverage — only a COMPLETE worker-list scoped to the
+  // recorded bound Run can prove absence; a paged or unscoped ledger cannot.
+  if (unprovenDispatches.length > 0 || issuedStartUnaccounted) {
+    const scope = prior?.boundRunId ?? null;
+    if (scope === null) {
+      fail(
+        'launch_unknown',
+        `${unprovenDispatches.length > 0 ? `dispatch(es) ${unprovenDispatches.join(', ')} are unproven` : 'the recorded worker-start outcome is unaccounted'} and the startup record has no bound Run to scope a worker ledger — custody is unresolved; inspect \`orca orchestration worker-show --dispatch <id> --json\` / \`worker-list\` manually before replacing`,
+        { details: { unprovenDispatches, requestId: prior?.requestIds.workerStart ?? null } },
+      );
+    }
+    const listed = await tryOrcaCli([
+      'orchestration',
+      'worker-list',
+      '--run',
+      scope,
+      '--full',
+      '--limit',
+      '100',
+      '--json',
+    ]);
+    if (!listed.ok) {
+      fail(
+        'launch_unknown',
+        `worker-list for ${scope} failed (${listed.error.message}) — dispatch custody is unproven; reconcile the ledger before replacing`,
+        { details: { scope } },
+      );
+    }
+    const rows = workerRowsStrict(listed.value, scope);
+    const identities = new Set<string>([...dispatchIds, ...unprovenDispatches]);
+    if (prior?.terminalHandle !== null && prior?.terminalHandle !== undefined) identities.add(prior.terminalHandle);
+    if (prior?.taskId !== null && prior?.taskId !== undefined) identities.add(prior.taskId);
+    identities.add(recorded.terminalHandle);
+    const matched = rows.filter((w) =>
+      [w.dispatchId, w.id, w.taskId, w.terminal, w.terminalHandle]
+        .filter((x): x is string => typeof x === 'string')
+        .some((id) => identities.has(id)),
+    );
+    for (const w of matched) {
+      const { verdict, conflict } = dispatchVerdictOf(w);
+      if (conflict !== undefined) {
+        fail(
+          'launch_unknown',
+          `a worker ledger row on the retiring supervisor's resources reports conflicting outcome/state (${conflict.outcome} vs ${conflict.state}) — custody is unproven; reconcile the ledger before replacing`,
+          { details: { row: w } },
+        );
+      }
+      if (verdict === undefined) {
+        if (dispatchIsActive(w)) {
+          fail(
+            'invalid_transition',
+            `a live dispatch (${firstStr(w.dispatchId) ?? firstStr(w.id) ?? 'unidentified'}) still claims the retiring supervisor's resources — custody is unresolved; reconcile it before replacing`,
+            { details: { row: w } },
+          );
+        }
+        fail(
+          'launch_unknown',
+          `a worker ledger row on the retiring supervisor's resources carries no decisive verdict (${JSON.stringify(w.outcome ?? w.state ?? 'none')}) — released/settled rows do not prove safe custody; reconcile the row before replacing`,
+          { details: { row: w } },
+        );
+      }
+    }
+    for (const d of unprovenDispatches) {
+      const accounted = matched.some((w) => firstStr(w.dispatchId) === d || firstStr(w.id) === d);
+      if (!accounted) {
+        // Absent on a complete scoped ledger → the dispatch never existed or
+        // is fully reaped; combined with the stale terminal this resolves it.
+        dispatchProbes[d] = { state: 'absent_on_complete_ledger', scope };
+      }
+    }
+    if (issuedStartUnaccounted) {
+      fail(
+        'launch_unknown',
+        `the recorded worker-start request ${prior!.requestIds.workerStart} resolved to '${(probes.requestShow as Record<string, unknown>).state}' but no dispatch accounts for it ${Object.keys(dispatchProbes).length > 0 ? `and ${Object.keys(dispatchProbes).join(', ')} is ${unprovenDispatches.length > 0 ? 'absent on the ledger' : 'settled'}` : ''} — the ledger cannot prove whether the attach landed; reconcile \`worker-list --run ${scope}\` manually before replacing`,
+        { details: { requestId: prior!.requestIds.workerStart, matchedRows: matched.length } },
+      );
+    }
+    probes.workerList = { scope, matched: matched.length, resolvedAbsences: unprovenDispatches };
+  } else {
+    probes.workerList = { skipped: 'all known dispatches carry verdicts' };
+  }
+  return probes;
+}
+
+/**
+ * Journal-first retirement of the recorded supervisor (clm_0037). The
+ * durable `supervisor.retired` event — carrying the evidence and the full
+ * original record — is journaled BEFORE state is cleared, so a crash at any
+ * later seam replays idempotently: the event marks the decision as durable,
+ * the archive write is deterministic, and the tombstone + state clear repeat
+ * harmlessly. Never called unless the recorded identity is provably stale
+ * and its custody is resolved (proveSupervisorReplaceable fails loudly).
+ */
+async function retireSupervisorUnderLock(
+  store: Store,
+  st: { ok: true; value: CouncilState },
+  runDir: string,
+  specSha256: string,
+): Promise<{ retired: string; archivePath: string | null; probes: Record<string, unknown> }> {
+  const state = st.value;
+  const recorded = state.supervisor;
+  if (recorded === null) {
+    fail('invalid_transition', 'no supervisor is recorded — nothing to retire');
+  }
+  const journal = unwrap(await store.readJournal());
+  const priorEvent = [...journal].reverse().find(
+    (e) =>
+      e.type === 'supervisor.retired' &&
+      e.payload?.terminalHandle === recorded.terminalHandle &&
+      (e.payload?.dispatchId ?? null) === recorded.dispatchId,
+  );
+
+  const raw = await readStartupRecordRaw(store, state, specSha256);
+  const now = new Date().toISOString();
+
+  let probes: Record<string, unknown>;
+  if (priorEvent === undefined) {
+    // The durable decision is journaled FIRST — before any archive/tombstone
+    // mutation — so an interrupted retirement replays from evidence, never
+    // silently forgets the old identity, and never double-launches.
+    probes = await proveSupervisorReplaceable(recorded, raw?.rec ?? null);
+    unwrap(
+      await store.appendJournal([
+        {
+          ts: now,
+          type: 'supervisor.retired',
+          actor: 'orchestrator',
+          payload: {
+            terminalHandle: recorded.terminalHandle,
+            dispatchId: recorded.dispatchId,
+            reason: 'explicit --replace',
+            probes,
+            record: raw?.raw ?? null,
+          },
+        },
+      ]),
+    );
+  } else {
+    probes = (asRec(priorEvent.payload)?.probes ?? {}) as Record<string, unknown>;
+  }
+
+  // Archive the original startup/identity history — the receipt survives
+  // under supervisor/retired/ even after the tombstone replaces startup.json.
+  // Records whose recorded terminal is still live (a resumable paused/early
+  // record on a DIFFERENT handle than the stale supervisor) stay in place:
+  // the resume path can still reuse them honestly.
+  let archivePath: string | null = null;
+  const retiredAt = now;
+  if (raw !== null && raw.rec.status !== 'retired') {
+    const rec = raw.rec;
+    // attached/start_issued records and records on the retiring terminal are
+    // always archived. A resumable record pointing at a DIFFERENT terminal
+    // is archived only when that terminal is also provably stale — a live
+    // (or unproven) one stays for the normal resume/readiness path, which
+    // pauses honestly rather than guessing.
+    let archive = true;
+    if (
+      rec.status !== 'attached' &&
+      rec.status !== 'start_issued' &&
+      rec.terminalHandle !== null &&
+      rec.terminalHandle !== recorded.terminalHandle
+    ) {
+      const shown = await tryOrcaCli(['terminal', 'show', '--terminal', rec.terminalHandle, '--json']);
+      const code = shown.ok
+        ? undefined
+        : firstStr(asRec(shown.error.details)?.adapterCode as string | undefined);
+      archive = !shown.ok && code !== undefined && isStaleTerminalCode(code);
+    }
+    if (archive) {
+      archivePath = `supervisor/retired/startup-${archiveToken(rec.dispatchId ?? recorded.dispatchId ?? recorded.terminalHandle)}.json`;
+      unwrap(
+        await store.writeArtifact(
+          archivePath,
+          JSON.stringify(
+            {
+              schemaVersion: 1,
+              kind: 'supervisor-startup-record',
+              retiredAt,
+              identity: recorded,
+              record: raw.raw,
+              probes,
+            },
+            null,
+            2,
+          ) + '\n',
+        ),
+      );
+      const tombstone: SupervisorStartup = {
+        ...rec,
+        status: 'retired',
+        retiredAt,
+        archivedTo: archivePath,
+        updatedAt: retiredAt,
+      };
+      unwrap(
+        await store.writeArtifact(
+          SUPERVISOR_STARTUP_ARTIFACT,
+          JSON.stringify(tombstone, null, 2) + '\n',
+        ),
+      );
+    }
+  } else if (raw === null) {
+    // No startup record at all (a self-recorded supervisor) — still preserve
+    // the retired identity + evidence as an archive for audit.
+    archivePath = `supervisor/retired/identity-${archiveToken(recorded.terminalHandle)}.json`;
+    unwrap(
+      await store.writeArtifact(
+        archivePath,
+        JSON.stringify(
+          {
+            schemaVersion: 1,
+            kind: 'supervisor-identity',
+            retiredAt,
+            identity: recorded,
+            record: null,
+            probes,
+          },
+          null,
+          2,
+        ) + '\n',
+      ),
+    );
+  }
+
+  // Clear the recorded identity LAST — after the journal event and archive —
+  // so a crash can never leave an uncleared supervisor with forgotten history.
+  state.supervisor = null;
+  unwrap(await store.saveState(state));
+  return { retired: recorded.terminalHandle, archivePath, probes };
+}
+
 async function cmdStartSupervisor(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
   const v = parseFlags('start-supervisor', argv, {
     run: { type: 'string' },
     'wait-ms': { type: 'string' },
+    replace: { type: 'boolean' },
+    notify: { type: 'string' },
   });
   const runDir = reqStr(v, 'run', '--run <runDir>');
   const waitMsRaw = optStr(v, 'wait-ms');
+  const replace = v.replace === true;
+  const notifyFlag = optStr(v, 'notify');
   let waitMs = 60_000;
   if (waitMsRaw !== undefined) {
     waitMs = Number.parseInt(waitMsRaw, 10);
@@ -1954,7 +2965,7 @@ async function cmdStartSupervisor(argv: readonly string[]): Promise<{ payload: R
   const txn = await store.withLock(
     async (): Promise<Result<{ payload: Record<string, unknown>; human: string }>> => {
       try {
-        return { ok: true, value: await startSupervisorUnderLock(store, runDir, specPath, waitMs) };
+        return { ok: true, value: await startSupervisorUnderLock(store, runDir, specPath, waitMs, { replace, notify: notifyFlag }) };
       } catch (e) {
         if (e instanceof CliError) return { ok: false, error: e.error };
         return {
@@ -1972,6 +2983,7 @@ async function startSupervisorUnderLock(
   runDir: string,
   specPath: string,
   waitMs: number,
+  opts: { replace: boolean; notify: string | undefined },
 ): Promise<{ payload: Record<string, unknown>; human: string }> {
   const st = await store.loadState();
   if (!st.ok) {
@@ -1984,11 +2996,12 @@ async function startSupervisorUnderLock(
   }
   const state = st.value;
 
-  // A recorded supervisor is durable identity — never overwrite it.
-  if (state.supervisor !== null) {
+  // A recorded supervisor is durable identity — never overwritten silently,
+  // and a plain (non---replace) invocation refuses BEFORE any host call.
+  if (state.supervisor !== null && !opts.replace) {
     fail(
       'invalid_transition',
-      `this run already records a supervisor (terminal ${state.supervisor.terminalHandle}, dispatch ${state.supervisor.dispatchId ?? 'unknown'}) — inspect with \`council status\`/\`tail\` or reconcile; a second supervisor is never launched`,
+      `this run already records a supervisor (terminal ${state.supervisor.terminalHandle}, dispatch ${state.supervisor.dispatchId ?? 'unknown'}) — a second supervisor is never launched. If it is dead and its identity is provably stale, retire it explicitly: \`council start-supervisor --run ${cmdToken(runDir)} --replace\``,
       { details: { recordedSupervisor: state.supervisor } },
     );
   }
@@ -2077,6 +3090,49 @@ async function startSupervisorUnderLock(
   const current = await tryOrcaCli(['orchestration', 'run-current', ...fromArgs, '--json']);
   const boundRunId = current.ok ? extractRunId(current.value) : null;
 
+  // ── Wake recipient: capture BEFORE any binding mutation — and never
+  // re-capture an implicit child target on replacement (first durable wins;
+  // explicit --notify overrides). ─────────────────────────────────────────
+  const notifyRecipient = await captureRecipientBest({
+    runDir,
+    to: opts.notify,
+    callerHandle: process.env.ORCA_TERMINAL_HANDLE,
+    callerRunId: boundRunId ?? undefined,
+    self: {
+      orcaRunId: state.orcaRunId ?? undefined,
+      supervisorHandle: state.supervisor?.terminalHandle,
+      councilDispatchIds: [
+        ...(state.supervisor !== null && state.supervisor.dispatchId !== null
+          ? [state.supervisor.dispatchId]
+          : []),
+        ...state.participants.flatMap((p) =>
+          p.attempts.map((a) => a.dispatchId).filter((d): d is string => d !== null),
+        ),
+      ],
+    },
+  });
+
+  // ── Recorded supervisor gate (--replace only) ─────────────────────────
+  // --replace is the only door out of a recorded identity, and only after
+  // the old identity is provably stale AND its attach/dispatch custody is
+  // resolved (retireSupervisorUnderLock fails loudly otherwise).
+  let replacedFrom: { retired: string; archivePath: string | null } | null = null;
+  if (state.supervisor !== null) {
+    const retired = await retireSupervisorUnderLock(store, st, runDir, specSha256);
+    replacedFrom = { retired: retired.retired, archivePath: retired.archivePath };
+  } else if (opts.replace) {
+    const journal = unwrap(await store.readJournal());
+    if (!journal.some((e) => e.type === 'supervisor.retired')) {
+      fail(
+        'invalid_transition',
+        `no supervisor is recorded and no retirement is journaled — nothing to replace; use plain \`council start-supervisor --run ${cmdToken(runDir)}\``,
+        { details: { reason: 'nothing_recorded' } },
+      );
+    }
+    // A retirement is already durable (a prior --replace reached the journal
+    // then crashed) — the tombstoned record loads as absent below.
+  }
+
   // ── Load a prior startup record, if any ─────────────────────────────────
   let rec: SupervisorStartup | null = null;
   const priorText = await store.readArtifact(SUPERVISOR_STARTUP_ARTIFACT);
@@ -2099,6 +3155,7 @@ async function startSupervisorUnderLock(
         { details: { record: p } },
       );
     }
+    if (p.status !== 'retired') {
     // The pinned supervisor identity must still resolve to the same command —
     // a changed staff choice, catalog fingerprint, or a pre-pin record must
     // never silently reuse resources created for a different supervisor.
@@ -2121,38 +3178,18 @@ async function startSupervisorUnderLock(
         { details: { record: p, resolved: lane } },
       );
     }
-    rec = {
-      schemaVersion: 1,
-      runId: state.runId,
-      specSha256,
-      supervisor: {
-        command: lane.command,
-        expectedAgent: lane.expectedAgent,
-        choice: lane.choice,
-      },
-      execution: state.config.execution ?? null,
-      lane: p.lane === 'implicit-run' ? 'implicit-run' : 'task-under-caller-run',
-      boundRunId: typeof p.boundRunId === 'string' ? p.boundRunId : null,
-      taskId: typeof p.taskId === 'string' ? p.taskId : null,
-      terminalHandle: typeof p.terminalHandle === 'string' ? p.terminalHandle : null,
-      requestIds: (asRec(p.requestIds) ?? {}) as Record<string, string>,
-      status: p.status as SupervisorStartup['status'],
-      dispatchId: typeof p.dispatchId === 'string' ? p.dispatchId : null,
-      paused: asRec(p.paused) as SupervisorStartup['paused'],
-      createdAt: typeof p.createdAt === 'string' ? p.createdAt : new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+    rec = recordFromParsed(p, state, specSha256);
     if (rec.status === 'attached') {
       fail(
         'invalid_transition',
-        `${SUPERVISOR_STARTUP_ARTIFACT} records an attached supervisor (dispatch ${rec.dispatchId ?? 'unknown'}) but state records none — inspect; never relaunch`,
+        `${SUPERVISOR_STARTUP_ARTIFACT} records an attached supervisor (dispatch ${rec.dispatchId ?? 'unknown'}) but state records none — inspect; if the attached terminal is provably stale, \`council start-supervisor --run ${cmdToken(runDir)} --replace\` retires it with custody proof`,
         { details: { record: rec } },
       );
     }
     if (rec.status === 'start_issued') {
       fail(
         'launch_unknown',
-        `a supervisor worker-start was already issued (task ${rec.taskId ?? 'implicit'}, terminal ${rec.terminalHandle ?? '?'}, request ${rec.requestIds.workerStart ?? 'unknown'}) with unconfirmed outcome — reconcile via \`request-show\`/\`worker-list\`; do not relaunch`,
+        `a supervisor worker-start was already issued (task ${rec.taskId ?? 'implicit'}, terminal ${rec.terminalHandle ?? '?'}, request ${rec.requestIds.workerStart ?? 'unknown'}) with unconfirmed outcome — reconcile via \`request-show\`/\`worker-list\`; do not relaunch. If the terminal is provably stale and the request resolves, \`--replace\` retires it`,
         { details: { record: rec } },
       );
     }
@@ -2172,6 +3209,7 @@ async function startSupervisorUnderLock(
         `the caller's bound Run changed since supervisor resources were recorded (was ${recordedBound ?? 'unbound'}, now ${boundRunId ?? 'unbound'})`,
         `rebind to ${recordedBound ?? 'the recorded Run'} or reconcile the recorded task/terminal manually — the record is preserved`,
       );
+    }
     }
   }
 
@@ -2500,6 +3538,10 @@ async function startSupervisorUnderLock(
     ]),
   );
 
+  // The launched supervisor is the run's progress helper host — ensure the
+  // bounded helper + report where stage wakes land. Both are best-effort.
+  const helper = await ensureProgressHelper(runDir);
+
   return {
     payload: {
       outcome: 'launched',
@@ -2518,11 +3560,14 @@ async function startSupervisorUnderLock(
       startupRecord: SUPERVISOR_STARTUP_ARTIFACT,
       requestIds: rec2.requestIds,
       resumed: !fresh,
+      replacedFrom,
+      notifyRecipient,
+      ...(helper !== null ? { helper } : {}),
       receipts: { taskCreate: taskReceipt, terminalCreate: termReceipt, workerStart: startReceipt },
       note: 'supervisor launched — it will drive `council supervise --advance --as-supervisor` on each wake',
     },
     human: [
-      `supervisor launched for ${state.runId}${fresh ? '' : ' (resumed recorded resources)'}`,
+      `supervisor launched for ${state.runId}${fresh ? '' : ' (resumed recorded resources)'}${replacedFrom !== null ? ` — replaced ${replacedFrom.retired}` : ''}`,
       `  task:     ${rec2.taskId ?? 'created implicitly by worker-start (id not in receipt)'}`,
       `  terminal: ${rec2.terminalHandle} (${rec2.supervisor.command})`,
       `  dispatch: ${dispatchId}`,
@@ -2563,9 +3608,18 @@ commands:
   catalog                       list supported agent lanes, postures/selectors
                                 and local binary presence (read-only; presence
                                 never implies auth/approval/free usage)
-  start-supervisor --run <runDir>
+  start-supervisor --run <runDir> [--wait-ms N] [--notify <target>] [--replace]
             launch the dedicated supervisor worker using the run's
-            staff.supervisor catalog lane (legacy runs keep the Devin pin)
+            staff.supervisor catalog lane (legacy runs keep the Devin pin).
+            --notify overrides the wake recipient (first durable target wins;
+            a recorded one is preserved otherwise).
+            --replace: retire a recorded supervisor ONLY when its terminal is
+            provably stale (documented terminal-show staleness code — never
+            guessed from quiet/released) AND its dispatch/attach custody
+            resolves via worker-show/request-show/worker-list receipts; the
+            retirement is journaled (supervisor.retired) and the original
+            record archived under supervisor/retired/ BEFORE any new launch.
+            Any live/pending/unknown custody refuses with actionable steps.
   supervise --run <runDir> --advance [--as-supervisor]
             one bounded, idempotent engine step; prints {state, action, note}.
             --as-supervisor is the dedicated supervisor's own mode: it binds
@@ -2577,10 +3631,17 @@ commands:
             after a confirmed no-effect refusal; refuses on any ambiguity
   approve   --run <runDir> --roster <file> [--note <text>]
             record the hash-bound roster approval (does not wake the supervisor)
-  status    --run <runDir>          phase, per-seat health, budgets, quorum
+  status    --run <runDir>          phase age/deadline, last persisted activity,
+                                    per-seat health + dispatch ids, budgets,
+                                    quorum, supervisor probe (live/stale/
+                                    unproven — never guessed), exact pending
+                                    actions when actionable, wake recipient +
+                                    helper state, managed-artifact integrity
   tail      --run <runDir> [--lines N]   last N journal events (read-only)
   verify    --run <runDir>          snapshot drift + approval binding +
-                                    catalog fingerprint integrity
+                                    catalog fingerprint + managed-artifact
+                                    integrity (legacy runs report legacy/
+                                    untracked, never a false verified)
   cancel    --run <runDir> [--reason <text>]   guarded stop of live workers
   doctor    [--config <file> | --run <runDir>]
             host check (node/orca) + informational catalog-lane presence;

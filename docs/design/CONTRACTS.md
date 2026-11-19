@@ -80,7 +80,20 @@ AttemptId, SnapshotId, ApprovalId`; `SCHEMA_VERSION = 1`.
   `repro` requires `steps` + `observed`.
 - `Finding { findingId, title, kind, severity, confidence, assertedGrade?,
   evidence[], counterEvidence?, remedies?, openQuestions? }`
-- `FindingsFile` (findings/`<pid>`.json) — independent phase.
+- `Strength { strengthId, feature, benefit, preserve, evidence[] }` —
+  optional worker-asserted preservation record: a specific existing feature,
+  the concrete role-specific benefit, what must not be lost, and evidence
+  under the identical kind/citation rules as `Finding.evidence`. Bounded by
+  `MAX_STRENGTHS_PER_FILE = 3` (a constant, not a config key — the approval
+  binding stays byte-stable). `CanonicalStrength extends Strength` adds
+  runner-stamped `participantId`/`perspectiveId` — workers never stamp their
+  own provenance.
+- `FindingsFile` (findings/`<pid>`.json) — independent phase. `findings`
+  requires unique `findingId`s (duplicate ids reject the file); optional
+  `strengths?: Strength[]` — absent or `[]` both valid, zero is a legitimate
+  answer, more than 3 rejects the file, duplicate `strengthId`s reject.
+  A strength whose ENTIRE evidence list fails citation checks is dropped
+  with a journaled rejection; partial failures keep the surviving items.
 - `Challenge { challengeId, claimId, kind, argument, evidence[] }`;
   `ChallengesFile` (rounds/`<n>`/challenges/`<pid>`.json). Challengers mint
   locally-unique ids; the ledger **qualifies** each id by challenger and
@@ -100,12 +113,38 @@ AttemptId, SnapshotId, ApprovalId`; `SCHEMA_VERSION = 1`.
 ### Ledger / scribe / report
 
 - `Claim { claimId, title, kind, grade, status, severity, confidence,
-  evidence[], counterEvidence[], sourceFindings[], history[], dissent[] }`;
+  evidence[], counterEvidence[], sourceFindings[], history[], dissent[],
+  remedies?, openQuestions?, assessments?, mergedTitles?, challenges?,
+  dedupeKey?, rejectedEvidence? }`;
   `ClaimStatus = 'proposed'|'challenged'|'defended'|'revised'|'escalated'|
   'confirmed'|'resolved'|'withdrawn'`; `EvidenceGrade = 'verified_defect'|
   'plausible_risk'|'speculative'|'unsupported'`; `ClaimLedger`,
   `ClaimEvent`, `DissentRecord`, `FindingKind`, `Severity`, `EvidenceKind`,
-  `ChallengeKind`.
+  `ChallengeKind`, `ClaimAssessment`.
+- `ClaimChallenge { challengeId /*qualified*/, round, challengerPid, kind,
+  answered, response?{participantId,disposition} }` — one admitted
+  challenge's lifecycle on its claim. `answered` is a fact, never a verdict:
+  a 'defend' keeps the dispute live, 'revise'/'withdraw' adopt or moot it,
+  'escalate' hands it to the orchestrator. `DissentRecord.challengeId?`
+  links dissent to the qualified challenge (absent on merge-rating dissent
+  and legacy records).
+- `ClaimLedger` adds optional `strengths?: CanonicalStrength[]` (runner-
+  provenanced, never challenged or graded) and `discussion?: {rounds:
+  RoundRoutingRecord[]}` — durable per-round routing records
+  (`ChallengeRoutingRecord {routedClaimIds, byteDroppedClaimIds,
+  unassigned[]}`, `ResponseRoutingRecord {routedChallengeIds, byteDropped[],
+  capOmitted[], unroutable[]}`) separating routed/examined claims from
+  never-routed ones and byte-cap drops from plan-level unassigned. Legacy
+  ledgers lack both and stay loadable.
+- `ReportProvenance { snapshotId, gitHead|null, targetRoot, objective }`
+  binds the exported report to the exact source it covers.
+  `CouncilReport` adds optional `provenance`, `runnerFacts` (deterministic
+  counts incl. `unansweredChallenges?`, `strengths?` count and per-round
+  `DiscussionRoundFacts` — filed/answered/unanswered challenges and the
+  routed/no-challenge/never-routed claim split), `strengths?:
+  CanonicalStrength[]`, and `limitationSources` (provenance-tagged
+  runner-vs-scribe limitations). `summary.md` carries the limitations block
+  in report order.
 - `ScribeNotesFile` — initial scribe pass artifact; an explicit input to
   `scribeSynthesis` via `notesPath` (a prior read, never an authority).
 - `SynthesisFile { schemaVersion, runId, participantId, generatedAt?,
@@ -214,6 +253,65 @@ launch due work, persist. `now` is injectable for deterministic tests.
 `advance` again in the same turn (bounded loop until a non-progress action;
 one-call-per-wake alone can deadlock internal transitions).
 
+### `progress` — implement in `src/progress.ts` (new, v1)
+
+Run-local stage/progress notification surface. Owns everything under
+`<runDir>/progress/` — `recipient.json`, `outbox.json` (+ its own `O_EXCL`
+lock — never shares `Store.withLock` or the journal), `helper.lease`,
+`helper.json`. Never consumes mail, never rebinds the caller, never spawns
+agents or provider jobs.
+
+```
+captureRecipient({runDir, to?, callerHandle?, callerRunId?, self?, now?})
+   → Result<{recipient:{to,source,recordedAt}, changed:boolean}>
+```
+
+Persists `progress/recipient.json` — the ONE canonical wake destination —
+**before** any supervisor binding change (init + start-supervisor).
+Preference: explicit `to` > `callerRunId`→`run:<id>` > `callerHandle`→term_.
+Rejects malformed and self/child targets; first durable target wins unless
+explicit override; absent on legacy runs = unconfigured, never inferred.
+
+```
+createProgressNotifier({runDir, sendMail, now?, readState?, budget?})
+   → notifier
+notifier.notify(event: ProgressEvent) → Result<{outcome:'sent'|'deduped'|
+   'retry'|'unknown'|'error'|'refused'|'budget_refused'|'no_recipient'|
+   'skipped_terminal', intentId, delivery?}>
+ProgressEvent = {kind:'stage',status,note?} | {kind:'blocked',reason,note?}
+   | {kind:'finished',outcome:'succeeded'|'failed'|'cancelled',reportPaths?}
+   | {kind:'approval',approver?} | {kind:'heartbeat'} /* helper only */
+```
+
+`sendMail` is injected `HostAdapter.sendNotification`. Durable intentIds
+dedupe repeats (`stage:<status>[:rN:…]`, `approval:<hash8>`,
+`blocked:<sha8>`, `finished:<outcome>`, `hb:<window>`); `unknown` is never
+resent, `error`/`refused` retried once. Bounded budgets (stage/heartbeat)
+persisted in the outbox — separate from `maxMailPerParticipant`. Message:
+subject `council <crun>: <stage>`, body = persisted facts (status,
+participant/attempt counts, launch consumption, elapsed/stage age, next
+action, reportPaths on finish) + the fixed honesty line that facts do not
+verify worker liveness. ≤8192B.
+
+```
+ensureHelper({runDir, now?, spawnFn?, helper?{intervalMs=120000,
+   maxLifetimeMs}}) → {state:'started'|'already_running'|'skipped_terminal'
+   |'no_recipient'|'lease_held'|'spawn_failed', pid?}
+```
+
+Argv-spawned detached child `node progress.js helper --run <dir>` — no
+shell, no agents. Singleton via `helper.lease` (O_EXCL + stale reclaim);
+each tick reads persisted state + journal tail only — NO host
+status/observe polls — and exits on terminal state, budget, or lifetime.
+`progressStatus(runDir)` is read-only: recipient, delivery counters,
+`lastDelivery`, budget, and `helper.state
+('running'|'stale'|'dead'|'exited'|'none')` — a dead helper is a visible
+gap, never claimed as guaranteed delivery.
+
+Engine calls `notify` post-flush (stage/blocked/finished, approval inside
+`approve`); engine/operator call `ensureHelper` idempotently. The
+supervisor agent sends no stage mail — its outbound list is unchanged.
+
 ## `src/validation.ts` exports (contracts owner, this dispatch)
 
 - `resolveConfig(raw): ParseResult<CouncilConfig>` — apply defaults + validate.
@@ -225,6 +323,8 @@ one-call-per-wake alone can deadlock internal transitions).
 - `parseScribeNotesFile(raw, ctx)`, `parseReportFile(raw, ctx)`,
   `parseSynthesisFile(raw, ctx)` — the slim scribe narrative contract;
   `parseReportFile` remains for legacy full-report artifacts.
+- `parseClaimLedger(raw, ctx{runId?})` — re-read parser for claims.json so
+  managed artifacts are parsed on consumption, never trusted casts.
 - `parseSourceSnapshot(raw): ParseResult<SourceSnapshot>`
 - `parseApprovalRecord(raw)`, `parseApprovalBinding(raw)`
 - `parseCouncilState(raw)`, `parseJournalEvent(raw)`, `parsePhaseAttempt(raw)`,

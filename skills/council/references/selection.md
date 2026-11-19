@@ -21,6 +21,13 @@ A choice is five independent axes, not a name:
 "Claude Code" is a CLI, not a supplier guarantee; a configured profile can
 route a CLI to another supplier without exposing credentials to council data.
 
+Fill-in files ship under `references/templates/`:
+`council.config.template.json` (the full config with `staff` placeholders),
+`council.config.smoke.template.json` (a bounded first-run variant), and
+`roster.approved.template.json` (the approval wrapper). Replace every
+`<...>` with a validated catalog choice — leftovers fail loudly, never
+default.
+
 ## The catalog is the contract
 
 ```text

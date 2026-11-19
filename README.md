@@ -6,10 +6,13 @@ orchestrator. Orca is the execution host; the council protocol lives behind a
 host-adapter boundary so other hosts can follow.
 
 Flow: an organiser proposes 10–25 review perspectives → the orchestrator
-approves a hash-bound roster → reviewers inspect independently → a bounded
-challenge/response discussion → a scribe preserves findings, dissent, and
-provenance → the orchestrator receives a report with evidence, confidence,
-limitations, and honest coverage.
+approves a hash-bound roster → reviewers inspect independently (optionally
+filing bounded, evidence-backed strengths beside prioritized criticism) →
+a bounded challenge/response discussion → a scribe preserves findings,
+dissent, and provenance → the orchestrator receives a report with evidence,
+confidence, limitations, and honest coverage. The run mails the initiating
+orchestrator at every lifecycle stage — approval gate, blockers, failure,
+completion — plus bounded progress notices during long stages.
 
 ## Requirements
 
@@ -34,10 +37,14 @@ npm ci
 npm run build
 
 node dist/src/cli.js catalog --json                # supported lanes + selectors
+node dist/src/cli.js doctor --config ./council.config.json --json  # readiness preflight
 node dist/src/cli.js init --objective ./OBJECTIVE.md --target /path/to/project --config ./council.config.json
-node dist/src/cli.js start-supervisor --run <runDir>   # or supervise --advance yourself
+node dist/src/cli.js start-supervisor --run <runDir> --json   # or supervise --advance yourself
+# CHECK the JSON: ok:true exit 0 can mean outcome:"paused" —
+# require outcome:"launched" + supervisorStarted:true
 node dist/src/cli.js status --run <runDir> --json
-# at the gate: write roster.approved.json, then
+# at the gate: write roster.approved.json (wrapper: schemaVersion, runId, seats[] —
+# template: skills/council/references/templates/roster.approved.template.json), then
 node dist/src/cli.js approve --run <runDir> --roster <runDir>/roster.approved.json
 ```
 

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "requestedPerspectives": 10,
+  "participants": 2,
+  "concurrency": 2,
+  "rounds": 1,
+  "maxFindingsPerSeat": 2,
+  "maxChallengesPerSeatPerRound": 1,
+  "maxResponsesPerSeatPerRound": 1,
+  "envelopeBytes": 8192,
+  "deadlines": {
+    "organiserMs": 1200000,
+    "independentMs": 3600000,
+    "scribeNotesMs": 1800000,
+    "challengeMs": 3600000,
+    "responseMs": 3600000,
+    "synthesisMs": 3600000,
+    "runMs": 14400000,
+    "graceMs": 900000
+  },
+  "staff": {
+    "organiser":    { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" },
+    "scribe":       { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" },
+    "supervisor":   { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" }
+  }
+}

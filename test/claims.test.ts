@@ -25,6 +25,7 @@ import {
   assignChallenges,
   assignResponses,
   buildClaimLedger,
+  buildDiscussionAccounting,
   claimAuthors,
   claimsById,
   deriveGrade,
@@ -33,6 +34,8 @@ import {
   makeEnvelopeBase,
   projectClaimView,
   qualifiedChallengeId,
+  recordChallengeRouting,
+  recordResponseRouting,
   validateEvidenceList,
   type AdmittedChallenge,
   type SourceAccess,
@@ -1199,4 +1202,246 @@ test('indexAdmittedChallenges: qualified ids primary; unique local ids alias; co
   assert.equal(idx.get('C-1'), undefined);
   // Unique local id still resolves for backward compatibility.
   assert.equal(idx.get('C-2')?.challengerPid, 'rev_c');
+});
+
+// ─── canonical strengths ─────────────────────────────────────────────────────
+
+function findingsWithStrengths(pid: string, strengths: FindingsFile['strengths']): FindingsFile {
+  return { ...findingsFile(pid, []), strengths };
+}
+
+test('buildClaimLedger: strengths canonicalize with runner-stamped provenance — worker cannot self-attribute', () => {
+  const file = findingsWithStrengths('rev_b', [
+    {
+      strengthId: 'S-2',
+      feature: 'hash-bound approval',
+      benefit: 'a security seat can diff the approved roster exactly',
+      preserve: 'never weaken the binding',
+      evidence: [{ kind: 'reasoned', note: 'by design' }],
+      // A worker minting participantId/perspectiveId fields has them
+      // overwritten by the runner — never trusted.
+      ...({ participantId: 'rev_a', perspectiveId: 'persp_rev_a' } as object),
+    },
+    {
+      strengthId: 'S-1',
+      feature: 'dissent retention',
+      benefit: 'a skeptic seat keeps its objection on record',
+      preserve: 'answers must not erase dissent',
+      evidence: [{ kind: 'reasoned', note: 'protocol' }],
+    },
+  ]);
+  const { ledger, strengthRejections } = buildClaimLedger(
+    RUN,
+    [{ participantId: 'rev_b', perspectiveId: 'persp_rev_b', file }],
+    src(),
+    NOW,
+  );
+  assert.equal(strengthRejections.length, 0);
+  assert.equal(ledger.strengths?.length, 2);
+  // Deterministic order: strengthId sort within the seat.
+  assert.equal(ledger.strengths![0].strengthId, 'S-1');
+  assert.equal(ledger.strengths![1].strengthId, 'S-2');
+  for (const s of ledger.strengths!) {
+    assert.equal(s.participantId, 'rev_b', 'runner stamps the admitting seat');
+    assert.equal(s.perspectiveId, 'persp_rev_b');
+  }
+});
+
+test('buildClaimLedger: strength with all-invalid evidence is dropped and journaled, never bare praise', () => {
+  const file = findingsWithStrengths('rev_a', [
+    {
+      strengthId: 'S-1',
+      feature: 'nice colors',
+      benefit: 'feels good',
+      preserve: 'keep it',
+      evidence: [{ kind: 'code_location', note: 'cited', path: 'src/nope.js', startLine: 1 }],
+    },
+    {
+      strengthId: 'S-2',
+      feature: 'real feature',
+      benefit: 'real benefit',
+      preserve: 'keep it too',
+      evidence: [
+        { kind: 'code_location', note: 'cited', path: 'src/app.js', startLine: 2, endLine: 2, snippet: 'dangerous()' },
+        { kind: 'code_location', note: 'phantom', path: 'src/nope.js', startLine: 1 },
+      ],
+    },
+  ]);
+  const { ledger, strengthRejections, evidenceRejections } = buildClaimLedger(
+    RUN,
+    [{ participantId: 'rev_a', perspectiveId: 'persp_rev_a', file }],
+    src(),
+    NOW,
+  );
+  assert.equal(strengthRejections.length, 1);
+  assert.equal(strengthRejections[0].strengthId, 'S-1');
+  assert.match(strengthRejections[0].reason, /bare praise/);
+  // S-2 survives with only its valid evidence; the rejected item is journaled.
+  assert.equal(ledger.strengths?.length, 1);
+  assert.equal(ledger.strengths![0].evidence.length, 1);
+  assert.equal(evidenceRejections.length, 2, 'both rejected strength-evidence items surface');
+});
+
+test('buildClaimLedger: absent and empty strengths are both valid — no quota', () => {
+  const { ledger } = buildClaimLedger(RUN, [{ participantId: 'rev_a', perspectiveId: 'p', file: findingsFile('rev_a', []) }], src(), NOW);
+  assert.equal(ledger.strengths, undefined);
+  const { ledger: empty } = buildClaimLedger(
+    RUN,
+    [{ participantId: 'rev_a', perspectiveId: 'p', file: findingsWithStrengths('rev_a', []) }],
+    src(),
+    NOW,
+  );
+  assert.equal(empty.strengths, undefined, 'empty stays absent');
+});
+
+// ─── challenge linkage + answered accounting ────────────────────────────────
+
+test('applyChallengesToLedger: stamps ClaimChallenge + qualified dissent linkage', () => {
+  const ledger = mkLedger([mkClaim('clm_1', ['rev_a'])]);
+  const res = applyChallengesToLedger(
+    ledger,
+    [
+      {
+        participantId: 'rev_b',
+        file: {
+          schemaVersion: SCHEMA_VERSION,
+          runId: RUN,
+          round: 1,
+          participantId: 'rev_b',
+          challenges: [
+            { challengeId: 'C-1', claimId: 'clm_1', kind: 'overstated', argument: 'too strong', evidence: [] },
+          ],
+        },
+      },
+    ],
+    src(),
+    NOW,
+  );
+  assert.equal(res.applied, 1);
+  const c = ledger.claims[0];
+  const qid = qualifiedChallengeId(1, 'rev_b', 'C-1');
+  assert.equal(c.challenges?.length, 1);
+  assert.equal(c.challenges![0].challengeId, qid);
+  assert.equal(c.challenges![0].challengerPid, 'rev_b');
+  assert.equal(c.challenges![0].answered, false, 'filed ≠ answered');
+  assert.equal(c.dissent[0].challengeId, qid, 'dissent joins to its challenge lifecycle');
+});
+
+test('applyResponsesToLedger: marks the challenge answered — never resolved', () => {
+  const ledger = mkLedger([mkClaim('clm_1', ['rev_a'])]);
+  applyChallengesToLedger(
+    ledger,
+    [
+      {
+        participantId: 'rev_b',
+        file: {
+          schemaVersion: SCHEMA_VERSION,
+          runId: RUN,
+          round: 1,
+          participantId: 'rev_b',
+          challenges: [
+            { challengeId: 'C-1', claimId: 'clm_1', kind: 'missing_evidence', argument: 'no proof', evidence: [] },
+          ],
+        },
+      },
+    ],
+    src(),
+    NOW,
+  );
+  const ac = mkAdmitted(
+    { challengeId: 'C-1', claimId: 'clm_1', kind: 'missing_evidence', argument: 'no proof', evidence: [] },
+    'rev_b',
+  );
+  const res = applyResponsesToLedger(
+    ledger,
+    [
+      {
+        participantId: 'rev_a',
+        file: {
+          schemaVersion: SCHEMA_VERSION,
+          runId: RUN,
+          round: 1,
+          participantId: 'rev_a',
+          responses: [
+            { claimId: 'clm_1', challengeId: 'C-1', disposition: 'defend', argument: 'still right', evidence: [] },
+          ],
+        },
+      },
+    ],
+    new Map([[ac.qualifiedId, ac], ['C-1', ac]]),
+    src(),
+    NOW,
+  );
+  assert.equal(res.applied, 1);
+  const crec = ledger.claims[0].challenges![0];
+  assert.equal(crec.answered, true);
+  assert.deepEqual(crec.response, { participantId: 'rev_a', disposition: 'defend' });
+  // The dissent record survives the answer — retained, not resolved.
+  assert.equal(ledger.claims[0].dissent.length, 1);
+});
+
+// ─── routing records + discussion accounting ────────────────────────────────
+
+test('recordChallengeRouting/recordResponseRouting + buildDiscussionAccounting: disjoint omission categories', () => {
+  const claims = [
+    mkClaim('clm_1', ['rev_a']),
+    mkClaim('clm_2', ['rev_a']),
+    mkClaim('clm_3', ['rev_b']),
+    mkClaim('clm_4', ['rev_c']),
+  ];
+  const ledger = mkLedger(claims);
+  // Round 1: clm_1 + clm_2 routed; clm_1 challenged (answered), clm_2 routed but
+  // the challenger filed nothing; clm_3 byte-dropped; clm_4 never assigned.
+  applyChallengesToLedger(
+    ledger,
+    [
+      {
+        participantId: 'rev_b',
+        file: {
+          schemaVersion: SCHEMA_VERSION,
+          runId: RUN,
+          round: 1,
+          participantId: 'rev_b',
+          challenges: [
+            { challengeId: 'C-1', claimId: 'clm_1', kind: 'other', argument: 'q', evidence: [] },
+          ],
+        },
+      },
+    ],
+    src(),
+    NOW,
+  );
+  recordChallengeRouting(ledger, 1, {
+    routedClaimIds: ['clm_1', 'clm_2'],
+    byteDroppedClaimIds: ['clm_3'],
+    unassigned: [{ claimId: 'clm_4', reason: 'all eligible challengers at cap' }],
+  });
+  recordResponseRouting(ledger, 1, {
+    routedChallengeIds: [qualifiedChallengeId(1, 'rev_b', 'C-1')],
+    byteDropped: [{ claimId: 'clm_9', authorPid: 'rev_a' }],
+    capOmitted: [],
+    unroutable: [],
+  });
+  const facts = buildDiscussionAccounting(ledger)!;
+  assert.equal(facts.length, 1);
+  const d = facts[0];
+  assert.equal(d.challengesFiled, 1);
+  assert.equal(d.challengesAnswered, 0);
+  assert.equal(d.challengesUnanswered, 1);
+  assert.equal(d.claimsRouted, 2);
+  assert.equal(d.claimsRoutedNoChallenge, 1, 'clm_2 routed but unchallenged');
+  assert.equal(d.claimsNeverRouted, 2, 'unassigned ∪ byte-dropped');
+  assert.equal(d.claimsUnassigned, 1);
+  assert.equal(d.claimsByteDropped, 1);
+  assert.equal(d.responsesRouted, 1);
+  assert.equal(d.responsesByteDropped, 1);
+  // Re-recording the same round overwrites (crash-replay idempotent).
+  recordChallengeRouting(ledger, 1, {
+    routedClaimIds: ['clm_1'],
+    byteDroppedClaimIds: [],
+    unassigned: [],
+  });
+  assert.equal(buildDiscussionAccounting(ledger)![0].claimsRouted, 1);
+  // No records → absent, never a zero-filled fiction.
+  assert.equal(buildDiscussionAccounting(mkLedger([mkClaim('x', ['rev_a'])])), undefined);
 });

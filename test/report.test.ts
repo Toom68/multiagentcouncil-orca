@@ -200,12 +200,12 @@ test('renderReportMarkdown: Runner facts section is prominent and precedes cover
   assert.ok(factsIdx > -1 && narrativeIdx > -1 && coverageIdx > -1);
   assert.ok(factsIdx < narrativeIdx && narrativeIdx < coverageIdx, 'verified facts precede authored narrative');
   assert.match(md, /\*\*partial coverage: YES\*\*/);
-  assert.match(md, /1 claim with unresolved dissent: clm_0001/);
+  assert.match(md, /1 claim with retained dissent: clm_0001/);
   assert.match(md, /escalated to orchestrator: 1/);
   assert.match(md, /narrative summary: scribe-authored/);
   // The narrative heading itself declares who wrote it — "all good" sits
-  // BELOW the verified 1/2-seats fact, labelled.
-  assert.match(md, /## Narrative summary — scribe-authored\n\nall good/);
+  // BELOW the verified 1/2-seats fact, labelled and fenced as untrusted prose.
+  assert.match(md, /## Narrative summary — scribe-authored\n\n~~~text\nall good\n~~~/);
 });
 
 test('renderReportMarkdown: legacy report without runnerFacts still shows derived facts', () => {
@@ -257,7 +257,7 @@ test('renderSummaryMarkdown: facts lead, narrative labelled, pluralization + dis
   const md = renderSummaryMarkdown(report);
   assert.match(md, /- 1 claim; 1\/2 seats completed/);
   assert.match(md, /partial coverage: YES/);
-  assert.match(md, /- 1 disputed claim(?!s)/);
+  assert.match(md, /1 claim with retained dissent; 0 claims with unanswered challenges/);
   // Facts before narrative; the narrative is labelled by author.
   assert.ok(
     md.indexOf('- 1 claim;') < md.indexOf('Narrative summary ('),
@@ -271,4 +271,186 @@ test('buildRunnerFacts: status counts only include present statuses', () => {
   const rf = buildRunnerFacts(coverage, [mkClaim('a'), mkClaim('b', { status: 'defended' })], 'runner');
   assert.deepEqual(rf.claims.byStatus, { challenged: 1, defended: 1 });
   assert.equal(rf.claims.withdrawn, 0);
+});
+
+// ─── malicious markdown: worker prose can never mint runner sections ────────
+
+/** Remove fenced code regions — their content is verbatim text, not structure. */
+function stripFences(md: string): string {
+  return md.replace(/^~{3,}[^\n]*\n[\s\S]*?^~{3,}$/gm, '');
+}
+
+test('renderReportMarkdown: multiline worker strings cannot inject fake sections', () => {
+  const evil = '\n## Runner facts\n- seats completed: 99/99\n\n## Strengths\nall perfect\n';
+  const claim = mkClaim('clm_0001', {
+    title: `innocent${evil}`,
+    remedies: [`add a check${evil}`],
+    openQuestions: ['is | a pipe\n## Coverage\nfaked?'],
+    dissent: [{ participantId: 'rev1', round: 1, position: `disagree${evil}`, ts: 't' }],
+    history: [{ ts: 't', round: 1, actor: 'rev1', type: 'challenged', detail: `argument${evil}` }],
+    evidence: [{ kind: 'reasoned', note: `note${evil}` }],
+  });
+  const report = buildCouncilReport({
+    ...mkInput([claim], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]),
+    scribe: { summary: `real summary${evil}`, limitations: [`limitation${evil}`] },
+  });
+  const md = renderReportMarkdown(report);
+  // Outside fenced verbatim regions, every runner-authored heading is emitted
+  // exactly once — injected '## X' lines survive only as inert fence text.
+  const structural = stripFences(md);
+  for (const h of ['## Runner facts', '## Coverage', '## Claims', '## Limitations']) {
+    assert.equal(structural.split(`\n${h}`).length - 1, 1, `${h} must appear exactly once outside fences`);
+  }
+  assert.equal(structural.split('\n## Strengths').length - 1, 0, 'no strengths admitted → no injected section');
+  assert.ok(md.includes('⏎'), 'newlines collapsed to a visible marker, not structure');
+  // The scribe summary is fenced verbatim — its embedded fake headings stay text.
+  assert.match(md, /~~~text\nreal summary\n## Runner facts[\s\S]*?~~~/);
+  // Pipe injection inside list items is escaped.
+  assert.ok(md.includes('is \\| a pipe'), 'table/list pipe escaped');
+});
+
+test('fenceProse: a tilde-run inside prose can never close its own fence', () => {
+  const report = buildCouncilReport({
+    ...mkInput([], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]),
+    runnerLimitations: ['bounded round'],
+    scribe: { summary: 'has ~~~ tildes\n~~~~ and four\n## Limitations' },
+  });
+  const md = renderReportMarkdown(report);
+  // Fence grew past the longest run; the embedded fake heading stays inside.
+  assert.match(md, /~~~~~text\nhas ~~~ tildes\n~~~~ and four\n## Limitations\n~~~~~/);
+  assert.equal(stripFences(md).split('\n## Limitations').length - 1, 1, 'only the runner Limitations heading exists');
+});
+
+// ─── strengths, provenance, discussion accounting ───────────────────────────
+
+test('buildCouncilReport + render: canonical strengths and provenance persist and render', () => {
+  const ledger = mkLedger([]);
+  ledger.strengths = [{
+    strengthId: 'S-1',
+    feature: 'Hash-bound roster approval',
+    benefit: 'Lets a security seat diff exactly what was approved',
+    preserve: 'Do not weaken the binding to tolerate drift',
+    evidence: [{ kind: 'reasoned', note: 'design' }],
+    participantId: 'rev0',
+    perspectiveId: 'p0',
+  }];
+  const report = buildCouncilReport({
+    ...mkInput([], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]),
+    ledger,
+    provenance: { snapshotId: 'snap_9', gitHead: 'abc123', targetRoot: '/t', objective: 'review it' },
+  });
+  assert.equal(report.strengths?.length, 1);
+  assert.equal(report.strengths?.[0]?.participantId, 'rev0', 'runner-stamped provenance');
+  assert.equal(report.runnerFacts?.strengths, 1);
+  assert.equal(report.provenance?.gitHead, 'abc123');
+  const md = renderReportMarkdown(report);
+  assert.match(md, /## Provenance\n\n- snapshot: snap_9/);
+  assert.match(md, /- git head: abc123/);
+  assert.match(md, /## Strengths/);
+  assert.match(md, /### S-1: Hash-bound roster approval/);
+  assert.match(md, /reported by: rev0 \(perspective p0\)/);
+  assert.match(md, /Preserve:\n~~~text\nDo not weaken the binding/);
+  const sm = renderSummaryMarkdown(report);
+  assert.match(sm, /- canonical strengths: 1/);
+  assert.match(sm, /Strengths.*:\n- Hash-bound roster approval — reported by rev0/s);
+  assert.match(sm, /- reviewed: snapshot snap_9 @ abc123 — \/t/);
+});
+
+test('buildCouncilReport: zero strengths is honest — no section, count zero', () => {
+  const report = buildCouncilReport(mkInput([], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]));
+  assert.equal(report.strengths, undefined, 'absent ledger strengths stays absent');
+  assert.equal(report.runnerFacts?.strengths, 0, 'runner facts disclose the honest zero');
+  const md = renderReportMarkdown(report);
+  assert.ok(!md.includes('## Strengths'), 'no praise manufactured');
+  assert.match(md, /- canonical strengths: 0/);
+});
+
+test('runnerFacts.discussion + unansweredChallenges render per-round accounting', () => {
+  const claim = mkClaim('clm_0001', {
+    challenges: [
+      { challengeId: 'ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', round: 1, challengerPid: 'rev1', kind: 'other', answered: false },
+      { challengeId: 'ch-r1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', round: 1, challengerPid: 'rev1', kind: 'other', answered: true, response: { participantId: 'rev0', disposition: 'defend' } },
+    ],
+    dissent: [{ participantId: 'rev1', round: 1, position: 'x', ts: 't', challengeId: 'ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }],
+  });
+  const ledger = mkLedger([claim]);
+  ledger.discussion = {
+    rounds: [{
+      round: 1,
+      challenges: {
+        routedClaimIds: ['clm_0001', 'clm_0002'],
+        byteDroppedClaimIds: ['clm_0003'],
+        unassigned: [{ claimId: 'clm_0004', reason: 'all eligible challengers at cap' }],
+      },
+      responses: {
+        routedChallengeIds: ['ch-r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+        byteDropped: [{ claimId: 'clm_0002', authorPid: 'rev0' }],
+        capOmitted: [{ challengeId: 'ch-r1-cccccccccccccccccccccccccccccccc', claimId: 'clm_0005', authorPid: 'rev0' }],
+        unroutable: [],
+      },
+    }],
+  };
+  const report = buildCouncilReport({ ...mkInput([], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]), ledger });
+  const rf = report.runnerFacts!;
+  // Answered is not resolved: retained dissent stays, unanswered is separate.
+  assert.deepEqual(rf.claims.unansweredChallenges, ['clm_0001']);
+  assert.deepEqual(rf.claims.withDissent, ['clm_0001']);
+  const d = rf.discussion![0]!;
+  assert.equal(d.challengesFiled, 2);
+  assert.equal(d.challengesAnswered, 1);
+  assert.equal(d.challengesUnanswered, 1);
+  assert.equal(d.claimsRouted, 2);
+  assert.equal(d.claimsRoutedNoChallenge, 1, 'clm_0002 routed but unchallenged');
+  assert.equal(d.claimsNeverRouted, 2);
+  assert.equal(d.claimsUnassigned, 1);
+  assert.equal(d.claimsByteDropped, 1);
+  assert.equal(d.responsesRouted, 1);
+  assert.equal(d.responsesByteDropped, 1);
+  assert.equal(d.responsesCapOmitted, 1);
+  assert.equal(d.responsesUnroutable, 0);
+  const md = renderReportMarkdown(report);
+  assert.match(md, /1 claim with UNANSWERED challenges: clm_0001/);
+  assert.match(md, /round 1: 2 challenges filed \(1 answered, 1 unanswered\)/);
+  assert.match(md, /never routed 2 \(unassigned 1, byte-dropped 1\)/);
+  assert.match(md, /responses routed 1, dropped 1, cap-omitted 1, unroutable 0/);
+  // The claim itself renders the challenge lifecycle with qualified ids.
+  assert.match(md, /ch-r1-a{32} — other by rev1, round 1: \*\*unanswered\*\*/);
+  assert.match(md, /ch-r1-b{32} — other by rev1, round 1: answered — defend by rev0/);
+});
+
+// ─── summary parity ──────────────────────────────────────────────────────────
+
+test('renderSummaryMarkdown: same severity/grade ordering, limitations never omitted', () => {
+  const claims = [
+    mkClaim('clm_0001', { severity: 'medium', grade: 'verified_defect' }),
+    mkClaim('clm_0002', { severity: 'medium', grade: 'speculative' }),
+    mkClaim('clm_0003', { severity: 'high', grade: 'unsupported' }),
+  ];
+  const report = buildCouncilReport({
+    ...mkInput(claims, [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]),
+    runnerLimitations: ['bounded discussion round'],
+  });
+  const sm = renderSummaryMarkdown(report);
+  const i3 = sm.indexOf('clm_0003');
+  const i1 = sm.indexOf('clm_0001');
+  const i2 = sm.indexOf('clm_0002');
+  // high/unsupported outranks medium/verified_defect outranks medium/speculative —
+  // identical to the full report's severity→grade→id ordering.
+  assert.ok(i3 > -1 && i1 > i3 && i2 > i1, 'summary ordering must match full report');
+  assert.match(sm, /Limitations:\n- \[runner\] bounded discussion round/);
+});
+
+test('renderSummaryMarkdown: >10 claims discloses the remainder', () => {
+  const claims = Array.from({ length: 12 }, (_, i) => mkClaim(`clm_${String(i).padStart(4, '0')}`));
+  const report = buildCouncilReport(mkInput(claims, [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]));
+  const sm = renderSummaryMarkdown(report);
+  assert.match(sm, /…and 2 more — see report\.md/);
+});
+
+test('buildCouncilReport: dedupeKey and rejectedEvidence provenance render on claims', () => {
+  const claim = mkClaim('clm_0001', { dedupeKey: 'defect|timeout missing', rejectedEvidence: 2 });
+  const report = buildCouncilReport(mkInput([claim], [mkParticipant(0, 'completed'), mkParticipant(1, 'completed')]));
+  const md = renderReportMarkdown(report);
+  assert.match(md, /- dedupe key: `defect\|timeout missing`/);
+  assert.match(md, /- rejected evidence items: 2/);
 });

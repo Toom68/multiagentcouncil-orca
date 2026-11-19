@@ -17,14 +17,17 @@ import { createHash } from 'node:crypto';
 
 import {
   SCHEMA_VERSION,
+  type CanonicalStrength,
   type Challenge,
   type ChallengeAssignment,
+  type ChallengeRoutingRecord,
   type Claim,
   type ClaimAssessment,
   type ClaimEvent,
   type ClaimId,
   type ClaimLedger,
   type ClaimView,
+  type DiscussionRoundFacts,
   type DissentRecord,
   type Evidence,
   type EvidenceGrade,
@@ -37,6 +40,7 @@ import {
   type Perspective,
   type PerspectiveId,
   type ResponseAssignment,
+  type ResponseRoutingRecord,
   type CouncilRunId,
   type Severity,
   type SourceSnapshot,
@@ -259,6 +263,17 @@ export interface LedgerBuild {
   ledger: ClaimLedger;
   /** Evidence pieces that failed validation (the claim itself is kept, downgraded). */
   evidenceRejections: (InvalidEvidence & { participantId: ParticipantId; findingId: FindingId })[];
+  /**
+   * Strengths whose ENTIRE evidence list failed citation validation — the
+   * strength is dropped (bare praise is never admitted) and the caller
+   * journals each rejection visibly. Partial failures keep surviving items.
+   */
+  strengthRejections: {
+    participantId: ParticipantId;
+    perspectiveId: PerspectiveId;
+    strengthId: string;
+    reason: string;
+  }[];
 }
 
 function event(
@@ -389,6 +404,7 @@ export function buildClaimLedger(
   const byKey = new Map<string, { claim: Claim; ranges: CitedRange[] }[]>();
   const provenance: Record<ClaimId, ParticipantId[]> = {};
   const evidenceRejections: LedgerBuild['evidenceRejections'] = [];
+  const strengthRejections: LedgerBuild['strengthRejections'] = [];
 
   const flat: { participantId: ParticipantId; perspectiveId: PerspectiveId; finding: Finding }[] = [];
   for (const a of admitted) {
@@ -429,6 +445,7 @@ export function buildClaimLedger(
       }
     }
     if (existing !== undefined && entryRanges !== undefined) {
+      existing.rejectedEvidence = (existing.rejectedEvidence ?? 0) + check.invalid.length + counterCheck.invalid.length;
       existing.sourceFindings.push({ participantId, findingId: finding.findingId });
       provenance[existing.claimId].push(participantId);
       const seenRange = new Set(entryRanges.map((r) => `${r.path}:${r.start}-${r.end}`));
@@ -498,7 +515,10 @@ export function buildClaimLedger(
         severity: finding.severity,
         confidence: finding.confidence,
       }],
+      dedupeKey: key,
     };
+    const rejected = check.invalid.length + counterCheck.invalid.length;
+    if (rejected > 0) claim.rejectedEvidence = rejected;
     const remedies: string[] = [];
     const openQuestions: string[] = [];
     unionStrings(remedies, finding.remedies, MAX_CLAIM_TEXT_ITEMS);
@@ -515,10 +535,33 @@ export function buildClaimLedger(
     claim.grade = deriveGrade(claim.evidence);
   }
 
-  return {
-    ledger: { schemaVersion: SCHEMA_VERSION, runId, claims, provenance },
-    evidenceRejections,
-  };
+  // Canonical strengths: optional, bounded (cap enforced at parse), runner-
+  // provenanced. Evidence is re-validated like findings — a strength whose
+  // entire evidence list fails citation checks is dropped, not admitted as
+  // bare praise; partial failures keep the surviving items.
+  const strengths: CanonicalStrength[] = [];
+  for (const a of [...admitted].sort((x, y) => x.participantId.localeCompare(y.participantId))) {
+    for (const s of [...(a.file.strengths ?? [])].sort((x, y) => x.strengthId.localeCompare(y.strengthId))) {
+      const check = validateEvidenceList(s.evidence, src);
+      for (const bad of check.invalid) {
+        evidenceRejections.push({ ...bad, participantId: a.participantId, findingId: s.strengthId });
+      }
+      if (check.valid.length === 0) {
+        strengthRejections.push({
+          participantId: a.participantId,
+          perspectiveId: a.perspectiveId,
+          strengthId: s.strengthId,
+          reason: 'all strength evidence failed citation validation — bare praise is never admitted',
+        });
+        continue;
+      }
+      strengths.push({ ...s, evidence: check.valid, participantId: a.participantId, perspectiveId: a.perspectiveId });
+    }
+  }
+
+  const ledger: ClaimLedger = { schemaVersion: SCHEMA_VERSION, runId, claims, provenance };
+  if (strengths.length > 0) ledger.strengths = strengths;
+  return { ledger, evidenceRejections, strengthRejections };
 }
 
 // ─── Claim projection and challenge assignment ───────────────────────────────
@@ -899,14 +942,27 @@ export function applyChallengesToLedger(
       claim.history.push(
         event(now, file.round, participantId, 'challenged', ch.argument, qid),
       );
+      // Qualified linkage every later stage can re-derive: challenge →
+      // dissent → response answer state, without trusting worker-local ids.
+      (claim.challenges ??= []).push({
+        challengeId: qid,
+        round: file.round,
+        challengerPid: participantId,
+        kind: ch.kind,
+        answered: false,
+      });
       const record: DissentRecord = {
         participantId,
         round: file.round,
         position: truncate(`challenge (${ch.kind}): ${ch.argument}`, DISSENT_POSITION_CHARS),
         ts: now.toISOString(),
+        challengeId: qid,
       };
       if (check.valid.length > 0) record.evidence = check.valid;
       claim.dissent.push(record);
+      if (check.invalid.length > 0) {
+        claim.rejectedEvidence = (claim.rejectedEvidence ?? 0) + check.invalid.length;
+      }
       if (ceDrop > 0) {
         claim.history.push(
           event(
@@ -1016,6 +1072,16 @@ export function applyResponsesToLedger(
       for (const bad of check.invalid) {
         evidenceRejections.push({ refId: qid, participantId, round: file.round, evidence: bad.evidence, reason: bad.reason });
       }
+      if (check.invalid.length > 0) {
+        claim.rejectedEvidence = (claim.rejectedEvidence ?? 0) + check.invalid.length;
+      }
+      // A filed response marks the challenge ANSWERED — never resolved. The
+      // challenger's dissent record stays live regardless of disposition.
+      const crec = claim.challenges?.find((c) => c.challengeId === qid);
+      if (crec !== undefined && !crec.answered) {
+        crec.answered = true;
+        crec.response = { participantId, disposition: res.disposition };
+      }
 
       switch (res.disposition) {
         case 'defend': {
@@ -1045,6 +1111,8 @@ export function applyResponsesToLedger(
           for (const bad of revCounter.invalid) {
             evidenceRejections.push({ refId: qid, participantId, round: file.round, evidence: bad.evidence, reason: bad.reason });
           }
+          const revRejected = revCheck.invalid.length + revCounter.invalid.length;
+          if (revRejected > 0) claim.rejectedEvidence = (claim.rejectedEvidence ?? 0) + revRejected;
           claim.title = revised.title;
           claim.kind = revised.kind;
           claim.severity = revised.severity;
@@ -1112,6 +1180,88 @@ export function orderedClaims(ledger: ClaimLedger): Claim[] {
       gradeRank(b.grade) - gradeRank(a.grade) ||
       a.claimId.localeCompare(b.claimId),
   );
+}
+
+// ─── Discussion routing records + accounting ────────────────────────────────
+
+/**
+ * Persist what the engine actually routed for a round's challenge envelopes:
+ * claim ids that reached an envelope, claim ids dropped by the byte bound,
+ * and claim ids that never got a challenger (no eligible seat / all at cap).
+ * Idempotent per round — a crash-replayed routing overwrites, not appends.
+ */
+export function recordChallengeRouting(
+  ledger: ClaimLedger,
+  round: number,
+  routing: ChallengeRoutingRecord,
+): void {
+  const discussion = (ledger.discussion ??= { rounds: [] });
+  const existing = discussion.rounds.find((r) => r.round === round);
+  if (existing === undefined) discussion.rounds.push({ round, challenges: routing });
+  else existing.challenges = routing;
+}
+
+/**
+ * Persist the round's response routing: challenge ids whose response
+ * assignment reached an author envelope, ids dropped by the byte bound, ids
+ * omitted by the per-seat response cap, and ids no author envelope could
+ * take. Creates a stub round when none exists so response omissions are
+ * never lost just because the challenge record is absent.
+ */
+export function recordResponseRouting(
+  ledger: ClaimLedger,
+  round: number,
+  routing: ResponseRoutingRecord,
+): void {
+  const discussion = (ledger.discussion ??= { rounds: [] });
+  let rec = discussion.rounds.find((r) => r.round === round);
+  if (rec === undefined) {
+    rec = { round, challenges: { routedClaimIds: [], byteDroppedClaimIds: [], unassigned: [] } };
+    discussion.rounds.push(rec);
+  }
+  rec.responses = routing;
+}
+
+/**
+ * Derive per-round discussion accounting for the report. Filed/answered/
+ * unanswered come from Claim.challenges; routed/never-routed/unassigned/
+ * byte-dropped/response-side omissions come from the persisted routing
+ * records — the four families are disjoint by construction. Answered means
+ * only "a response was filed", never "resolved": retained dissent lives in
+ * claim.dissent and is NOT subtracted from unresolved disagreement.
+ * Returns undefined when no routing records exist (pre-discussion ledgers).
+ */
+export function buildDiscussionAccounting(ledger: ClaimLedger): DiscussionRoundFacts[] | undefined {
+  const records = ledger.discussion?.rounds;
+  if (records === undefined || records.length === 0) return undefined;
+  const sorted = [...records].sort((a, b) => a.round - b.round);
+  return sorted.map((rec) => {
+    const filed = ledger.claims.flatMap((c) => (c.challenges ?? []).filter((ch) => ch.round === rec.round));
+    const answered = filed.filter((ch) => ch.answered).length;
+    const challengedClaims = new Set(
+      ledger.claims.filter((c) => (c.challenges ?? []).some((ch) => ch.round === rec.round)).map((c) => c.claimId),
+    );
+    const routed = new Set(rec.challenges.routedClaimIds);
+    const routedNoChallenge = [...routed].filter((id) => !challengedClaims.has(id)).length;
+    const unassigned = rec.challenges.unassigned.length;
+    const byteDropped = rec.challenges.byteDroppedClaimIds.length;
+    const resp = rec.responses;
+    return {
+      round: rec.round,
+      challengesFiled: filed.length,
+      challengesAnswered: answered,
+      challengesUnanswered: filed.length - answered,
+      claimsRouted: routed.size,
+      claimsRoutedNoChallenge: routedNoChallenge,
+      claimsNeverRouted: unassigned + byteDropped,
+      claimsUnassigned: unassigned,
+      claimsByteDropped: byteDropped,
+      responsesRouted: resp?.routedChallengeIds.length ?? 0,
+      responsesByteDropped: resp?.byteDropped.length ?? 0,
+      responsesCapOmitted: resp?.capOmitted.length ?? 0,
+      responsesUnroutable: resp?.unroutable.length ?? 0,
+    };
+  });
 }
 
 export function makeEnvelopeBase<T>(input: {
