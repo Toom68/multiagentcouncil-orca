@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -44,12 +44,14 @@ import {
   type CouncilReport,
 } from '../src/contracts.js';
 import { createEngine } from '../src/engine.js';
+import { INTEGRITY_POLICY, emptyIndex } from '../src/artifacts.js';
 import {
   canonicalRosterHash,
   err,
   parseChallengeEnvelope,
   resolveConfig,
 } from '../src/validation.js';
+import { qualifiedChallengeId } from '../src/claims.js';
 
 const RUN = 'crun_testrun';
 const AGENT: AgentChoice = { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' };
@@ -134,7 +136,7 @@ class FakeStore implements Store {
   async readArtifact(relPath: string) {
     const v = this.db.artifacts.get(relPath);
     return v === undefined
-      ? failRes(err('io_error', `artifact ${relPath} missing`))
+      ? failRes(err('io_error', `artifact ${relPath} missing`, { details: { reason: 'not_found', relPath } }))
       : ok(v);
   }
   async artifactExists(relPath: string) {
@@ -297,8 +299,15 @@ class FakeHost implements HostAdapter {
   settle(dispatchId: string, failed = false) {
     this.liveness.set(dispatchId, { liveness: 'finished', taskStatus: failed ? 'failed' : 'completed' });
   }
+  /**
+   * One-shot outcome overrides dequeued per call — plants 'unknown'/'refused'
+   * custody or a proven refusal for P-D4 custody assertions.
+   */
+  notificationResults: Result<{ outcome: 'sent' | 'unknown'; requestId?: string }>[] = [];
   async sendNotification(input: { to: string; subject: string; body: string }) {
     this.notifications.push(input);
+    const r = this.notificationResults.shift();
+    if (r !== undefined) return r;
     return ok({ outcome: 'sent' as const, requestId: `nreq_${this.notifications.length}` });
   }
   async requestStop(input: { dispatchId: string; reason: string }) {
@@ -373,6 +382,8 @@ interface Env {
   prompts: FakePrompts;
   db: FakeDb;
   clock: { t: number };
+  /** Optional per-seat findings override (default: `mkFindings` n=2). */
+  findingsFor?: (pid: string, persp: string) => object;
 }
 
 function makeEnv(
@@ -406,8 +417,30 @@ function makeEnv(
       phaseEnteredAt: new Date(clock.t).toISOString(),
       createdAt: new Date(clock.t).toISOString(),
     },
-    artifacts: new Map(),
-    journal: [],
+    // council.json — the run's immutable identity + integrity policy stamp,
+    // exactly what FileStore.initialize writes for a new (receipts-v1) run,
+    // plus the rebuildable empty receipt projection it seeds alongside.
+    artifacts: new Map([
+      ['council.json', JSON.stringify({
+        schemaVersion: SCHEMA_VERSION,
+        runId: RUN,
+        targetRoot,
+        objective: 'review the target project',
+        snapshotId: snapshot.snapshotId,
+        integrityPolicy: INTEGRITY_POLICY,
+        createdAt: new Date(clock.t).toISOString(),
+      })],
+      ['integrity/index.json', JSON.stringify(emptyIndex(RUN), null, 2) + '\n'],
+    ]),
+    // The genesis policy marker FileStore.initialize writes as journal seq 1 —
+    // every v1 journal carries it before any engine step runs.
+    journal: [{
+      seq: 1,
+      ts: new Date(clock.t).toISOString(),
+      type: 'run.initialized',
+      actor: 'engine',
+      payload: { runId: RUN, snapshotId: snapshot.snapshotId, integrity: INTEGRITY_POLICY },
+    } as JournalEvent],
     proposed: null,
     approved: null,
     approval: null,
@@ -575,7 +608,7 @@ async function drive(env: Env, stop?: () => boolean): Promise<AdvanceResult> {
         case 'organiser': json = mkProposal(env.db.state.config.requestedPerspectives); break;
         case 'independent_review': {
           const p = env.db.state.participants.find((x) => x.participantId === l.spec.participantId);
-          json = mkFindings(l.spec.participantId, p?.perspectiveId ?? 'persp_1');
+          json = (env.findingsFor ?? mkFindings)(l.spec.participantId, p?.perspectiveId ?? 'persp_1');
           break;
         }
         case 'scribe_notes': json = mkScribeNotes(); break;
@@ -685,6 +718,229 @@ test('full 15-seat lifecycle: organiser → gate → independent → scribe → 
   assert.ok(env.host.released.length >= 15, 'settled retained workers released');
 });
 
+test('default volume: 15 seats × 7 findings = 105 distinct claims, real byte/cap omissions, bounded strengths', async () => {
+  // Full default configuration — the required combined-volume case the first
+  // report omitted. NO budget is enlarged: envelope 8192, challenge/response
+  // caps 3, concurrency 5, rounds 1, maxLaunches 56, so byte-cap and per-seat
+  // omissions are exercised for real. Simulated host evidence only.
+  const env = makeEnv(configWith({}));
+  const cfg = env.db.state.config;
+  assert.equal(cfg.participants, 15);
+  assert.equal(cfg.requestedPerspectives, 15);
+  assert.equal(cfg.concurrency, 5);
+  assert.equal(cfg.rounds, 1);
+  assert.equal(cfg.envelopeBytes, 8192);
+  assert.equal(cfg.maxChallengesPerSeatPerRound, 3);
+  assert.equal(cfg.maxResponsesPerSeatPerRound, 3);
+  assert.equal(cfg.maxFindingsPerSeat, 7);
+  assert.equal(cfg.maxLaunches, 56);
+  // Every seat files the default 7 findings + one bounded, honestly-evidenced
+  // strength; rev_1 additionally files a phantom-evidence strength that must
+  // be rejected visibly rather than admitted as bare praise.
+  env.findingsFor = (pid, persp) => {
+    const f = mkFindings(pid, persp, 7) as { strengths?: object[] };
+    f.strengths = [{
+      strengthId: `S-${pid}`,
+      feature: `well-scoped ${pid} work`,
+      benefit: 'keeps the seat honest',
+      preserve: 'keep the evidence discipline',
+      evidence: [{ kind: 'reasoned', note: `reasoned by ${pid}` }],
+    }];
+    if (pid === 'rev_1') {
+      f.strengths.push({
+        strengthId: 'S-phantom',
+        feature: 'imaginary subsystem',
+        benefit: 'unverifiable praise',
+        preserve: 'none',
+        evidence: [{ kind: 'code_location', note: 'cited', path: 'src/ghost.js', startLine: 1 }],
+      });
+    }
+    return f;
+  };
+  await driveToApproval(env);
+  const ap = await env.engine.approve({
+    roster: mkApprovedRoster(env, Array.from({ length: 15 }, (_, i) => `persp_${i + 1}`)),
+    approver: 'test-orchestrator',
+  });
+  assert.ok(ap.ok);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  const state = env.db.state;
+  assert.equal(state.status, 'reported');
+
+  // ── Exact unique participants/attempts/tasks/launches ─────────────────────
+  assert.equal(state.consumption.launches, 48, 'organiser + 15×3 + scribe×2 within the 56 cap');
+  assert.equal(env.host.createTaskCalls, 48);
+  const pids = state.participants.map((p) => p.participantId);
+  assert.equal(new Set(pids).size, pids.length, 'no duplicate participant objects');
+  assert.equal(state.participants.length, 17, 'organiser + 15 reviewers + scribe');
+  const attempts = state.participants.flatMap((p) => p.attempts);
+  assert.equal(new Set(attempts.map((a) => a.attemptId)).size, attempts.length, 'no duplicate attempt ids');
+  assert.equal(new Set(attempts.map((a) => a.taskId)).size, 48, 'one task per attempt');
+  assert.equal(env.host.launches.length, 48);
+  assert.equal(
+    env.db.journal.filter((e) => e.type === 'launch.intent' && typeof e.payload?.launchIntentId === 'string').length,
+    48,
+    'one attempt-level intent per launch',
+  );
+  assert.equal(env.db.journal.filter((e) => e.type === 'worker.started').length, 48);
+
+  // Concurrency bound from durable evidence: at no journal point were more
+  // than `concurrency` workers live (started without a terminal record).
+  let live = 0;
+  let maxLive = 0;
+  const settled = new Set<string>();
+  for (const e of env.db.journal) {
+    if (e.type === 'worker.started' && typeof e.payload?.attemptId === 'string') {
+      if (!settled.has(e.payload.attemptId)) live += 1;
+    } else if (
+      (e.type === 'worker.settled' || e.type === 'worker.stopped' || e.type === 'worker.timed_out') &&
+      typeof e.payload?.attemptId === 'string' &&
+      !settled.has(e.payload.attemptId)
+    ) {
+      settled.add(e.payload.attemptId);
+      live -= 1;
+    }
+    if (live > maxLive) maxLive = live;
+  }
+  assert.ok(maxLive <= cfg.concurrency, `concurrency cap 5 exceeded: ${maxLive} workers live at once`);
+
+  // ── Every claim retained ──────────────────────────────────────────────────
+  const ledger = JSON.parse(env.db.artifacts.get('claims.json')!) as ClaimLedger;
+  assert.equal(ledger.claims.length, 105, '105 distinct findings admitted — caps may omit routing, never the claim');
+  const allClaimIds = new Set(ledger.claims.map((c) => c.claimId));
+  assert.equal(Object.keys(ledger.provenance).length, 105);
+  // 15 bounded strengths admitted with runner-stamped provenance; the phantom
+  // is a journaled rejection, not bare praise.
+  assert.equal(ledger.strengths?.length, 15);
+  assert.ok(
+    ledger.strengths!.every((s) => s.strengthId === `S-${s.participantId}`),
+    'runner stamps each strength with its admitting seat — never worker self-attribution',
+  );
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'artifact.rejected' && e.payload?.kind === 'strength' && e.payload?.strengthId === 'S-phantom'),
+    'phantom strength rejection journaled',
+  );
+
+  // ── Challenge routing: once per stage, disjoint families covering all claims
+  const rec = ledger.discussion?.rounds.find((x) => x.round === 1);
+  assert.ok(rec !== undefined && rec.challenges !== undefined && rec.responses !== undefined, 'one routing record with both stage families');
+  const routed = new Set(rec.challenges.routedClaimIds);
+  const byteDropped = new Set(rec.challenges.byteDroppedClaimIds);
+  const unassignedIds = rec.challenges.unassigned.map((u) => u.claimId);
+  const unassigned = new Set(unassignedIds);
+  assert.equal(unassignedIds.length, unassigned.size, 'no duplicate unassigned entries');
+  for (const cid of allClaimIds) {
+    const cover = (routed.has(cid) ? 1 : 0) + (byteDropped.has(cid) ? 1 : 0) + (unassigned.has(cid) ? 1 : 0);
+    assert.equal(cover, 1, `claim ${cid} must sit in exactly one challenge-routing family`);
+  }
+  // Plan math from the ACTUAL assignment: each of 105 single-author claims has
+  // 14 eligible challengers and seat capacity is 15×3=45 — so exactly 45 claims
+  // are plan-assigned and the remaining 60 are plan-unassigned, independently
+  // of any byte drops (which only ever shrink the routed subset).
+  const planAssigned = routed.size + byteDropped.size;
+  assert.equal(planAssigned, 45, 'every seat filled to the per-seat challenge cap');
+  assert.equal(unassigned.size, 60, 'remaining claims unassigned at default caps — the omission this test exists to see');
+  for (const u of rec.challenges.unassigned) {
+    assert.ok(typeof u.reason === 'string' && u.reason.length > 0, `unassigned ${u.claimId} carries its plan reason`);
+  }
+  // Per-envelope durable facts: ≤ cap assignments, ≤ envelopeBytes, and the
+  // union of journaled assignedIds equals the ledger's routed set exactly.
+  const envBuilt = env.db.journal.filter((e) => e.type === 'envelope.built' && e.phase === 'challenge');
+  assert.equal(envBuilt.length, 15, 'one challenge envelope per challenger seat');
+  const journaledRouted = new Set<string>();
+  for (const e of envBuilt) {
+    const ids = (e.payload?.assignedIds ?? []) as string[];
+    assert.ok(ids.length <= cfg.maxChallengesPerSeatPerRound, `${e.participantId} envelope above the challenge cap`);
+    for (const id of ids) journaledRouted.add(id);
+    const envPath = e.payload!.path as string;
+    const envFile = env.db.artifacts.get(envPath);
+    assert.ok(envFile !== undefined, `envelope artifact ${envPath} written`);
+    assert.ok(Buffer.byteLength(envFile) <= cfg.envelopeBytes, `envelope ${envPath} exceeds ${cfg.envelopeBytes} bytes`);
+    // Byte-dropped ids journaled on the same event must not overlap its assigned ids.
+    const omitted = (e.payload?.omitted ?? []) as string[];
+    for (const o of omitted) assert.ok(!ids.includes(o), `${envPath}: byte-dropped id also marked assigned`);
+  }
+  assert.deepEqual([...journaledRouted].sort(), [...routed].sort(), 'ledger routed == union of journaled assignedIds');
+  // Admitted challenges: one ChallengesFile per seat, ≤ cap entries each, and
+  // the total is exactly the routed set (workers filed everything assigned).
+  const chAdmits = env.db.journal.filter((e) => e.type === 'artifact.admitted' && e.phase === 'challenge');
+  assert.equal(chAdmits.length, 15);
+  const filedChallenges = new Map<string, string>(); // qualifiedId → claimId
+  let filedCount = 0;
+  for (const e of envBuilt) {
+    const pid = e.participantId!;
+    const file = JSON.parse(env.db.artifacts.get(outPaths.challengeOut(pid, 1))!) as { challenges: { challengeId: string; claimId: string }[] };
+    assert.ok(file.challenges.length <= cfg.maxChallengesPerSeatPerRound);
+    for (const ch of file.challenges) {
+      filedChallenges.set(qualifiedChallengeId(1, pid, ch.challengeId), ch.claimId);
+      filedCount += 1;
+    }
+  }
+  assert.equal(filedCount, routed.size, 'admitted challenges == routed claim count (nothing silently re-routed)');
+
+  // ── Response routing: qualified ids, partition over admitted challenges ────
+  const resp = rec.responses!;
+  const respRouted = new Set(resp.routedChallengeIds);
+  const capOmittedIds = new Set(resp.capOmitted.map((o) => o.challengeId));
+  const unroutableIds = new Set(resp.unroutable.map((u) => u.challengeId));
+  const respByteDroppedClaims = new Set(resp.byteDropped.map((b) => b.claimId));
+  for (const qid of respRouted) assert.match(qid, /^ch-r1-[0-9a-f]{32}$/, `qualified challenge id ${qid}`);
+  for (const [qid, claimId] of filedChallenges) {
+    const cover =
+      (respRouted.has(qid) ? 1 : 0) +
+      (capOmittedIds.has(qid) ? 1 : 0) +
+      (unroutableIds.has(qid) ? 1 : 0) +
+      (respByteDroppedClaims.has(claimId) ? 1 : 0);
+    assert.equal(cover, 1, `admitted challenge ${qid} in exactly one response-routing family`);
+  }
+  // Every response envelope honoured the author cap (challenges summed across
+  // its claim entries) and the byte cap.
+  const respBuilt = env.db.journal.filter((e) => e.type === 'envelope.built' && e.phase === 'author_response');
+  for (const e of respBuilt) {
+    const envFile = env.db.artifacts.get(e.payload!.path as string)!;
+    assert.ok(Buffer.byteLength(envFile) <= cfg.envelopeBytes, `response envelope ${e.payload!.path} exceeds byte cap`);
+    const parsed = JSON.parse(envFile) as { assignments: { challenges: unknown[] }[] };
+    const chCount = parsed.assignments.reduce((n, a) => n + a.challenges.length, 0);
+    assert.ok(chCount <= cfg.maxResponsesPerSeatPerRound, `${e.participantId} response envelope above the response cap`);
+  }
+
+  // ── Report, coverage, receipts, budgets ────────────────────────────────────
+  const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
+  assert.equal(report.coverage.selectedSeats, 15);
+  assert.equal(report.coverage.partial, false, 'all seats completed — coverage is genuine, not inflated');
+  assert.equal(report.claims.length, 105);
+  const dFacts = report.runnerFacts?.discussion;
+  assert.ok(dFacts !== undefined && dFacts.length === 1, 'report carries one round of discussion accounting');
+  const d = dFacts![0];
+  assert.equal(d.challengesFiled, filedCount);
+  assert.equal(d.claimsRouted, routed.size);
+  assert.equal(d.claimsNeverRouted, 60);
+  assert.equal(d.claimsUnassigned, 60);
+  assert.equal(d.claimsByteDropped, byteDropped.size);
+  assert.equal(d.challengesAnswered, respRouted.size, 'every routed challenge got a defend response');
+  assert.equal(d.challengesUnanswered, filedCount - respRouted.size);
+  assert.equal(d.responsesCapOmitted, capOmittedIds.size);
+  assert.equal(d.responsesUnroutable, unroutableIds.size);
+  // Managed artifacts are receipt-bound in the journal (exact bytes + marker).
+  const receipted = env.db.journal.filter(
+    (e) => e.payload?.integrity === 'receipts-v1' && typeof e.payload?.sha256 === 'string',
+  );
+  for (const path of ['report.json', 'claims.json', 'report.md']) {
+    assert.ok(
+      receipted.some((e) => e.payload?.path === path),
+      `managed artifact ${path} journaled with an exact-byte receipt`,
+    );
+  }
+  assert.ok(
+    envBuilt.every((e) => typeof e.payload?.sha256 === 'string'),
+    'every challenge envelope write carried its receipt fields',
+  );
+  // Budgets: launches within the computed cap; reviewer mail below per-target cap.
+  assert.ok(state.consumption.launches <= cfg.maxLaunches);
+  assert.ok(state.consumption.mailSent <= cfg.maxMailPerParticipant * 2, 'mail within bounded per-target budget');
+});
+
 test('reduced 2-seat lifecycle runs the same protocol at 9 launches', async () => {
   const env = makeEnv(configWith({ requestedPerspectives: 10, participants: 2 }));
   await driveToApproval(env);
@@ -694,6 +950,54 @@ test('reduced 2-seat lifecycle runs the same protocol at 9 launches', async () =
   const r = await drive(env);
   assert.equal(r.action, 'finished');
   assert.equal(env.db.state.consumption.launches, 9); // 1 + 2 + 1 + 2 + 2 + 1
+  const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
+  assert.equal(report.coverage.selectedSeats, 2);
+  assert.equal(report.coverage.partial, false);
+});
+
+test('rounds=2 lifecycle runs a second bounded discussion cycle before synthesis', async () => {
+  const env = makeEnv(configWith({ requestedPerspectives: 10, participants: 2, rounds: 2 }));
+  await driveToApproval(env);
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'orch' });
+  assert.ok(ap.ok);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  // 1 organiser + 2 independent + 1 scribe-notes + 2 rounds × (2 challenge +
+  // 2 response) + 1 synthesis = 13 launches, one task each.
+  assert.equal(env.db.state.consumption.launches, 13);
+  assert.equal(env.host.createTaskCalls, 13);
+  const taskIds = new Set(env.db.state.participants.flatMap((p) => p.attempts.map((a) => a.taskId)));
+  assert.equal(taskIds.size, 13, 'every phase attempt is a fresh orchestration task');
+  // Both rounds are journaled and each seat attempted each round exactly once.
+  for (const round of [1, 2]) {
+    for (const stage of ['challenges', 'responses']) {
+      assert.ok(
+        env.db.journal.some(
+          (e) => e.type === 'phase.entered' && e.payload?.status === 'discussing'
+            && e.payload?.round === round && e.payload?.stage === stage,
+        ),
+        `phase.entered discussing round ${round} stage ${stage} journaled`,
+      );
+    }
+    for (const pid of ['rev_1', 'rev_2']) {
+      for (const phase of ['challenge', 'author_response'] as const) {
+        const n = env.db.state.participants
+          .find((p) => p.participantId === pid)!
+          .attempts.filter((a) => a.phase === phase && a.round === round).length;
+        assert.equal(n, 1, `${pid} has exactly one ${phase} attempt in round ${round}`);
+      }
+      assert.ok(env.db.artifacts.has(outPaths.challengeEnv(pid, round)), `challenge envelope ${pid} r${round}`);
+      assert.ok(env.db.artifacts.has(outPaths.responseEnv(pid, round)), `response envelope ${pid} r${round}`);
+    }
+  }
+  // Routing is recorded once per stage per round — two round records, each
+  // carrying both the challenge and the response routing family.
+  const ledger = JSON.parse(env.db.artifacts.get('claims.json')!) as ClaimLedger;
+  assert.equal(ledger.discussion?.rounds.length, 2);
+  for (const rec of ledger.discussion!.rounds) {
+    assert.ok(rec.challenges !== undefined, `round ${rec.round} challenge routing recorded`);
+    assert.ok(rec.responses !== undefined, `round ${rec.round} response routing recorded`);
+  }
   const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
   assert.equal(report.coverage.selectedSeats, 2);
   assert.equal(report.coverage.partial, false);
@@ -1144,6 +1448,44 @@ test('deadline expiry marks the phase and continues with partial coverage', asyn
   assert.ok(st.ok);
   const lingering = st.value.participants.find((p) => p.participantId === indep[1].spec.participantId);
   assert.ok(lingering !== undefined && (lingering.status === 'timed_out' || lingering.status === 'failed'));
+});
+
+test('status returns read-only timing facts: phase/run elapsed, deadlines, journal-tail activity', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await env.engine.advance(); // organiser launched; status organising
+  const before = {
+    journalLen: env.db.journal.length,
+    tasks: env.host.createTaskCalls,
+    launches: env.host.launchCalls,
+  };
+  env.clock.t += 60_000;
+  const st = await env.engine.status();
+  assert.ok(st.ok);
+  const s = st.value;
+  // Phase timing: enteredAt persisted, elapsed measured against the clock,
+  // phase deadline + grace surfaced with remaining budget.
+  assert.equal(s.phaseTiming?.enteredAt, env.db.state.phaseEnteredAt);
+  assert.equal(s.phaseTiming?.elapsedMs, 60_000);
+  assert.equal(s.phaseTiming?.deadlineMs, env.db.state.config.deadlines.organiserMs);
+  assert.equal(s.phaseTiming?.graceMs, env.db.state.config.deadlines.graceMs);
+  assert.equal(s.phaseTiming?.remainingMs, env.db.state.config.deadlines.organiserMs - 60_000);
+  // Run timing from createdAt + runMs deadline.
+  assert.equal(s.runTiming?.createdAt, env.db.state.createdAt);
+  assert.equal(s.runTiming?.elapsedMs, 60_000);
+  assert.equal(s.runTiming?.deadlineMs, env.db.state.config.deadlines.runMs);
+  // lastActivity is the journal tail — a persisted-record fact, not liveness.
+  const tail = env.db.journal.at(-1)!;
+  assert.equal(s.lastActivity?.seq, tail.seq);
+  assert.equal(s.lastActivity?.type, tail.type);
+  // Active attempt detail identifies the live organiser dispatch.
+  const org = s.participants.find((p) => p.participantId === 'organiser')!;
+  assert.equal(org.activeAttemptDetail?.attemptId, 'att_organiser_organiser_r0_0');
+  assert.equal(org.activeAttemptDetail?.phase, 'organiser');
+  assert.ok(org.activeAttemptDetail?.dispatchId !== null);
+  // Read-only: the status call journaled nothing and mutated nothing.
+  assert.equal(env.db.journal.length, before.journalLen, 'status never writes journal events');
+  assert.equal(env.host.createTaskCalls, before.tasks);
+  assert.equal(env.host.launchCalls, before.launches);
 });
 
 // ─── Cancellation ────────────────────────────────────────────────────────────
@@ -2199,4 +2541,491 @@ test('RA-008: mail intent+outcome pair charges the cap once, not twice', async (
   await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
   assert.equal(env.host.notifications.length, 1, 'pair deduped — wake send fits under cap 2');
   assert.equal(env.db.state.consumption.mailSent, 2, 'seeded sent + wake sent');
+});
+
+test('lifecycle wakes reach the persisted recipient at stage, approval and completion — deduped, budget-free', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Operator captured the initiating orchestrator BEFORE any binding change
+  // — canonical destination progress/recipient.json (real file in runDir).
+  mkdirSync(join(env.db.runDir, 'progress'), { recursive: true });
+  writeFileSync(
+    join(env.db.runDir, 'progress/recipient.json'),
+    JSON.stringify({ schemaVersion: 1, to: 'term_orch_9', source: 'explicit', recordedAt: new Date(env.clock.t).toISOString() }),
+  );
+  await driveToApproval(env); // organiser launched + proposal admitted
+  assert.ok(
+    env.host.notifications.some((n) => n.to === 'term_orch_9'),
+    'stage wake delivered to the persisted recipient during organising',
+  );
+  const organisingWakes = env.host.notifications.filter((n) => n.to === 'term_orch_9').length;
+  // Repeating advance while the run sits in the same stage must not re-send —
+  // the outbox dedupes durably.
+  await env.engine.advance();
+  const afterIdle = env.host.notifications.filter((n) => n.to === 'term_orch_9').length;
+  assert.equal(afterIdle, organisingWakes, 'same-stage repeat is outbox-deduped, not re-mailed');
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(ap.ok);
+  assert.ok(
+    env.host.notifications.filter((n) => n.to === 'term_orch_9').length > organisingWakes,
+    'approval + independent-review stage wakes delivered',
+  );
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.ok(
+    env.host.notifications.some((n) => n.to === 'term_orch_9' && /succeeded|finished|report/i.test(n.subject + n.body)),
+    'completion wake delivered',
+  );
+  // Lifecycle wakes never touch the reviewer mail budget.
+  assert.equal(env.db.state.consumption.mailSent, 1, 'only the charged approval-wake mail counted');
+});
+
+// ─── P-D4: durable stage-wake recovery ──────────────────────────────────────
+//
+// The durable lifecycle record lives in events.jsonl; the send intent lives in
+// progress/outbox.json. A crash (or a pre-intent fs/lock failure) between the
+// state flush and the outbox write leaves the first without the second — the
+// engine must recompute the missing wakes on later calls, with their ORIGINAL
+// dedupe identity, never re-sending anything whose outcome is uncertain.
+
+function writeWakeRecipient(env: Env, to = 'term_orch_9') {
+  mkdirSync(join(env.db.runDir, 'progress'), { recursive: true });
+  writeFileSync(
+    join(env.db.runDir, 'progress/recipient.json'),
+    JSON.stringify({ schemaVersion: 1, to, source: 'explicit', recordedAt: new Date(env.clock.t).toISOString() }),
+  );
+}
+
+interface OutboxDelivery {
+  intentId: string;
+  kind: string;
+  stageKey: string;
+  delivery: string;
+  attempts: number;
+  subject: string;
+  body: string;
+}
+function outboxDeliveries(env: Env): OutboxDelivery[] {
+  const p = join(env.db.runDir, 'progress/outbox.json');
+  if (!existsSync(p)) return [];
+  return (JSON.parse(readFileSync(p, 'utf8')) as { deliveries?: OutboxDelivery[] }).deliveries ?? [];
+}
+
+test('P-D4: wakes lost between the state flush and the outbox intent are recovered from durable journal history', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Recipient absent: notify() returns no_recipient BEFORE persisting an
+  // intent — the durable state is identical to a crash between the flush and
+  // the outbox write: lifecycle records in the journal, nothing in the box.
+  await driveToApproval(env);
+  assert.equal(outboxDeliveries(env).length, 0, 'no intents exist without a recipient');
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'orch' });
+  assert.ok(ap.ok);
+  assert.equal(outboxDeliveries(env).length, 0, 'approval wake also lost pre-intent');
+
+  // The recipient appears — the next advance must catch up EVERY durable
+  // lifecycle record, not only the current stage.
+  writeWakeRecipient(env);
+  const r = await env.engine.advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? {} : r.error));
+  const ids = new Set(outboxDeliveries(env).map((d) => d.intentId));
+  for (const want of ['stage:initialized', 'stage:organising', 'stage:awaiting_approval', 'stage:independent_review']) {
+    assert.ok(ids.has(want), `catch-up intent ${want} created and sent`);
+  }
+  assert.ok([...ids].some((i) => i.startsWith('approval:')), 'approval wake recovered');
+  const woke = env.host.notifications.filter((n) => n.to === 'term_orch_9');
+  assert.ok(woke.length >= 5, 'every recovered milestone mailed');
+  // Catch-up is labelled historical and names the replayed durable record;
+  // the counts in the body are CURRENT persisted facts, never old numbers.
+  const recovered = woke.filter((n) => n.body.includes('replay: recovered'));
+  assert.ok(recovered.length >= 4, 'historical replays labelled as recovered/late');
+  assert.ok(
+    recovered.some((n) => n.body.includes('replayed milestone: stage:organising')),
+    'the replayed milestone is named explicitly by its durable intent id',
+  );
+
+  // Dedupe is durable: another advance at the same stage resends nothing.
+  const sent = env.host.notifications.length;
+  const idle = await env.engine.advance();
+  assert.ok(idle.ok);
+  assert.equal(env.host.notifications.length, sent, 'recovered wakes dedupe durably — no blind resend');
+});
+
+test('P-D4: a pre-intent progress-lock failure keeps wakes pending — journaled visibly, recovered next advance', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  writeWakeRecipient(env);
+  // Plant a live, unexpired outbox lock (our own pid is alive): notify cannot
+  // reach the intent phase at all — a pre-intent fs/lock Result failure.
+  const lockPath = join(env.db.runDir, 'progress/outbox.lock');
+  writeFileSync(lockPath, JSON.stringify({
+    pid: process.pid,
+    nonce: 'planted-holder',
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }));
+  const r = await env.engine.advance();
+  assert.ok(r.ok, 'a failed wake never fails the council step');
+  assert.equal(env.db.state.status, 'organising', 'the transition still persisted');
+  assert.equal(outboxDeliveries(env).length, 0, 'no intent could persist behind the held lock');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'error' && e.payload?.op === 'progress.drain'),
+    'the drain failure is journaled as a visible diagnostic',
+  );
+
+  // The lock clears — the recomputed backlog delivers on the next advance.
+  rmSync(lockPath);
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok);
+  const ids = new Set(outboxDeliveries(env).map((d) => d.intentId));
+  assert.ok(ids.has('stage:initialized') && ids.has('stage:organising'), 'the wakes held behind the lock are delivered');
+});
+
+test('P-D4: terminal drain recovers the whole backlog — discussion cursors keep their original round/stage keys', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal(env.db.state.status, 'reported');
+  assert.equal(outboxDeliveries(env).length, 0, 'the full lifecycle ran with no recipient — zero intents');
+
+  // A resume at terminal must drain every pending catch-up — there is no
+  // later advance to recompute it (historical replays bypass the module's
+  // terminal suppression; the finished wake is always attempted).
+  writeWakeRecipient(env);
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok);
+  const deliveries = outboxDeliveries(env);
+  assert.equal(
+    deliveries[0]?.intentId,
+    'finished:succeeded',
+    'the timely finished wake is attempted BEFORE the historical backlog',
+  );
+  const ids = new Set(deliveries.map((d) => d.intentId));
+  for (const want of [
+    'stage:initialized',
+    'stage:organising',
+    'stage:awaiting_approval',
+    'stage:independent_review',
+    'stage:scribe_notes',
+    'stage:discussing:r1:challenges',
+    'stage:discussing:r1:responses',
+    'stage:synthesising',
+    'finished:succeeded',
+  ]) {
+    assert.ok(ids.has(want), `recovered intent ${want} delivered post-terminal`);
+  }
+  assert.ok(
+    env.host.notifications.some((n) => n.body.includes('replayed milestone: stage:discussing:r1:challenges')),
+    'the challenge-stage replay names its own cursor — not the current discussion facts',
+  );
+  assert.ok(
+    env.host.notifications.some((n) => n.body.includes('replayed milestone: stage:discussing:r1:responses')),
+    'the response-stage replay names its own cursor',
+  );
+  assert.ok(
+    deliveries.every((d) => d.delivery === 'sent'),
+    'every recovered intent delivered — none stranded at terminal',
+  );
+});
+
+test('P-D4: a held progress lock records the finished wake attempted first — never silently skipped behind the backlog', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal(outboxDeliveries(env).length, 0, 'whole lifecycle ran with no recipient — full backlog pending');
+
+  // Recipient appears, then the outbox lock is held by a live owner: the
+  // finished wake must be the FIRST event attempted (never stranded behind
+  // up-to-64 catch-up events), and its failure must be journaled honestly.
+  writeWakeRecipient(env);
+  const lockPath = join(env.db.runDir, 'progress/outbox.lock');
+  writeFileSync(lockPath, JSON.stringify({
+    pid: process.pid,
+    nonce: 'planted-holder',
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }));
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok, 'a failed wake never fails the council step');
+  assert.equal(outboxDeliveries(env).length, 0, 'no intent persisted behind the held lock — nothing claimed delivered');
+  const diags = env.db.journal.filter((e) => e.type === 'error' && e.payload?.op === 'progress.drain');
+  assert.equal(diags.length, 2, 'the finished failure plus the deferred-backlog count — one bounded drain stop, not N lock waits');
+  assert.match(String(diags[0]!.payload?.detail), /^finished: io_error: timed out waiting for progress lock/, 'finished was attempted FIRST and its failure is the first diagnostic');
+  assert.match(String(diags[1]!.payload?.detail), /pending wake event\(s\) left deferred/, 'the un-attempted backlog is counted honestly, not silently dropped');
+
+  // Lock cleared — the next advance recovers finished AND the whole backlog.
+  rmSync(lockPath);
+  const r3 = await env.engine.advance();
+  assert.ok(r3.ok);
+  const ids = new Set(outboxDeliveries(env).map((d) => d.intentId));
+  assert.ok(ids.has('finished:succeeded') && ids.has('stage:discussing:r1:challenges') && ids.has('stage:organising'), 'finished plus backlog recovered once the lock clears');
+});
+
+test('P-D4: a blocked reason is journaled once and its wake is recoverable — never re-journaled while stuck', async () => {
+  const env = makeEnv({ ...configWith({ participants: 2, requestedPerspectives: 10 }), maxLaunches: 3 });
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'blocked', 'launch cap reached → blocked');
+  const markers = () => env.db.journal.filter((e) => e.type === 'error' && e.payload?.op === 'lifecycle.blocked');
+  assert.equal(markers().length, 1, 'the blocked reason is journaled durably, exactly once');
+
+  // Still stuck: the marker dedupes (no journal spam) and the current wake
+  // dedupes by reason hash once a recipient exists.
+  writeWakeRecipient(env);
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok);
+  assert.equal(r2.value.action, 'blocked', 'still blocked on the same reason');
+  const blocked = outboxDeliveries(env).filter((d) => d.kind === 'blocked');
+  assert.equal(blocked.length, 1, 'one blocked intent keyed by reason hash');
+  assert.match(blocked[0]!.intentId, /^blocked:[0-9a-f]{8}$/);
+  const mails = env.host.notifications.length;
+  const r3 = await env.engine.advance();
+  assert.ok(r3.ok);
+  assert.equal(markers().length, 1, 'the same blocked reason is not re-journaled');
+  assert.equal(env.host.notifications.length, mails, 'the same blocked reason is not re-mailed');
+});
+
+test('P-D4: an unknown-outcome send is retained as custody and never blindly resent', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  writeWakeRecipient(env);
+  // The first wake send's outcome is unproven — custody must stay 'unknown'.
+  env.host.notificationResults.push(ok({ outcome: 'unknown' }));
+  const r = await env.engine.advance();
+  assert.ok(r.ok);
+  const unknown = outboxDeliveries(env).find((d) => d.delivery === 'unknown');
+  assert.ok(unknown !== undefined, 'the unproven send is retained as unknown custody');
+  assert.equal(unknown.intentId, 'stage:organising', 'the first drained event — the timely current transition — took the planted outcome');
+  assert.equal(unknown.attempts, 1);
+
+  // Recomputed backlog replays hit the durable dedupe — 'unknown' is never
+  // retried (it may have landed).
+  const r2 = await env.engine.advance();
+  assert.ok(r2.ok);
+  const after = outboxDeliveries(env).find((d) => d.intentId === unknown.intentId);
+  assert.equal(after?.attempts, 1, 'unknown custody never re-sends');
+  assert.equal(after?.delivery, 'unknown');
+  // Meanwhile later stages still wake normally — the unknown custody does
+  // not wedge the drain.
+  assert.ok(
+    outboxDeliveries(env).some((d) => d.delivery === 'sent'),
+    'other intents still deliver',
+  );
+});
+
+test('strength with all-invalid evidence is rejected visibly; valid strengths reach the ledger', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // rev_1 files a findings carrying one unverifiable 'strength' (phantom
+  // code_location — liveSource is empty) and one honestly-evidenced one.
+  await env.engine.advance();
+  const rev1 = env.host.launches.find((l) => l.spec.participantId === 'rev_1')!;
+  const findings = mkFindings('rev_1', 'persp_1') as { strengths?: unknown[] };
+  findings.strengths = [
+    {
+      strengthId: 'S-phantom',
+      feature: 'imaginary subsystem',
+      benefit: 'unverifiable praise',
+      preserve: 'none',
+      evidence: [{ kind: 'code_location', note: 'cited', path: 'src/nope.js', startLine: 1 }],
+    },
+    {
+      strengthId: 'S-real',
+      feature: 'hash-bound approval',
+      benefit: 'the orchestrator can diff the approved roster exactly',
+      preserve: 'never weaken the binding',
+      evidence: [{ kind: 'reasoned', note: 'by design' }],
+    },
+  ];
+  await env.store.writeArtifact(outPaths.findings('rev_1'), JSON.stringify(findings));
+  env.host.settle(rev1.result.dispatchId!);
+  const r = await drive(env, () => env.db.state.status === 'scribe_notes' || env.db.state.status === 'discussing');
+  // The phantom strength was journaled as a strength rejection — never
+  // admitted as bare praise — while the evidenced strength reached the
+  // canonical ledger with runner-stamped provenance.
+  assert.ok(
+    env.db.journal.some(
+      (e) => e.type === 'artifact.rejected' && e.payload?.kind === 'strength' && e.payload?.strengthId === 'S-phantom',
+    ),
+    'phantom strength rejection journaled',
+  );
+  const ledger = JSON.parse(env.db.artifacts.get('claims.json')!) as ClaimLedger;
+  assert.equal(ledger.strengths?.length, 1);
+  assert.equal(ledger.strengths![0].strengthId, 'S-real');
+  assert.equal(ledger.strengths![0].participantId, 'rev_1', 'runner stamps provenance, not the worker');
+});
+
+/* ================= clm_0007: phase-entry append-ok/save-fail ====================
+ * The crash window the council reproduced: a phase-entering flush appends
+ * journal events (approval.granted / phase.entered) but saveState fails, so
+ * state.json stays behind the journal. The journal overlay then re-materializes
+ * the minted participants/attempts — and every state-side seed site must reuse
+ * them, not push duplicates. Retried operations must yield exactly one
+ * participant per id, one attempt per (participantId, phase, round), one task
+ * and one launch per seat. */
+
+const uniq = <T>(xs: T[]): T[] => [...new Set(xs)];
+
+const participantCounts = (env: Env): Map<string, number> => {
+  const m = new Map<string, number>();
+  for (const p of env.db.state.participants) m.set(p.participantId, (m.get(p.participantId) ?? 0) + 1);
+  return m;
+};
+
+const attemptCounts = (env: Env): Map<string, number> => {
+  const m = new Map<string, number>();
+  for (const p of env.db.state.participants) {
+    for (const a of p.attempts) m.set(a.attemptId, (m.get(a.attemptId) ?? 0) + 1);
+  }
+  return m;
+};
+
+test('clm_0007: retried approve after append-ok/save-fail → no duplicate seat/attempt/task/launch', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  const roster = mkApprovedRoster(env, ['persp_1', 'persp_2']);
+  // Reproduce: approval.granted + phase.entered journaled; saveState dies.
+  env.store.failNextSaveState = err('io_error', 'simulated crash: approval journaled, state save lost');
+  const r1 = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(!r1.ok, 'first approve dies at the save');
+  assert.ok(env.db.journal.some((e) => e.type === 'approval.granted'), 'grant durably journaled');
+  assert.equal(env.db.state.status, 'awaiting_approval', 'state.json stayed behind the journal');
+  // Retry — the journal proves the grant landed and seats were minted.
+  const r2 = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(r2.ok, JSON.stringify(r2.ok ? r2.value : r2.error));
+  const pids = participantCounts(env);
+  assert.deepEqual([...pids.keys()].sort(), ['organiser', 'rev_1', 'rev_2']);
+  assert.ok([...pids.values()].every((n) => n === 1), `duplicate participant objects: ${JSON.stringify([...pids])}`);
+  const aids = attemptCounts(env);
+  assert.ok(
+    [...aids.values()].every((n) => n === 1),
+    `duplicate attempt ids: ${JSON.stringify([...aids])}`,
+  );
+  for (const pid of ['rev_1', 'rev_2']) {
+    assert.equal(
+      env.db.state.participants.flatMap((p) => p.attempts.filter((a) => a.participantId === pid && a.phase === 'independent_review')).length,
+      1,
+      `exactly one independent_review attempt for ${pid}`,
+    );
+  }
+  // Advance — exactly one task and one launch per seat.
+  const adv = await env.engine.advance();
+  assert.ok(adv.ok, JSON.stringify(adv.ok ? adv.value : adv.error));
+  const launches = env.host.launches.filter((l) => l.spec.phase === 'independent_review');
+  assert.equal(launches.length, 2, `one launch per seat, got ${launches.length}`);
+  assert.equal(uniq(launches.map((l) => l.spec.participantId)).length, 2);
+  assert.equal(uniq(launches.map((l) => l.spec.taskId)).length, 2, 'one task per seat');
+  assert.equal(env.host.createTaskCalls, 3, 'organiser task + exactly one task per seat');
+});
+
+test('clm_0007: organiser phase-entry append-ok/save-fail → retried advance mints no duplicate organiser', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Crash window: the flush inside launchAttempt appends
+  // [task.created(run), phase.entered(organising), launch.intent(att)] — the
+  // SECOND saveState of the advance dies. Like a real process crash the
+  // failure is PERMANENT from that point (the error-path retry flush must
+  // die too); a one-shot failure would be healed by the retry and never
+  // reproduce the journal-ahead/state-behind gap.
+  let saves = 0;
+  const realSave = env.store.saveState.bind(env.store);
+  env.store.saveState = async (s) => {
+    if (++saves === 2) {
+      killPersistence(env, 'simulated crash: phase-entry journaled, state save lost');
+      return failRes(err('io_error', 'simulated crash: phase-entry journaled, state save lost'));
+    }
+    return realSave(s);
+  };
+  const r1 = await env.engine.advance();
+  assert.ok(!r1.ok, 'advance dies at the phase-entry save');
+  assert.equal(env.db.state.status, 'initialized', 'state.json stayed at initialized');
+  assert.ok(env.db.state.participants.length === 0, 'no participants persisted');
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'phase.entered' && e.payload?.status === 'organising'),
+    'phase.entered journaled',
+  );
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.attemptId === 'att_organiser_organiser_r0_0'),
+    'organiser attempt intent journaled',
+  );
+  // Retry on a fresh engine — the overlay re-materializes organiser+attempt;
+  // the re-entered step must reuse them.
+  env.store.saveState = realSave;
+  const r2 = await resume(env).advance();
+  assert.ok(r2.ok, JSON.stringify(r2.ok ? r2.value : r2.error));
+  const orgs = env.db.state.participants.filter((p) => p.participantId === 'organiser');
+  assert.equal(orgs.length, 1, `duplicate organiser participants: ${orgs.length}`);
+  assert.equal(
+    orgs[0]!.attempts.filter((a) => a.attemptId === 'att_organiser_organiser_r0_0').length,
+    1,
+    'exactly one organiser attempt id',
+  );
+  assert.equal(orgs[0]!.attempts.filter((a) => a.phase === 'organiser').length, 1, 'one organiser attempt');
+  // Journaled intent resolves by observation: one task, one launch total.
+  const orgLaunches = env.host.launches.filter((l) => l.spec.phase === 'organiser');
+  assert.equal(orgLaunches.length, 1, `organiser launched exactly once, got ${orgLaunches.length}`);
+  assert.equal(env.host.createTaskCalls, 1, 'exactly one task created');
+});
+
+test('clm_0007: challenge-entry append-ok/save-fail → no duplicate round attempts or envelopes', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  // Drive until challenge envelopes are built (state enters discussing), then
+  // simulate the crash: journal appended envelope.built + phase.entered but
+  // the save died — rewind state to the pre-entry snapshot.
+  await drive(env, () => env.db.state.status === 'discussing');
+  assert.equal(env.db.state.status, 'discussing');
+  const journaledEnvs = env.db.journal.filter((e) => e.type === 'envelope.built' && e.phase === 'challenge').length;
+  assert.ok(journaledEnvs >= 1, 'envelope.built journaled');
+  // Rewind durable state to before the transition (append-ok/save-fail).
+  env.db.state.status = 'scribe_notes';
+  env.db.state.discussion = null;
+  for (const p of env.db.state.participants) {
+    p.attempts = p.attempts.filter((a) => a.phase !== 'challenge');
+  }
+  // Re-enter: overlay re-mints challenge attempts; the step must reuse them.
+  const r = await resume(env).advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  const aids = attemptCounts(env);
+  assert.ok([...aids.values()].every((n) => n === 1), `duplicate attempt ids: ${JSON.stringify([...aids])}`);
+  for (const pid of ['rev_1', 'rev_2']) {
+    const n = env.db.state.participants.flatMap((p) =>
+      p.attempts.filter((a) => a.participantId === pid && a.phase === 'challenge' && a.round === 1),
+    ).length;
+    assert.ok(n <= 1, `${pid} has ${n} challenge attempts for round 1 — duplicate stage mint`);
+  }
+});
+
+test('clm_0020: rejected organiser output launches the journaled repair attempt, not a stale "cancel and restart"', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  // Settle the organiser with an INVALID proposal — admission rejects it and
+  // mints exactly one corrective attempt in the same pass.
+  await env.engine.advance(); // organiser launched
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  const orig = org.attempts[0]!;
+  await env.store.writeArtifact(outPaths.organiser, JSON.stringify({ not: 'a roster' }));
+  env.host.settle(orig.dispatchId!);
+  const r = await env.engine.advance();
+  assert.ok(r.ok, JSON.stringify(r.ok ? r.value : r.error));
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'artifact.rejected' && e.payload?.attemptId === orig.attemptId),
+    'rejection journaled',
+  );
+  // Re-derive: saveState swaps the whole durable state clone — `org` from
+  // before the advance is stale and never sees the minted repair.
+  const org2 = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  const repair = org2.attempts.find((a) => a.attemptId === 'att_organiser_organiser_r0_1');
+  assert.ok(repair !== undefined, 'corrective attempt minted');
+  // The SAME advance must launch the repair — not block on the stale
+  // settled_ok reference of the rejected original.
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.attemptId === repair.attemptId),
+    `repair launched immediately, status ${repair.status}`,
+  );
+  assert.notEqual(r.value.action, 'blocked', 'must not stale-block on the rejected attempt');
+  // Repair produces a valid proposal → run reaches the approval gate.
+  const r2 = await drive(env);
+  assert.equal(r2.action, 'needs_approval', JSON.stringify(r2));
 });

@@ -152,7 +152,19 @@ test('initialize writes stable artifacts and a valid initial state', async () =>
   const meta = JSON.parse(readFileSync(path.join(runDir, STORE_PATHS.council), 'utf8'));
   assert.equal(meta.runId, RUN_ID);
   assert.equal(readFileSync(path.join(runDir, STORE_PATHS.objective), 'utf8'), `${OBJECTIVE}\n`);
-  assert.equal(readFileSync(path.join(runDir, STORE_PATHS.journal), 'utf8'), '');
+  // Journal is born with the genesis integrity marker as seq 1 (v1 runs are
+  // never both non-empty and unmarked — see src/artifacts.ts policy rules).
+  const journalLines = readFileSync(path.join(runDir, STORE_PATHS.journal), 'utf8')
+    .trim()
+    .split('\n');
+  assert.equal(journalLines.length, 1);
+  const genesis = JSON.parse(journalLines[0]);
+  assert.equal(genesis.seq, 1);
+  assert.equal(genesis.type, 'run.initialized');
+  assert.equal(genesis.payload.integrity, 'receipts-v1');
+  assert.equal(genesis.payload.runId, RUN_ID);
+  assert.equal(genesis.payload.snapshotId, snapshot.snapshotId);
+  assert.equal(genesis.prevHash, undefined, 'chain head carries no prevHash');
 
   const store = createStore({ runDir });
   const state = await store.loadState();
@@ -194,7 +206,9 @@ test('a fresh store on the same dir loads persisted state and journal', async ()
   assert.ok(state.ok);
   const journal = await reopened.readJournal();
   assert.ok(journal.ok);
-  assert.deepEqual(journal.value.map((e) => e.seq), [1, 2]);
+  assert.deepEqual(journal.value.map((e) => e.seq), [1, 2, 3]);
+  assert.equal(journal.value[0].type, 'run.initialized');
+  assert.equal(journal.value[0].payload?.integrity, 'receipts-v1');
 });
 
 test('snapshot target mismatch is refused at initialize', async () => {
@@ -315,21 +329,22 @@ test('journal appends are sequential and hash-linked', async () => {
   const { store } = await initStore(runDir);
   const a = await store.appendJournal([ev('run.initialized'), ev('phase.entered', 'engine')]);
   assert.ok(a.ok);
-  assert.deepEqual(a.value.map((e) => e.seq), [1, 2]);
-  assert.equal(a.value[0].prevHash, undefined);
+  assert.deepEqual(a.value.map((e) => e.seq), [2, 3]);
+  assert.equal(a.value[0].prevHash, lineHashOf(readFileSync(path.join(runDir, STORE_PATHS.journal), 'utf8').split('\n')[0]));
   const b = await store.appendJournal([ev('artifact.written')]);
   assert.ok(b.ok);
-  assert.equal(b.value[0].seq, 3);
+  assert.equal(b.value[0].seq, 4);
 
   const lines = readFileSync(path.join(runDir, STORE_PATHS.journal), 'utf8')
     .trim()
     .split('\n');
-  assert.equal(lines.length, 3);
+  assert.equal(lines.length, 4);
   assert.equal(JSON.parse(lines[1]).prevHash, lineHashOf(lines[0]));
   assert.equal(JSON.parse(lines[2]).prevHash, lineHashOf(lines[1]));
+  assert.equal(JSON.parse(lines[3]).prevHash, lineHashOf(lines[2]));
   const all = await store.readJournal();
   assert.ok(all.ok);
-  assert.equal(all.value.length, 3);
+  assert.equal(all.value.length, 4);
 });
 
 test('writeFully completes short writes and fails on a stalled handle', async () => {
@@ -372,10 +387,10 @@ test('concurrent appends across store instances lose no events', async () => {
   for (const r of results) assert.ok(r.ok, JSON.stringify(r));
   const all = await store.readJournal();
   assert.ok(all.ok);
-  assert.equal(all.value.length, 24);
+  assert.equal(all.value.length, 25);
   assert.deepEqual(
     all.value.map((e) => e.seq),
-    Array.from({ length: 24 }, (_, i) => i + 1),
+    Array.from({ length: 25 }, (_, i) => i + 1),
     'contiguous seq under concurrency',
   );
   const is = new Set<number>();
@@ -451,7 +466,7 @@ test('journal events failing schema validation are rejected before writing', asy
   assert.equal(r.error.code, 'schema_invalid');
   const all = await store.readJournal();
   assert.ok(all.ok);
-  assert.equal(all.value.length, 0, 'nothing appended');
+  assert.equal(all.value.length, 1, 'only the genesis marker — nothing appended');
 });
 
 // ─── locking ─────────────────────────────────────────────────────────────────
@@ -476,7 +491,7 @@ test('withLock serializes mutations; internal appends run under the outer lock',
   assert.ok(a.ok && b.ok);
   assert.deepEqual(order, ['a-start', 'a-end', 'b'], 'second withLock waited');
   const all = await store.readJournal();
-  assert.ok(all.ok && all.value.length === 1);
+  assert.ok(all.ok && all.value.length === 2); // genesis marker + appended event
 });
 
 test('journal appends inside a lock session cannot interleave with outside appends', async () => {
@@ -497,10 +512,10 @@ test('journal appends inside a lock session cannot interleave with outside appen
   for (const r of siblings) assert.ok(r.ok, JSON.stringify(r));
   const all = await store.readJournal();
   assert.ok(all.ok);
-  assert.equal(all.value.length, 4);
+  assert.equal(all.value.length, 5); // genesis marker + 4 appended
   assert.deepEqual(
     all.value.map((e) => e.seq),
-    [1, 2, 3, 4],
+    [1, 2, 3, 4, 5],
     'seq stayed contiguous across lock boundary',
   );
 });
@@ -748,4 +763,36 @@ test('verifySourceSnapshot reports manifest tampering and id mismatch', async ()
   r = await store.verifySourceSnapshot();
   assert.ok(!r.ok);
   assert.equal(r.error.details?.reason, 'manifest_integrity');
+});
+
+// ─── integrity policy marker + index (src/artifacts.ts seam) ────────────────
+
+test('initialize stamps integrityPolicy and an empty receipt index', async () => {
+  const runDir = path.join(tmp(), 'run');
+  await initStore(runDir);
+  const meta = JSON.parse(readFileSync(path.join(runDir, STORE_PATHS.council), 'utf8'));
+  assert.equal(meta.integrityPolicy, 'receipts-v1');
+  const indexPath = path.join(runDir, STORE_PATHS.integrityIndex);
+  assert.ok(existsSync(indexPath), 'integrity/index.json must exist at init');
+  const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+  assert.equal(index.policy, 'receipts-v1');
+  assert.equal(index.runId, RUN_ID);
+  assert.deepEqual(index.entries, {});
+});
+
+test('initialize refuses to clobber a stray integrity index', async () => {
+  const runDir = path.join(tmp(), 'run');
+  const { targetRoot, snapshot } = await makeTarget();
+  mkdirSync(path.join(runDir, 'integrity'), { recursive: true });
+  writeFileSync(path.join(runDir, 'integrity', 'index.json'), '{}');
+  const store = createStore({ runDir });
+  const r = await store.initialize({
+    runId: RUN_ID,
+    targetRoot,
+    objective: OBJECTIVE,
+    config: config(),
+    snapshot,
+  });
+  assert.ok(!r.ok);
+  assert.equal(r.error.details?.reason, 'already_initialized');
 });

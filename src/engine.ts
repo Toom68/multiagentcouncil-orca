@@ -46,6 +46,7 @@ import {
   type Participant,
   type ParticipantId,
   type Perspective,
+  type PerspectiveId,
   type PhaseAttempt,
   type PhaseKind,
   type ProposedRoster,
@@ -57,6 +58,8 @@ import {
   type SourceSnapshot,
   type Store,
   type TaskListRow,
+  type TerminalCreateIntent,
+  type TerminalCreateReceipt,
   type WorkerListRow,
 } from './contracts.js';
 import {
@@ -67,6 +70,7 @@ import {
   err,
   parseApprovedRoster,
   parseChallengesFile,
+  parseClaimLedger,
   parseFindingsFile,
   parseProposedRoster,
   parseReportFile,
@@ -74,6 +78,21 @@ import {
   parseScribeNotesFile,
 } from './validation.js';
 import * as validationNs from './validation.js';
+import {
+  collectReceipts,
+  INTEGRITY_POLICY,
+  integrityPolicy,
+  journalHasPolicyMarker,
+  noteReceipt,
+  readVerifiedArtifact,
+  receiptJournalFields,
+  recordManagedWrite,
+  resolveIntegrityPolicy,
+  type ArtifactReceipt,
+  type IntegrityPolicy,
+  type ReceiptCategory,
+} from './artifacts.js';
+import { createProgressNotifier, type ProgressEvent } from './progress.js';
 import {
   applyChallengesToLedger,
   applyResponsesToLedger,
@@ -85,6 +104,8 @@ import {
   fitEnvelope,
   indexAdmittedChallenges,
   makeEnvelopeBase,
+  recordChallengeRouting,
+  recordResponseRouting,
   type AdmittedFinding,
   type SourceAccess,
 } from './claims.js';
@@ -204,6 +225,16 @@ interface StepCtx {
   taskCreateStage: Map<AttemptId, 'issued' | 'refused'>;
   workerLaunchStage: Map<AttemptId, 'issued' | 'refused'>;
   /**
+   * Same durable chronology for the terminal-create INSIDE launchWorker —
+   * journaled by the adapter's custody callbacks, so a crash mid-launch
+   * leaves the pre-attach resource visible and never licenses a blind
+   * second create. 'issued' ⇒ intent journaled or outcome uncertain;
+   * 'refused' ⇒ a definitive no-effect refusal was receipted.
+   */
+  terminalCreateStage: Map<AttemptId, 'issued' | 'refused'>;
+  /** Journaled terminal identities retained per attempt (pre-attach custody). */
+  terminalCustody: Map<AttemptId, { handle: string; requestId?: string }>;
+  /**
    * Launch-protocol version per attempt (max `v` on attempt-level
    * launch.intent events). v≥2 intents participate in the stage-marker
    * scheme; absent/lower means the attempt was journaled by a runner without
@@ -220,6 +251,38 @@ interface StepCtx {
   approvedRoster?: ApprovedRoster;
   /** Drift verdict cached once per advance — never re-scans per launch. */
   driftResult?: Result<SnapshotDrift>;
+  /**
+   * Resolved artifact-integrity policy for this run (marker agreement across
+   * council.json + journal). 'receipts-v1' runs mint/verify exact-byte
+   * receipts; 'legacy' runs stay honest and untracked — never retro-minted.
+   */
+  integrity: IntegrityPolicy;
+  /**
+   * Journal-authoritative receipt map (collectReceipts over events.jsonl).
+   * Updated in-step from the exact bytes held at mint/write time — never
+   * re-read from disk. An index-only orphan is invisible here, which is the
+   * point: only journaled receipts authorize anything.
+   */
+  receipts: Map<string, ArtifactReceipt>;
+  /**
+   * Envelope authorization, journal-derived: path → the claim/challenge ids
+   * the runner assigned when the envelope was built. NEVER re-derived from
+   * the worker-editable envelope file.
+   */
+  envelopeAssigned: Map<string, string[]>;
+  /** Envelope.built events that predate assignedIds journaling (legacy). */
+  legacyEnvelopes: Set<string>;
+  /** Journal-error details already emitted (anomaly dedupe across rebuilds). */
+  journaledErrors: Set<string>;
+  /**
+   * Durable lifecycle records from events.jsonl — phase.entered /
+   * approval.granted / run.finished / lifecycle.blocked error markers — in
+   * journal order. This is the P-D4 wake catch-up source: a stage whose
+   * progress intent was lost (crash or pre-intent failure between the state
+   * flush and the outbox write) is recovered by replaying these entries with
+   * their ORIGINAL dedupe identity, never guessed state.
+   */
+  lifecycleJournal: JournalEvent[];
 }
 
 /** Corrective-attempt context handed to the spec builders (RepairContext). */
@@ -299,6 +362,118 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const abs = (rel: string): string => join(store.runDir, rel);
 
+  // ── Managed-artifact integrity (receipts-v1) ───────────────────────────────
+  //
+  // Write order for every managed write: bytes → integrity index → journal
+  // event carrying receiptJournalFields → flush (journal + state). The
+  // journal is authoritative; the index is its projection. A crash between
+  // index record and flush leaves an index-only orphan — invisible to the
+  // journal-authoritative ctx.receipts map — which idempotent replay heals
+  // (identical bytes re-record to the same receipt).
+
+  /**
+   * Runner-managed write with an exact-byte receipt on v1; plain write on
+   * legacy runs (they stay honestly untracked). Returns the minted receipt
+   * so the caller can merge receiptJournalFields into its journal event.
+   */
+  const mintedWrite = async (
+    ctx: StepCtx,
+    rel: string,
+    bytes: string,
+    category: ReceiptCategory,
+  ): Promise<Result<{ receipt?: ArtifactReceipt }>> => {
+    if (ctx.integrity !== 'receipts-v1') {
+      const w = await store.writeArtifact(rel, bytes);
+      if (!w.ok) return w as Result<never>;
+      return ok({});
+    }
+    const r = await recordManagedWrite(store, rel, bytes, category, {
+      prior: ctx.receipts,
+      now: ctx.now,
+    });
+    if (!r.ok) return r as Result<never>;
+    // Fold the returned receipt into the working journal-authoritative map
+    // from the bytes at hand — never a re-read (no read/write race).
+    ctx.receipts.set(rel, r.value.receipt);
+    if (r.value.indexAnomaly !== undefined) {
+      emit(ctx, 'error', { op: 'integrity-index', detail: r.value.indexAnomaly });
+    }
+    return ok({ receipt: r.value.receipt });
+  };
+
+  /**
+   * Read a managed artifact and verify exact bytes against the
+   * journal-authoritative receipt map. 'ok' or legacy-'untracked' pass;
+   * 'mismatch'/'missing'/v1-'untracked' are visible integrity violations —
+   * the caller journals + fails closed, never silently downgrades.
+   */
+  const verifiedRead = async (
+    ctx: StepCtx,
+    rel: string,
+  ): Promise<Result<{ text: string; verdict: 'ok' | 'mismatch' | 'missing' | 'untracked' }>> => {
+    const v = await readVerifiedArtifact(store, rel, { receipts: ctx.receipts });
+    if (!v.ok) return v as Result<never>;
+    const status = v.value.verdict.status;
+    if (
+      status === 'ok' ||
+      (status === 'untracked' && ctx.integrity !== 'receipts-v1')
+    ) {
+      return ok({ text: v.value.text, verdict: status });
+    }
+    return failRes(
+      err('untrusted_output', `integrity verification failed for ${rel}: ${status}`, {
+        details: {
+          reason: 'integrity_violation',
+          path: rel,
+          verdict: status,
+          ...(v.value.verdict.actualSha256 !== undefined ? { actualSha256: v.value.verdict.actualSha256 } : {}),
+          ...(v.value.verdict.receipt !== undefined ? { recordedSha256: v.value.verdict.receipt.sha256 } : {}),
+        },
+      }),
+    );
+  };
+
+  const integrityViolation = (ctx: StepCtx, rel: string, e: CouncilError): void => {
+    emit(ctx, 'error', {
+      op: 'integrity-verify',
+      path: rel,
+      detail: e.message,
+      ...(typeof e.details?.verdict === 'string' ? { verdict: e.details.verdict } : {}),
+    });
+  };
+
+  /**
+   * Envelope authorization — journaled assignedIds only (never worker-
+   * editable envelope bytes). A journaled envelope.built without assignedIds
+   * is a legacy artifact: verify its bytes on v1, pass through on legacy.
+   * Absent envelope ⇒ nothing was ever assigned ⇒ empty set.
+   */
+  const envelopeAssignedIds = async (ctx: StepCtx, envRel: string): Promise<Result<Set<string>>> => {
+    const journaled = ctx.envelopeAssigned.get(envRel);
+    if (journaled !== undefined) return ok(new Set(journaled));
+    if (ctx.legacyEnvelopes.has(envRel)) {
+      const v = await verifiedRead(ctx, envRel);
+      if (!v.ok) return v as Result<never>;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(v.value.text);
+      } catch {
+        return failRes(err('untrusted_output', `legacy envelope ${envRel} is not valid JSON`));
+      }
+      const assignments = (raw as { assignments?: unknown[] }).assignments ?? [];
+      const out = new Set<string>();
+      for (const a of assignments) {
+        const o = a as { claimId?: unknown; challenges?: { challengeId?: unknown }[] };
+        if (typeof o.claimId === 'string') out.add(o.claimId);
+        for (const c of o.challenges ?? []) {
+          if (typeof c.challengeId === 'string') out.add(c.challengeId);
+        }
+      }
+      return ok(out);
+    }
+    return ok(new Set());
+  };
+
   // ── Participant / attempt helpers ──────────────────────────────────────────
 
   const findParticipant = (state: CouncilState, pid: ParticipantId): Participant | undefined =>
@@ -348,6 +523,33 @@ export function createEngine(deps: EngineDeps): Engine {
     p.attempts.push(attempt);
     return attempt;
   };
+
+  /**
+   * Idempotent stage-entry mints (clm_0007): every phase-entry seed site
+   * creates exactly ONE base participant/attempt per id/tuple — but after an
+   * append-ok/save-fail the journal overlay has already re-materialized them.
+   * Pushing a second participant object or minting a second base attempt is
+   * the exact defect the council reproduced (duplicate task+launch per seat).
+   * Repair/fallback mints stay the ONLY legitimate extra attempts per tuple
+   * and never go through these helpers.
+   */
+  const ensureParticipant = (
+    state: CouncilState,
+    pid: ParticipantId,
+    role: Participant['role'],
+    agent: AgentChoice,
+    seatId: string | null,
+    perspectiveId: string | null,
+  ): Participant => {
+    const existing = findParticipant(state, pid);
+    if (existing !== undefined) return existing;
+    const p = makeParticipant(pid, role, agent, seatId, perspectiveId);
+    state.participants.push(p);
+    return p;
+  };
+
+  const ensureStageAttempt = (p: Participant, phase: PhaseKind, round: number | null): PhaseAttempt =>
+    attemptsFor(p, phase, round)[0] ?? addPlannedAttempt(p, phase, round);
 
   /**
    * Attempts occupying a concurrency slot: any whose worker might still be
@@ -1037,6 +1239,27 @@ export function createEngine(deps: EngineDeps): Engine {
       if (st !== 'uncertain') {
         return resumeOk('no-issue-marker', { op: 'worker-launch', detail: st === 'never' ? 'v2 intent proves launchWorker was never issued' : 'journaled definitive refusal resolves launch outcome' });
       }
+      // Terminal-create custody refinement (journaled BEFORE the mutation by
+      // the adapter callback): a refused create proves the launch produced
+      // no worker and no pre-attach resource — re-issuing is not a blind
+      // duplicate. A created/uncertain receipt means the terminal may be
+      // live: its handle is durable evidence, adopted into custody below,
+      // and a missing dispatch keeps the attempt blocked — never re-create.
+      const tcStage = ctx.terminalCreateStage.get(attempt.attemptId);
+      if (tcStage === 'refused') {
+        return resumeOk('terminal-create-refused', {
+          op: 'worker-launch',
+          detail: 'journaled terminal-create refusal proves no worker and no terminal landed — safe to re-issue launchWorker',
+        });
+      }
+      const custody = ctx.terminalCustody.get(attempt.attemptId);
+      if (custody !== undefined && attempt.terminalHandle === null) {
+        attempt.terminalHandle = custody.handle;
+        if (p.retainedTerminal === null) p.retainedTerminal = custody.handle;
+        if (attempt.requestId === undefined && custody.requestId !== undefined) {
+          attempt.requestId = custody.requestId;
+        }
+      }
       if (typeof host.listWorkers !== 'function') {
         return block('worker-launch outcome unobservable (adapter lacks listWorkers)', { op: 'worker-launch' });
       }
@@ -1212,9 +1435,13 @@ export function createEngine(deps: EngineDeps): Engine {
       };
     }
     const specRel = paths.spec(attempt.attemptId);
-    const w = await store.writeArtifact(specRel, built.spec);
+    const w = await mintedWrite(ctx, specRel, built.spec, 'runner');
     if (!w.ok) return { kind: 'task_error', error: w.error };
-    emit(ctx, 'artifact.written', { path: specRel, kind: 'spec' }, { participantId: p.participantId, phase: attempt.phase });
+    emit(ctx, 'artifact.written', {
+      path: specRel,
+      kind: 'spec',
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    }, { participantId: p.participantId, phase: attempt.phase });
 
     if (attempt.taskId === null) {
       if (ctx.taskCreateFailed.has(attempt.attemptId)) {
@@ -1295,6 +1522,63 @@ export function createEngine(deps: EngineDeps): Engine {
       agent: p.agent,
       retainTerminal: true,
       ...(reuse !== undefined ? { reuseTerminal: reuse } : {}),
+      custody: {
+        // Durable stages around the terminal-create INSIDE this launch —
+        // intent flushes before the mutation, the returned/refused/uncertain
+        // identity flushes after. A mid-launch crash leaves pre-attach
+        // custody visible and never authorizes a blind second create.
+        beforeTerminalCreate: async (intent) => {
+          emit(ctx, 'launch.intent', {
+            attemptId: attempt.attemptId,
+            stage: 'terminal-create',
+            intentId: intent.intentId,
+            title: intent.title,
+            worktree: intent.worktree,
+            command: intent.command,
+          }, { participantId: p.participantId, phase: attempt.phase });
+          ctx.terminalCreateStage.set(attempt.attemptId, 'issued');
+          return await flush(ctx);
+        },
+        afterTerminalCreate: async (receipt) => {
+          if (receipt.outcome === 'created' && receipt.terminalHandle !== undefined) {
+            ctx.terminalCustody.set(attempt.attemptId, {
+              handle: receipt.terminalHandle,
+              ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+            });
+            attempt.terminalHandle = receipt.terminalHandle;
+            if (p.retainedTerminal === null) p.retainedTerminal = receipt.terminalHandle;
+            emit(ctx, 'task.created', {
+              attemptId: attempt.attemptId,
+              scope: 'terminal',
+              terminalHandle: receipt.terminalHandle,
+              intentId: receipt.intentId,
+              taskId: receipt.taskId,
+              ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+            }, { participantId: p.participantId, phase: attempt.phase });
+          } else {
+            const uncertain = receipt.outcome !== 'refused';
+            ctx.terminalCreateStage.set(attempt.attemptId, uncertain ? 'issued' : 'refused');
+            if (receipt.terminalHandle !== undefined) {
+              ctx.terminalCustody.set(attempt.attemptId, {
+                handle: receipt.terminalHandle,
+                ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+              });
+              attempt.terminalHandle = receipt.terminalHandle;
+              if (p.retainedTerminal === null) p.retainedTerminal = receipt.terminalHandle;
+            }
+            emit(ctx, 'error', {
+              op: 'terminal-create',
+              attemptId: attempt.attemptId,
+              uncertain,
+              intentId: receipt.intentId,
+              detail: receipt.detail ?? `terminal create ${receipt.outcome}`,
+              ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+              ...(receipt.terminalHandle !== undefined ? { terminalHandle: receipt.terminalHandle } : {}),
+            }, { participantId: p.participantId, phase: attempt.phase });
+          }
+          return await flush(ctx);
+        },
+      },
     });
     if (!launch.ok) {
       emit(ctx, 'error', {
@@ -1389,11 +1673,11 @@ export function createEngine(deps: EngineDeps): Engine {
 
   // ── Artifact admission ─────────────────────────────────────────────────────
 
-  const readJson = async (rel: string): Promise<{ ok: true; value: unknown } | { ok: false; reason: string }> => {
+  const readJson = async (rel: string): Promise<{ ok: true; value: unknown; text: string } | { ok: false; reason: string }> => {
     const r = await store.readArtifact(rel);
     if (!r.ok) return { ok: false, reason: `missing/unreadable: ${r.error.message}` };
     try {
-      return { ok: true, value: JSON.parse(r.value) };
+      return { ok: true, value: JSON.parse(r.value), text: r.value };
     } catch (e) {
       return { ok: false, reason: `malformed JSON: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -1460,7 +1744,7 @@ export function createEngine(deps: EngineDeps): Engine {
       return undefined;
     }
     const rel = `rejected/${attempt.attemptId}__${outRel.split('/').pop()}`;
-    const w = await store.writeArtifact(rel, existing.value);
+    const w = await mintedWrite(ctx, rel, existing.value, 'archive');
     if (!w.ok) {
       emit(ctx, 'error', {
         op: 'rejected-preserve',
@@ -1469,7 +1753,12 @@ export function createEngine(deps: EngineDeps): Engine {
       }, { participantId: attempt.participantId, phase: attempt.phase });
       return undefined;
     }
-    emit(ctx, 'artifact.written', { path: rel, kind: 'rejected-archive', supersedes: outRel }, {
+    emit(ctx, 'artifact.written', {
+      path: rel,
+      kind: 'rejected-archive',
+      supersedes: outRel,
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    }, {
       participantId: attempt.participantId,
       phase: attempt.phase,
     });
@@ -1504,10 +1793,15 @@ export function createEngine(deps: EngineDeps): Engine {
       issues,
       diagnostics: diag,
     }, null, 2);
-    const dw = await store.writeArtifact(diagRel, diagJson);
+    const dw = await mintedWrite(ctx, diagRel, diagJson, 'archive');
     const issuesRef = dw.ok ? diagRel : undefined;
     if (dw.ok) {
-      emit(ctx, 'artifact.written', { path: diagRel, kind: 'rejection-diagnostics', supersedes: outRel }, {
+      emit(ctx, 'artifact.written', {
+        path: diagRel,
+        kind: 'rejection-diagnostics',
+        supersedes: outRel,
+        ...(dw.value.receipt !== undefined ? receiptJournalFields(dw.value.receipt) : {}),
+      }, {
         participantId: attempt.participantId,
         phase: attempt.phase,
       });
@@ -1557,34 +1851,43 @@ export function createEngine(deps: EngineDeps): Engine {
     });
   };
 
-  const admit = (ctx: StepCtx, attempt: PhaseAttempt, path: string): void => {
+  /**
+   * Admit a validated worker output: on v1, receipt the EXACT text bytes
+   * just parsed (never a re-read) so every later consumption verifies
+   * against the journaled hash. The receipt rides the artifact.admitted
+   * event — journal-authoritative, like every other durable fact.
+   */
+  const admit = async (
+    ctx: StepCtx,
+    attempt: PhaseAttempt,
+    path: string,
+    rawText: string,
+  ): Promise<Result<void>> => {
+    let receipt: ArtifactReceipt | undefined;
+    if (ctx.integrity === 'receipts-v1') {
+      const r = await noteReceipt(store, path, rawText, 'worker_output', {
+        prior: ctx.receipts,
+        now: ctx.now,
+      });
+      if (!r.ok) return r as Result<never>;
+      receipt = r.value.receipt;
+      ctx.receipts.set(path, receipt);
+      if (r.value.indexAnomaly !== undefined) {
+        emit(ctx, 'error', { op: 'integrity-index', detail: r.value.indexAnomaly });
+      }
+    }
     attempt.artifacts.push(path);
     ctx.artifacts.push(path);
-    emit(ctx, 'artifact.admitted', { attemptId: attempt.attemptId, path }, {
+    emit(ctx, 'artifact.admitted', {
+      attemptId: attempt.attemptId,
+      path,
+      ...(receipt !== undefined ? receiptJournalFields(receipt) : {}),
+    }, {
       participantId: attempt.participantId,
       phase: attempt.phase,
       ...(attempt.round !== null ? { round: attempt.round } : {}),
     });
-  };
-
-  /** Claim ids this attempt was assigned (from the envelope we wrote). */
-  const assignedClaimIds = async (path: string): Promise<Set<string>> => {
-    const r = await readJson(path);
-    if (!r.ok) return new Set();
-    const assignments = (r.value as { assignments?: { claimId?: string }[] }).assignments ?? [];
-    return new Set(assignments.map((a) => a.claimId).filter((x): x is string => typeof x === 'string'));
-  };
-
-  /** Challenge ids assigned to this author (flattened over its assignments). */
-  const assignedChallengeIds = async (path: string): Promise<Set<string>> => {
-    const r = await readJson(path);
-    if (!r.ok) return new Set();
-    const assignments = (r.value as { assignments?: { challenges?: { challengeId?: string }[] }[] }).assignments ?? [];
-    const out = new Set<string>();
-    for (const a of assignments) for (const c of a.challenges ?? []) {
-      if (typeof c.challengeId === 'string') out.add(c.challengeId);
-    }
-    return out;
+    return ok(undefined);
   };
 
   /**
@@ -1621,7 +1924,8 @@ export function createEngine(deps: EngineDeps): Engine {
             };
             const w = await store.writeProposedRoster(roster);
             if (!w.ok) return w;
-            admit(ctx, attempt, outPath);
+            const a0 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a0.ok) return a0;
             emit(ctx, 'roster.proposed', { perspectives: roster.perspectives.length });
             state.status = 'awaiting_approval';
             state.phaseEnteredAt = ctx.now.toISOString();
@@ -1639,7 +1943,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a1 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a1.ok) return a1;
             break;
           }
           case 'scribe_notes': {
@@ -1651,7 +1956,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a2 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a2.ok) return a2;
             break;
           }
           case 'challenge': {
@@ -1665,8 +1971,14 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            const allowed = await assignedClaimIds(paths.challengeEnv(p.participantId, attempt.round ?? 1));
-            const bad = parsed.value.challenges.filter((c) => !allowed.has(c.claimId));
+            // Authorization is journal-derived (journaled assignedIds from
+            // envelope.built) — never the worker-editable envelope bytes.
+            const allowed = await envelopeAssignedIds(ctx, paths.challengeEnv(p.participantId, attempt.round ?? 1));
+            if (!allowed.ok) {
+              integrityViolation(ctx, paths.challengeEnv(p.participantId, attempt.round ?? 1), allowed.error);
+              return allowed as Result<never>;
+            }
+            const bad = parsed.value.challenges.filter((c) => !allowed.value.has(c.claimId));
             const ids = parsed.value.challenges.map((c) => c.challengeId);
             const dup = ids.length !== new Set(ids).size;
             if (bad.length > 0 || dup) {
@@ -1676,7 +1988,8 @@ export function createEngine(deps: EngineDeps): Engine {
               });
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a3 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a3.ok) return a3;
             break;
           }
           case 'author_response': {
@@ -1690,15 +2003,20 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
-            const allowed = await assignedChallengeIds(paths.responseEnv(p.participantId, attempt.round ?? 1));
-            const bad = parsed.value.responses.filter((r) => !allowed.has(r.challengeId));
+            const allowed = await envelopeAssignedIds(ctx, paths.responseEnv(p.participantId, attempt.round ?? 1));
+            if (!allowed.ok) {
+              integrityViolation(ctx, paths.responseEnv(p.participantId, attempt.round ?? 1), allowed.error);
+              return allowed as Result<never>;
+            }
+            const bad = parsed.value.responses.filter((r) => !allowed.value.has(r.challengeId));
             if (bad.length > 0) {
               await rejectOutput(ctx, p, attempt, outPath, {
                 unassignedChallengeIds: bad.map((r) => r.challengeId),
               });
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a4 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a4.ok) return a4;
             break;
           }
           case 'scribe_synthesis': {
@@ -1724,7 +2042,8 @@ export function createEngine(deps: EngineDeps): Engine {
               await rejectOutput(ctx, p, attempt, outPath, issues);
               break;
             }
-            admit(ctx, attempt, outPath);
+            const a5 = await admit(ctx, attempt, outPath, raw.text);
+            if (!a5.ok) return a5;
             break;
           }
         }
@@ -1733,34 +2052,146 @@ export function createEngine(deps: EngineDeps): Engine {
     return ok(undefined);
   };
 
-  /** Read back every admitted file of a phase (trusted, engine-admitted). */
-  const admittedFiles = async <T>(
+  /**
+   * Typed re-parse of an admitted artifact — never an unchecked cast. Same
+   * parser/options admission used, so a file that no longer parses is a
+   * visible corruption, not silent data loss.
+   */
+  const reparseAdmitted = (
     state: CouncilState,
+    p: Participant,
+    a: PhaseAttempt,
+    raw: unknown,
+  ): Result<unknown> => {
+    switch (a.phase) {
+      case 'organiser':
+        return parseProposedRoster(raw, {
+          runId: state.runId,
+          requestedPerspectives: state.config.requestedPerspectives,
+        }) as Result<unknown>;
+      case 'independent_review':
+        return parseFindingsFile(raw, {
+          runId: state.runId,
+          participantId: p.participantId,
+          perspectiveId: p.perspectiveId ?? undefined,
+          maxFindings: state.config.maxFindingsPerSeat,
+        }) as Result<unknown>;
+      case 'scribe_notes':
+        return parseScribeNotesFile(raw, { runId: state.runId, participantId: p.participantId }) as Result<unknown>;
+      case 'challenge':
+        return parseChallengesFile(raw, {
+          runId: state.runId,
+          round: a.round ?? undefined,
+          participantId: p.participantId,
+          max: state.config.maxChallengesPerSeatPerRound,
+        }) as Result<unknown>;
+      case 'author_response':
+        return parseResponsesFile(raw, {
+          runId: state.runId,
+          round: a.round ?? undefined,
+          participantId: p.participantId,
+          max: state.config.maxResponsesPerSeatPerRound,
+        }) as Result<unknown>;
+      case 'scribe_synthesis': {
+        const syn = (validationNs as {
+          parseSynthesisFile?: (
+            v: unknown,
+            o: { runId: string; participantId?: string },
+          ) => { ok: true; value: unknown } | { ok: false; issues?: unknown[] };
+        }).parseSynthesisFile?.(raw, { runId: state.runId, participantId: p.participantId });
+        if (syn !== undefined && syn.ok) return ok(syn.value);
+        return parseReportFile(raw, { runId: state.runId }) as Result<unknown>;
+      }
+    }
+  };
+
+  /**
+   * Read back every admitted file of a phase, verifying exact bytes against
+   * the journaled receipts (v1) and re-parsing typed — a file that verifies
+   * clean but no longer parses is corruption, both fail visibly.
+   */
+  const admittedFiles = async <T>(
+    ctx: StepCtx,
     phase: PhaseKind,
     round: number | null,
-  ): Promise<{ participantId: ParticipantId; file: T }[]> => {
-    const out: { participantId: ParticipantId; file: T }[] = [];
+  ): Promise<Result<{ participantId: ParticipantId; perspectiveId: PerspectiveId | undefined; file: T }[]>> => {
+    const { state } = ctx;
+    const out: { participantId: ParticipantId; perspectiveId: PerspectiveId | undefined; file: T }[] = [];
     for (const p of state.participants) {
       for (const a of attemptsFor(p, phase, round)) {
         for (const rel of a.artifacts) {
-          const raw = await readJson(rel);
-          if (raw.ok) out.push({ participantId: p.participantId, file: raw.value as T });
+          const v = await verifiedRead(ctx, rel);
+          if (!v.ok) {
+            integrityViolation(ctx, rel, v.error);
+            return v as Result<never>;
+          }
+          let raw: unknown;
+          try {
+            raw = JSON.parse(v.value.text);
+          } catch (e) {
+            return failRes(err('io_error', `admitted artifact ${rel} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`));
+          }
+          const parsed = reparseAdmitted(state, p, a, raw);
+          if (!parsed.ok) {
+            emit(ctx, 'error', {
+              op: 'admitted-reparse',
+              path: rel,
+              attemptId: a.attemptId,
+              detail: `admitted artifact ${rel} failed re-parse — corruption between admission and consumption`,
+            }, { participantId: p.participantId, phase: a.phase });
+            return failRes(
+              err('untrusted_output', `admitted artifact ${rel} failed typed re-parse`, {
+                details: { reason: 'admitted_reparse_failed', path: rel, attemptId: a.attemptId },
+              }),
+            );
+          }
+          out.push({ participantId: p.participantId, perspectiveId: p.perspectiveId ?? undefined, file: parsed.value as T });
         }
       }
     }
-    return out;
+    return ok(out);
   };
 
-  const readLedger = async (state: CouncilState): Promise<ClaimLedger | null> => {
-    const raw = await readJson(paths.ledger);
-    return raw.ok ? (raw.value as ClaimLedger) : null;
+  /**
+   * The canonical ledger is a managed artifact: verified bytes (v1) plus
+   * typed re-parse — null only when claims.json was never written.
+   */
+  const readLedger = async (ctx: StepCtx): Promise<Result<ClaimLedger | null>> => {
+    const exists = await store.artifactExists(paths.ledger);
+    if (!exists.ok) return exists as Result<never>;
+    if (!exists.value) return ok(null);
+    const v = await verifiedRead(ctx, paths.ledger);
+    if (!v.ok) {
+      integrityViolation(ctx, paths.ledger, v.error);
+      return v as Result<never>;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(v.value.text);
+    } catch (e) {
+      return failRes(err('io_error', `claims.json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`));
+    }
+    const parsed = parseClaimLedger(raw, { runId: ctx.state.runId });
+    if (!parsed.ok) {
+      return failRes(
+        err('schema_invalid', 'claims.json failed typed re-parse', {
+          issues: parsed.issues,
+          details: { reason: 'ledger_reparse_failed', path: paths.ledger },
+        }),
+      );
+    }
+    return ok(parsed.value);
   };
 
-  const writeLedger = async (ctx: StepCtx, ledger: ClaimLedger): Promise<Result<void>> => {
-    const w = await store.writeArtifact(paths.ledger, JSON.stringify(ledger, null, 2));
-    if (!w.ok) return w;
-    emit(ctx, 'claim.updated', { claims: ledger.claims.length });
-    return ok(undefined);
+  const writeLedger = async (ctx: StepCtx, ledger: ClaimLedger): Promise<Result<{ receipt?: ArtifactReceipt }>> => {
+    const w = await mintedWrite(ctx, paths.ledger, JSON.stringify(ledger, null, 2), 'ledger');
+    if (!w.ok) return w as Result<never>;
+    emit(ctx, 'claim.updated', {
+      claims: ledger.claims.length,
+      path: paths.ledger,
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    });
+    return ok({ receipt: w.value.receipt });
   };
 
   const sourceAccess = (state: CouncilState, snapshot: SourceSnapshot): SourceAccess => ({
@@ -1858,9 +2289,8 @@ export function createEngine(deps: EngineDeps): Engine {
         ...(run.value.requestId !== undefined ? { requestId: run.value.requestId } : {}),
       });
     }
-    const organiser = makeParticipant(ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
-    state.participants.push(organiser);
-    addPlannedAttempt(organiser, 'organiser', null);
+    const organiser = ensureParticipant(state, ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
+    ensureStageAttempt(organiser, 'organiser', null);
     state.status = 'organising';
     state.phaseEnteredAt = ctx.now.toISOString();
     emit(ctx, 'phase.entered', { status: 'organising' });
@@ -1874,7 +2304,6 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const p = findParticipant(state, ORGANISER_PID);
     if (p === undefined) return { kind: 'error', error: err('invalid_transition', 'organiser participant missing') };
-    const attempt = attemptsFor(p, 'organiser', null).at(-1)!;
     await reconcileAttempts(ctx);
     if (await enforceDeadlines(ctx)) {
       return advanceResult('finished', state.status, undefined, { outcome: 'failed' });
@@ -1885,6 +2314,10 @@ export function createEngine(deps: EngineDeps): Engine {
     if (statusAfter === 'awaiting_approval') {
       return advanceResult('needs_approval', statusAfter, 'roster proposed — approve the exact seats/agents/config to launch reviewers');
     }
+    // Re-derive AFTER admission (clm_0020): a rejection this pass may have
+    // minted the corrective repair attempt — following the stale rejected
+    // reference would block on 'settled_ok' instead of launching the repair.
+    const attempt = attemptsFor(p, 'organiser', null).at(-1)!;
     switch (attempt.status) {
       case 'planned':
       case 'intent_recorded': {
@@ -1964,7 +2397,9 @@ export function createEngine(deps: EngineDeps): Engine {
     }
 
     // Barrier: phase closed. Build the canonical ledger from admitted findings.
-    const admittedFindings = await admittedFiles<FindingsFile>(state, 'independent_review', null);
+    const af = await admittedFiles<FindingsFile>(ctx, 'independent_review', null);
+    if (!af.ok) return { kind: 'error', error: af.error };
+    const admittedFindings = af.value;
     const rejected = all.filter((a) => ctx.rejectedAttempts.has(a.attemptId) || a.status === 'settled_failed' || a.status === 'timed_out' || a.status === 'unknown');
     const lingering = all.filter((a) => a.status === 'unknown');
     for (const a of lingering) {
@@ -2001,12 +2436,29 @@ export function createEngine(deps: EngineDeps): Engine {
         reason: rej.reason,
       });
     }
-    emit(ctx, 'artifact.written', { path: paths.ledger, claims: build.ledger.claims.length });
+    // Strengths carry the same evidence/citation rules as findings — a
+    // strength whose whole evidence list fails is dropped visibly, never
+    // admitted as bare praise.
+    for (const rej of build.strengthRejections) {
+      emit(ctx, 'artifact.rejected', {
+        kind: 'strength',
+        participantId: rej.participantId,
+        perspectiveId: rej.perspectiveId,
+        strengthId: rej.strengthId,
+        reason: rej.reason,
+      });
+    }
+    emit(ctx, 'artifact.written', {
+      path: paths.ledger,
+      claims: build.ledger.claims.length,
+      ...(build.ledger.strengths !== undefined ? { strengths: build.ledger.strengths.length } : {}),
+      ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+    });
 
-    // Enter scribe-notes phase with a fresh, distinct scribe participant.
-    const scribe = makeParticipant(SCRIBE_PID, 'scribe', staffAgent(state, 'scribe'), null, null);
-    state.participants.push(scribe);
-    addPlannedAttempt(scribe, 'scribe_notes', null);
+    // Enter scribe-notes phase with a fresh, distinct scribe participant —
+    // reusing the overlay-minted one after append-ok/save-fail (clm_0007).
+    const scribe = ensureParticipant(state, SCRIBE_PID, 'scribe', staffAgent(state, 'scribe'), null, null);
+    ensureStageAttempt(scribe, 'scribe_notes', null);
     state.status = 'scribe_notes';
     state.phaseEnteredAt = ctx.now.toISOString();
     emit(ctx, 'phase.entered', { status: 'scribe_notes' });
@@ -2028,8 +2480,9 @@ export function createEngine(deps: EngineDeps): Engine {
     if (p === undefined) return { kind: 'error', error: err('invalid_transition', 'scribe participant missing') };
     const attempt = attemptsFor(p, 'scribe_notes', null).at(-1)!;
     if (attempt.status === 'planned' || attempt.status === 'intent_recorded') {
-      const admitted = await admittedFiles<FindingsFile>(state, 'independent_review', null);
-      ctx.admittedFindingsPaths = admitted.map((f) => abs(paths.findingsOut(f.file.participantId)));
+      const admitted = await admittedFiles<FindingsFile>(ctx, 'independent_review', null);
+      if (!admitted.ok) return { kind: 'error', error: admitted.error };
+      ctx.admittedFindingsPaths = admitted.value.map((f) => abs(paths.findingsOut(f.file.participantId)));
       const lo = await launchAttempt(ctx, p, attempt);
       if (lo.kind === 'launched') return advanceResult('progress', state.status, 'scribe notes launched');
       if (lo.kind === 'failed') return blocked(state.status, 'scribe notes launch failed; reconcile');
@@ -2051,8 +2504,10 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const enterChallengeStage = async (ctx: StepCtx, round: number): Promise<StepResult> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at discussion entry') };
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at discussion entry') };
+    const ledger = ledgerR.value;
     const proposedR = await store.readProposedRoster();
     const perspectives = new Map<string, Perspective>(
       (proposedR.ok ? proposedR.value.perspectives : []).map((p) => [p.perspectiveId, p]),
@@ -2075,32 +2530,63 @@ export function createEngine(deps: EngineDeps): Engine {
     });
 
     let total = 0;
+    const routedClaimIds: string[] = [];
+    const byteDroppedClaimIds: string[] = [];
     for (const [pid, assignments] of plan.assignments) {
       if (assignments.length === 0) continue;
       const p = findParticipant(state, pid)!;
-      const base = makeEnvelopeBase<ChallengeAssignment>({
-        runId: state.runId,
-        phase: 'challenge',
-        round,
-        recipientId: pid,
-        outputPath: paths.challengeOut(pid, round),
-        outputContract: 'ChallengesFile',
-      });
-      const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
       const envRel = paths.challengeEnv(pid, round);
-      const w = await store.writeArtifact(envRel, JSON.stringify(fit.envelope, null, 2));
-      if (!w.ok) return { kind: 'error', error: w.error };
-      emit(ctx, 'envelope.built', {
-        path: envRel,
-        recipientId: pid,
-        round,
-        assigned: fit.envelope.assignments.length,
-        omitted: [...fit.omitted.map((a) => a.claimId), ...plan.unassigned.map((u) => u.claimId)],
-        bytes: fit.bytes,
-      }, { participantId: pid, phase: 'challenge', round });
-      addPlannedAttempt(p, 'challenge', round);
-      total += fit.envelope.assignments.length;
+      const alreadyBuilt = ctx.envelopeAssigned.has(envRel);
+      if (alreadyBuilt) {
+        // Replay: the journaled envelope.built is the durable plan. Never
+        // rewrite — on v1 verify the file against its journaled receipt
+        // (tamper/deletion is visible, not silently healed).
+        const v = await verifiedRead(ctx, envRel);
+        if (!v.ok) {
+          integrityViolation(ctx, envRel, v.error);
+          return { kind: 'error', error: v.error };
+        }
+        routedClaimIds.push(...ctx.envelopeAssigned.get(envRel)!);
+      } else {
+        const base = makeEnvelopeBase<ChallengeAssignment>({
+          runId: state.runId,
+          phase: 'challenge',
+          round,
+          recipientId: pid,
+          outputPath: paths.challengeOut(pid, round),
+          outputContract: 'ChallengesFile',
+        });
+        const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
+        const assignedIds = fit.envelope.assignments.map((a) => a.claimId);
+        const w = await mintedWrite(ctx, envRel, JSON.stringify(fit.envelope, null, 2), 'envelope');
+        if (!w.ok) return { kind: 'error', error: w.error };
+        emit(ctx, 'envelope.built', {
+          path: envRel,
+          recipientId: pid,
+          round,
+          assigned: fit.envelope.assignments.length,
+          assignedIds,
+          omitted: fit.omitted.map((a) => a.claimId),
+          bytes: fit.bytes,
+          ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+        }, { participantId: pid, phase: 'challenge', round });
+        ctx.envelopeAssigned.set(envRel, assignedIds);
+        routedClaimIds.push(...assignedIds);
+        byteDroppedClaimIds.push(...fit.omitted.map((a) => a.claimId));
+      }
+      ensureStageAttempt(p, 'challenge', round);
+      total += ctx.envelopeAssigned.get(envRel)!.length;
     }
+    // Routing record ONCE per stage — routed/byte-dropped/unassigned are
+    // disjoint families; persisted into the ledger so the report can
+    // distinguish never-routed from examined claims (clm_0016).
+    recordChallengeRouting(ledger, round, {
+      routedClaimIds: [...new Set(routedClaimIds)],
+      byteDroppedClaimIds: [...new Set(byteDroppedClaimIds)],
+      unassigned: plan.unassigned.map((u) => ({ claimId: u.claimId, reason: u.reason })),
+    });
+    const wl = await writeLedger(ctx, ledger);
+    if (!wl.ok) return { kind: 'error', error: wl.error };
     if (total === 0) {
       emit(ctx, 'envelope.built', {
         round,
@@ -2175,15 +2661,19 @@ export function createEngine(deps: EngineDeps): Engine {
    */
   const foldResponses = async (ctx: StepCtx, round: number): Promise<StepResult | null> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) {
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) {
       return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response fold') };
     }
-    const admittedResponses = await admittedFiles<ResponsesFile>(state, 'author_response', round);
-    if (admittedResponses.length === 0) return null;
-    const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    const ledger = ledgerR.value;
+    const admittedResponses = await admittedFiles<ResponsesFile>(ctx, 'author_response', round);
+    if (!admittedResponses.ok) return { kind: 'error', error: admittedResponses.error };
+    if (admittedResponses.value.length === 0) return null;
+    const admittedChallenges = await admittedFiles<ChallengesFile>(ctx, 'challenge', round);
+    if (!admittedChallenges.ok) return { kind: 'error', error: admittedChallenges.error };
     const challengeIndex = indexAdmittedChallenges(
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
     );
     let snapshot = ctx.snapshot;
     if (snapshot === undefined) {
@@ -2193,7 +2683,7 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const applied = applyResponsesToLedger(
       ledger,
-      admittedResponses.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedResponses.value.map((a) => ({ participantId: a.participantId, file: a.file })),
       challengeIndex,
       sourceAccess(state, snapshot),
       ctx.now,
@@ -2217,10 +2707,13 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const enterResponseStage = async (ctx: StepCtx, round: number): Promise<StepResult> => {
     const { state } = ctx;
-    const ledger = await readLedger(state);
-    if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
+    const ledgerR = await readLedger(ctx);
+    if (!ledgerR.ok) return { kind: 'error', error: ledgerR.error };
+    if (ledgerR.value === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
+    const ledger = ledgerR.value;
 
-    const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    const admittedChallenges = await admittedFiles<ChallengesFile>(ctx, 'challenge', round);
+    if (!admittedChallenges.ok) return { kind: 'error', error: admittedChallenges.error };
     let snapshot = ctx.snapshot;
     if (snapshot === undefined) {
       const snapR = await store.readSnapshot();
@@ -2229,7 +2722,7 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     const applied = applyChallengesToLedger(
       ledger,
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
       sourceAccess(state, snapshot),
       ctx.now,
     );
@@ -2250,13 +2743,75 @@ export function createEngine(deps: EngineDeps): Engine {
     }
 
     const challengeIndex = indexAdmittedChallenges(
-      admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      admittedChallenges.value.map((a) => ({ participantId: a.participantId, file: a.file })),
     );
     const plan = assignResponses({
       challenges: challengeIndex,
       claimsById: claimsById(ledger),
       maxPerSeat: state.config.maxResponsesPerSeatPerRound,
     });
+    const routedChallengeIds: string[] = [];
+    const byteDropped: { claimId: string; authorPid: ParticipantId }[] = [];
+    let total = 0;
+    for (const [pid, assignments] of plan.assignments) {
+      if (assignments.length === 0) continue;
+      const p = findParticipant(state, pid);
+      if (p === undefined) continue;
+      const envRel = paths.responseEnv(pid, round);
+      if (ctx.envelopeAssigned.has(envRel)) {
+        // Replay: journaled qualified challengeIds are the durable plan —
+        // verify bytes on v1, never rewrite.
+        const v = await verifiedRead(ctx, envRel);
+        if (!v.ok) {
+          integrityViolation(ctx, envRel, v.error);
+          return { kind: 'error', error: v.error };
+        }
+        routedChallengeIds.push(...ctx.envelopeAssigned.get(envRel)!);
+      } else {
+        const base = makeEnvelopeBase<ResponseAssignment>({
+          runId: state.runId,
+          phase: 'author_response',
+          round,
+          recipientId: pid,
+          outputPath: paths.responseOut(pid, round),
+          outputContract: 'ResponsesFile',
+        });
+        const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
+        // Authorization units are the qualified challengeIds inside kept
+        // assignments — the ids admission checks responses against.
+        const assignedIds = fit.envelope.assignments.flatMap((a) =>
+          a.challenges.map((c) => c.challengeId),
+        );
+        const w = await mintedWrite(ctx, envRel, JSON.stringify(fit.envelope, null, 2), 'envelope');
+        if (!w.ok) return { kind: 'error', error: w.error };
+        emit(ctx, 'envelope.built', {
+          path: envRel,
+          recipientId: pid,
+          round,
+          assigned: fit.envelope.assignments.length,
+          assignedIds,
+          omitted: fit.omitted.map((a) => a.claimId),
+          bytes: fit.bytes,
+          ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+        }, { participantId: pid, phase: 'author_response', round });
+        ctx.envelopeAssigned.set(envRel, assignedIds);
+        routedChallengeIds.push(...assignedIds);
+        for (const o of fit.omitted) byteDropped.push({ claimId: o.claimId, authorPid: pid });
+      }
+      ensureStageAttempt(p, 'author_response', round);
+      total += ctx.envelopeAssigned.get(envRel)!.length;
+    }
+    // Response routing ONCE per stage: routed qualified ids + byte-dropped
+    // claim-level assignments + per-seat cap omissions + unroutables —
+    // persisted to the ledger alongside the round's challenge record.
+    recordResponseRouting(ledger, round, {
+      routedChallengeIds: [...new Set(routedChallengeIds)],
+      byteDropped,
+      capOmitted: plan.omitted.map((o) => ({ challengeId: o.challengeId, claimId: o.claimId, authorPid: o.authorPid })),
+      unroutable: plan.unroutable.map((u) => ({ challengeId: u.challengeId, claimId: u.claimId, reason: u.reason })),
+    });
+    const wl2 = await writeLedger(ctx, ledger);
+    if (!wl2.ok) return { kind: 'error', error: wl2.error };
     for (const u of plan.unroutable) {
       emit(ctx, 'envelope.built', {
         kind: 'response-unroutable',
@@ -2273,35 +2828,6 @@ export function createEngine(deps: EngineDeps): Engine {
         authorPid: o.authorPid,
         reason: 'author at cap',
       }, { round });
-    }
-
-    let total = 0;
-    for (const [pid, assignments] of plan.assignments) {
-      if (assignments.length === 0) continue;
-      const p = findParticipant(state, pid);
-      if (p === undefined) continue;
-      const base = makeEnvelopeBase<ResponseAssignment>({
-        runId: state.runId,
-        phase: 'author_response',
-        round,
-        recipientId: pid,
-        outputPath: paths.responseOut(pid, round),
-        outputContract: 'ResponsesFile',
-      });
-      const fit = fitEnvelope(base, assignments, state.config.envelopeBytes);
-      const envRel = paths.responseEnv(pid, round);
-      const wr = await store.writeArtifact(envRel, JSON.stringify(fit.envelope, null, 2));
-      if (!wr.ok) return { kind: 'error', error: wr.error };
-      emit(ctx, 'envelope.built', {
-        path: envRel,
-        recipientId: pid,
-        round,
-        assigned: fit.envelope.assignments.length,
-        omitted: fit.omitted.map((a) => a.claimId),
-        bytes: fit.bytes,
-      }, { participantId: pid, phase: 'author_response', round });
-      addPlannedAttempt(p, 'author_response', round);
-      total += fit.envelope.assignments.length;
     }
 
     if (total === 0) {
@@ -2325,7 +2851,7 @@ export function createEngine(deps: EngineDeps): Engine {
     const { state } = ctx;
     const scribe = findParticipant(state, SCRIBE_PID);
     if (scribe === undefined) return { kind: 'error', error: err('invalid_transition', 'scribe participant missing') };
-    addPlannedAttempt(scribe, 'scribe_synthesis', null);
+    ensureStageAttempt(scribe, 'scribe_synthesis', null);
     state.status = 'synthesising';
     state.discussion = null;
     state.phaseEnteredAt = ctx.now.toISOString();
@@ -2413,17 +2939,20 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const finalizeReport = async (ctx: StepCtx): Promise<StepResult> => {
     const { state } = ctx;
-    const [proposedR, approvedR, ledger] = await Promise.all([
+    const [proposedR, approvedR, ledgerR] = await Promise.all([
       store.readProposedRoster(),
       store.readApprovedRoster(),
-      readLedger(state),
+      readLedger(ctx),
     ]);
-    if (!proposedR.ok || !approvedR.ok || ledger === null) {
+    if (!proposedR.ok || !approvedR.ok || !ledgerR.ok || ledgerR.value === null) {
       return {
         kind: 'error',
-        error: err('invalid_transition', 'cannot finalize: roster or ledger artifacts missing'),
+        error: !ledgerR.ok
+          ? ledgerR.error
+          : err('invalid_transition', 'cannot finalize: roster or ledger artifacts missing'),
       };
     }
+    const ledger = ledgerR.value;
 
     // Final drift check — detect, never claim prevention. Approval/snapshot
     // revalidation gates launches only; the tree may have drifted since the
@@ -2470,9 +2999,26 @@ export function createEngine(deps: EngineDeps): Engine {
 
     // Scribe narrative only — its claims/coverage are never trusted. Prefer
     // the narrative SynthesisFile contract; fall back to a legacy full
-    // ReportFile artifact (both carry summary + limitations).
+    // ReportFile artifact (both carry summary + limitations). The artifact
+    // is an admitted worker output: verify exact bytes on v1 — tampered or
+    // unadmitted bytes degrade to the runner-rendered narrative WITH a
+    // visible journal entry, never silently trusted.
     let scribe: ScribeNarrative | undefined;
-    const rawReport = await readJson(paths.scribeReportJson);
+    let rawReport: { ok: true; value: unknown } | { ok: false } = { ok: false };
+    const reportExists = await store.artifactExists(paths.scribeReportJson);
+    if (reportExists.ok && reportExists.value) {
+      const v = await verifiedRead(ctx, paths.scribeReportJson);
+      if (v.ok) {
+        try {
+          rawReport = { ok: true, value: JSON.parse(v.value.text) };
+        } catch {
+          emit(ctx, 'error', { op: 'scribe-narrative', path: paths.scribeReportJson, detail: 'verified scribe report is not valid JSON' });
+        }
+      } else {
+        integrityViolation(ctx, paths.scribeReportJson, v.error);
+        runnerLims.push(`scribe report failed integrity verification (${v.error.message}) — runner-rendered narrative used`);
+      }
+    }
     if (rawReport.ok) {
       const synParse = (validationNs as {
         parseSynthesisFile?: (
@@ -2489,6 +3035,9 @@ export function createEngine(deps: EngineDeps): Engine {
         }
       }
     }
+    const snapForProvenance = ctx.snapshot !== undefined
+      ? { ok: true as const, value: ctx.snapshot }
+      : await store.readSnapshot();
     const report = buildCouncilReport({
       runId: state.runId,
       generatedAt: ctx.now.toISOString(),
@@ -2499,6 +3048,16 @@ export function createEngine(deps: EngineDeps): Engine {
       ledger,
       scribe,
       runnerLimitations: runnerLims,
+      ...(snapForProvenance.ok
+        ? {
+            provenance: {
+              snapshotId: snapForProvenance.value.snapshotId,
+              gitHead: snapForProvenance.value.gitHead,
+              targetRoot: snapForProvenance.value.targetRoot,
+              objective: state.objective,
+            },
+          }
+        : {}),
     });
     // Drift detected after approval means the emitted report cannot claim
     // full coverage of the reviewed corpus — mark it visibly partial.
@@ -2518,9 +3077,12 @@ export function createEngine(deps: EngineDeps): Engine {
       [paths.summaryMd, renderSummaryMarkdown(report)],
     ];
     for (const [rel, content] of writes) {
-      const w = await store.writeArtifact(rel, content);
+      const w = await mintedWrite(ctx, rel, content, 'report');
       if (!w.ok) return { kind: 'error', error: w.error };
-      emit(ctx, 'report.written', { path: rel });
+      emit(ctx, 'report.written', {
+        path: rel,
+        ...(w.value.receipt !== undefined ? receiptJournalFields(w.value.receipt) : {}),
+      });
       ctx.artifacts.push(rel);
     }
     state.status = 'reported';
@@ -2670,6 +3232,258 @@ export function createEngine(deps: EngineDeps): Engine {
     if (note.ok && note.value.outcome === 'sent') ctx.state.consumption.mailSent += 1;
   };
 
+  // ── Lifecycle wakes: durable backlog + bounded post-lock drain ─────────────
+
+  const TERMINAL_STATUS: ReadonlySet<RunStatus> = new Set(['reported', 'failed', 'cancelled']);
+  const TERMINAL_OUTCOME: Record<string, 'succeeded' | 'failed' | 'cancelled'> = {
+    reported: 'succeeded',
+    failed: 'failed',
+    cancelled: 'cancelled',
+  };
+
+  /**
+   * P-D4 wake events — the lifecycle subset of ProgressEvent. `cursor` pins a
+   * discussion wake to its durable round/stage instead of whatever
+   * facts.discussion happens to hold at send time; `approvalHash` pins the
+   * approval intent to the bound hash; `historical` labels a journal-replayed
+   * catch-up — it never changes the dedupe key, budget charge, or custody.
+   */
+  type WakeEvent =
+    | Extract<ProgressEvent, { kind: 'stage' }>
+    | Extract<ProgressEvent, { kind: 'blocked' }>
+    | Extract<ProgressEvent, { kind: 'finished' }>
+    | Extract<ProgressEvent, { kind: 'approval' }>;
+  interface WakePlan {
+    events: WakeEvent[];
+    /** Terminal transition — the last wake opportunity: every pending catch-up must drain, never stranded. */
+    terminal: boolean;
+  }
+
+  const wakeSha8 = (s: string): string => createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 8);
+
+  /**
+   * The dedupe identity progress.intentFor derives — kept here ONLY to
+   * prefer a fresh (unmarked) event over its historical replay copy when
+   * both exist in one plan. It is never used to decide whether to send.
+   */
+  const wakeKeyOf = (e: WakeEvent, state: CouncilState): string => {
+    switch (e.kind) {
+      case 'stage': {
+        if (TERMINAL_STATUS.has(e.status)) return `finished:${TERMINAL_OUTCOME[e.status]}`;
+        if (e.status === 'discussing') {
+          const c = e.cursor ?? state.discussion;
+          return c !== null && c !== undefined ? `stage:discussing:r${c.round}:${c.stage}` : 'stage:discussing';
+        }
+        return `stage:${e.status}`;
+      }
+      case 'blocked': return `blocked:${wakeSha8(e.reason)}`;
+      case 'approval': return `approval:${(e.approvalHash ?? state.approvalHash ?? 'unknown').slice(0, 8)}`;
+      case 'finished': return `finished:${e.outcome}`;
+    }
+  };
+
+  /**
+   * Historical catch-up backlog (P-D4): replay durable lifecycle records —
+   * the journal read at buildCtx plus this step's own emissions — into wake
+   * events carrying their ORIGINAL identity. A stage whose outbox intent was
+   * lost between the state flush and the send (crash or pre-intent fs/lock
+   * failure) is recomputed here on every later advance; the module's durable
+   * dedupe makes replays of already-sent intents free, and 'sending' /
+   * 'unknown' / 'refused' custody is never blindly retried.
+   */
+  const backlogWakes = (ctx: StepCtx): WakeEvent[] => {
+    const out: WakeEvent[] = [];
+    const map = (e: Omit<JournalEvent, 'seq'> | JournalEvent): void => {
+      const p = e.payload ?? {};
+      if (e.type === 'run.initialized') {
+        out.push({ kind: 'stage', status: 'initialized', historical: true });
+      } else if (e.type === 'phase.entered') {
+        const s = p.status;
+        if (s === 'discussing') {
+          if (typeof p.round === 'number' && typeof p.stage === 'string') {
+            out.push({ kind: 'stage', status: 'discussing', cursor: { round: p.round, stage: p.stage }, historical: true });
+          }
+        } else if (typeof s === 'string') {
+          // Terminal statuses normalise to the finished intent inside the
+          // module — the replay stays honest either way.
+          out.push({ kind: 'stage', status: s as RunStatus, historical: true });
+        }
+      } else if (e.type === 'approval.granted') {
+        out.push({
+          kind: 'approval',
+          ...(typeof p.approver === 'string' ? { approver: p.approver } : {}),
+          ...(typeof p.hash === 'string' ? { approvalHash: p.hash } : {}),
+          historical: true,
+        });
+      } else if (e.type === 'run.finished') {
+        const o = p.outcome;
+        out.push({
+          kind: 'finished',
+          outcome: o === 'succeeded' || o === 'cancelled' ? o : 'failed',
+          ...(Array.isArray(p.reportPaths) ? { reportPaths: p.reportPaths as string[] } : {}),
+          historical: true,
+        });
+      } else if (e.type === 'error' && p.op === 'lifecycle.blocked' && typeof p.reason === 'string') {
+        out.push({ kind: 'blocked', reason: p.reason, historical: true });
+      }
+    };
+    for (const e of ctx.lifecycleJournal) map(e);
+    for (const e of ctx.events) map(e);
+    return out;
+  };
+
+  /**
+   * Order the drain: the CURRENT timely transition first — above all the
+   * finished wake, which must be attempted before any catch-up so terminal
+   * feedback can never sit behind up-to-64 replays × send timeout or a held
+   * progress lock — then the durable backlog in journal order. A fresh event
+   * wins over a historical replay copy of the same intent so timely wakes
+   * are never labelled 'late'.
+   */
+  const planWakes = (ctx: StepCtx, current: WakeEvent[], terminal: boolean): WakePlan => {
+    const curKeys = new Set(current.map((e) => wakeKeyOf(e, ctx.state)));
+    const backlog = backlogWakes(ctx).filter((e) => !curKeys.has(wakeKeyOf(e, ctx.state)));
+    return { events: [...current, ...backlog], terminal };
+  };
+
+  /**
+   * Drain bounds. Current events drain first, historical backlog after.
+   * Non-terminal calls cap NEW host sends and wall-clock — skipped events
+   * stay pending (they hold no outbox record yet) and are recomputed from
+   * the journal next advance. Terminal calls are the last wake opportunity:
+   * every computed event is attempted so catch-up is never stranded; each
+   * send stays individually bounded. The finished wake is always attempted
+   * inside WAKE_DRAIN_MAX_EVENTS.
+   */
+  const WAKE_SEND_TIMEOUT_MS = 15_000;
+  const WAKE_LOCK_WAIT_MS = 5_000;
+  const WAKE_DRAIN_SEND_CAP = 8;
+  const WAKE_DRAIN_DEADLINE_MS = 45_000;
+  const WAKE_DRAIN_MAX_EVENTS = 64;
+  const SEND_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set(['sent', 'unknown', 'refused', 'refused_final']);
+
+  /**
+   * Persist wake-drain diagnostics on a FRESH store lock — journal-only,
+   * never a saveState. The drained ctx.state is a pre-send snapshot;
+   * persisting it could overwrite a concurrent advance.
+   */
+  const journalWakeFailures = async (failures: string[]): Promise<void> => {
+    try {
+      await store.withLock(async () =>
+        store.appendJournal(failures.map((detail) => ({
+          ts: now().toISOString(),
+          type: 'error' as const,
+          actor: 'engine',
+          payload: { op: 'progress.drain', detail: detail.slice(0, 400) },
+        }))),
+      );
+    } catch {
+      /* diagnostics are best-effort — the outbox retains the outcomes */
+    }
+  };
+
+  /**
+   * Lifecycle wake to the initiating orchestrator (progress module v1).
+   *
+   * Runs OUTSIDE the store lock after the transition is durable: the plan is
+   * computed inside the lock from persisted records, then each event flows
+   * intent → send through progress/outbox.json. A hung send can no longer
+   * serialize council mutations. Facts in the body come from a fresh
+   * state.json read per event — catch-up mail reports CURRENT persisted
+   * counts, never fabricated historical ones. Repeat sends dedupe durably;
+   * a missing recipient.json is an honest no_recipient outcome, and module
+   * errors are journaled as progress.drain diagnostics — wake delivery must
+   * NEVER fail a council step.
+   */
+  const drainWakes = async (plan: WakePlan): Promise<void> => {
+    if (plan.events.length === 0) return;
+    const notifier = createProgressNotifier({
+      runDir: store.runDir,
+      sendMail: (input) => host.sendNotification(input),
+      readState: () => store.loadState(),
+      sendTimeoutMs: WAKE_SEND_TIMEOUT_MS,
+      lockWaitMs: WAKE_LOCK_WAIT_MS,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+    const failures: string[] = [];
+    let sends = 0;
+    let processed = 0;
+    let lockBreak = false;
+    const deadline = now().getTime() + WAKE_DRAIN_DEADLINE_MS;
+    for (const event of plan.events) {
+      const isFinished = event.kind === 'finished' || (event.kind === 'stage' && TERMINAL_STATUS.has(event.status));
+      if (processed >= WAKE_DRAIN_MAX_EVENTS && !isFinished) continue;
+      if (!plan.terminal && !isFinished && (sends >= WAKE_DRAIN_SEND_CAP || now().getTime() > deadline)) continue;
+      processed += 1;
+      let r;
+      try {
+        r = await notifier.notify(event);
+      } catch (e) {
+        failures.push(`notify threw for ${event.kind} wake: ${e instanceof Error ? e.message : String(e)}`);
+        continue;
+      }
+      if (!r.ok) {
+        failures.push(`${event.kind}: ${r.error.code}: ${r.error.message}`);
+        // A held progress lock persists across events — stop burning wait
+        // time; the backlog is recomputed on the next advance.
+        if (r.error.details?.reason === 'progress_lock_timeout') {
+          lockBreak = true;
+          break;
+        }
+        continue;
+      }
+      if (SEND_ATTEMPT_OUTCOMES.has(r.value.outcome)) sends += 1;
+    }
+    if (lockBreak && processed < plan.events.length) {
+      // Never silently strand pending wakes: the count left un-attempted is
+      // part of the same diagnostic record.
+      failures.push(
+        `${plan.events.length - processed} pending wake event(s) left deferred behind the held progress lock — they stay pending and are recomputed from the journal on the next call`,
+      );
+    }
+    if (failures.length > 0) await journalWakeFailures(failures);
+  };
+
+  /** Current-transition events for an advance step (unmarked — the timely copy). */
+  const currentStepWakes = (ctx: StepCtx, step: StepResult): WakeEvent[] => {
+    const s = ctx.state.status;
+    const events: WakeEvent[] = [];
+    if (TERMINAL_STATUS.has(s)) {
+      events.push({
+        kind: 'finished',
+        outcome: TERMINAL_OUTCOME[s],
+        ...(step.kind === 'advance' && step.result.reportPaths !== undefined ? { reportPaths: step.result.reportPaths } : {}),
+      });
+    } else {
+      events.push({
+        kind: 'stage',
+        status: s,
+        ...(s === 'discussing' && ctx.state.discussion !== null
+          ? { cursor: { round: ctx.state.discussion.round, stage: ctx.state.discussion.stage } }
+          : {}),
+      });
+    }
+    if (step.kind === 'advance' && step.result.action === 'blocked') {
+      events.push({ kind: 'blocked', reason: step.result.note ?? 'advance blocked — see status/journal' });
+    }
+    return events;
+  };
+
+  /**
+   * Make the blocked wake durable: the step result's action is transient,
+   * so the reason is journaled as a lifecycle.blocked error marker before
+   * the flush — P-D4 catch-up replays it like any other lifecycle record.
+   * Deduped on the exact detail so a stuck run doesn't spam the journal.
+   */
+  const journalBlockedMarker = (ctx: StepCtx, step: StepResult): void => {
+    if (step.kind !== 'advance' || step.result.action !== 'blocked') return;
+    const reason = step.result.note ?? 'advance blocked — see status/journal';
+    const detail = `lifecycle.blocked: ${reason}`;
+    if (ctx.journaledErrors.has(detail)) return;
+    ctx.journaledErrors.add(detail);
+    emit(ctx, 'error', { op: 'lifecycle.blocked', reason, detail });
+  };
+
   // ── Advance dispatch ───────────────────────────────────────────────────────
 
   /**
@@ -2698,7 +3512,15 @@ export function createEngine(deps: EngineDeps): Engine {
       releaseRequested: new Set(),
       taskCreateStage: new Map(),
       workerLaunchStage: new Map(),
+      terminalCreateStage: new Map(),
+      terminalCustody: new Map(),
       intentProtocol: new Map(),
+      integrity: 'legacy',
+      receipts: new Map(),
+      envelopeAssigned: new Map(),
+      legacyEnvelopes: new Set(),
+      journaledErrors: new Set(),
+      lifecycleJournal: [],
     };
     const journal = await store.readJournal();
     if (!journal.ok) return journal as Result<never>;
@@ -2751,11 +3573,36 @@ export function createEngine(deps: EngineDeps): Engine {
       ) {
         noteAttempt(`att_${e.participantId}_${e.phase}_r${e.round ?? 1}_0`, e.ts);
       }
+      // Envelope authorization is journal-derived, NEVER file-derived: the
+      // assignedIds the runner journaled at build time are the only claim/
+      // challenge ids that worker output may legitimately reference.
+      if (e.type === 'envelope.built' && typeof e.payload?.path === 'string') {
+        const ids = e.payload?.assignedIds;
+        if (Array.isArray(ids) && ids.every((x) => typeof x === 'string')) {
+          ctx.envelopeAssigned.set(e.payload.path, ids as string[]);
+        } else {
+          ctx.legacyEnvelopes.add(e.payload.path);
+        }
+      }
+      // Dedupe keys for journaled anomaly/error lines so a rebuild never
+      // re-emits the same durable evidence.
+      if (e.type === 'error' && typeof e.payload?.detail === 'string') {
+        ctx.journaledErrors.add(e.payload.detail as string);
+      }
       if (e.type === 'phase.entered') {
         if (e.payload?.status === 'organising') seedOrganiser = true;
         if (e.payload?.status === 'independent_review') seedReviewers = true;
         if (e.payload?.status === 'scribe_notes') seedScribeNotes = true;
         if (e.payload?.status === 'synthesising') seedSynthesis = true;
+      }
+      if (
+        e.type === 'run.initialized' ||
+        e.type === 'phase.entered' ||
+        e.type === 'approval.granted' ||
+        e.type === 'run.finished' ||
+        (e.type === 'error' && e.payload?.op === 'lifecycle.blocked')
+      ) {
+        ctx.lifecycleJournal.push(e);
       }
       if (e.type === 'approval.granted') seedReviewers = true;
       // RA-004: journaled launch charges — the worker.started RECEIPT shape
@@ -2799,9 +3646,33 @@ export function createEngine(deps: EngineDeps): Engine {
           ctx.taskCreateStage.set(aid, 'issued'); // chronological last-wins
         } else if (e.payload?.stage === 'worker-launch') {
           ctx.workerLaunchStage.set(aid, 'issued');
+        } else if (e.payload?.stage === 'terminal-create') {
+          ctx.terminalCreateStage.set(aid, 'issued');
         } else {
           const v = typeof e.payload?.v === 'number' ? e.payload.v : 1;
           ctx.intentProtocol.set(aid, Math.max(ctx.intentProtocol.get(aid) ?? 1, v));
+        }
+      }
+      // Terminal-create custody receipts — journaled by the adapter's
+      // afterTerminalCreate callback, so a mid-launch crash keeps the
+      // created/refused/uncertain outcome and any landed handle visible.
+      if (e.type === 'error' && e.payload?.op === 'terminal-create' && typeof e.payload?.attemptId === 'string') {
+        const aid = e.payload.attemptId;
+        ctx.terminalCreateStage.set(aid, e.payload?.uncertain === true ? 'issued' : 'refused');
+        if (typeof e.payload?.terminalHandle === 'string' && e.payload.terminalHandle.length > 0) {
+          ctx.terminalCustody.set(aid, {
+            handle: e.payload.terminalHandle,
+            ...(typeof e.payload?.requestId === 'string' ? { requestId: e.payload.requestId } : {}),
+          });
+        }
+      }
+      if (e.type === 'task.created' && e.payload?.scope === 'terminal' && typeof e.payload?.attemptId === 'string') {
+        const h = e.payload?.terminalHandle;
+        if (typeof h === 'string' && h.length > 0) {
+          ctx.terminalCustody.set(e.payload.attemptId, {
+            handle: h,
+            ...(typeof e.payload?.requestId === 'string' ? { requestId: e.payload.requestId } : {}),
+          });
         }
       }
       // RA-006: an error carrying `uncertain:true` is an issued mutation
@@ -2863,6 +3734,9 @@ export function createEngine(deps: EngineDeps): Engine {
             break;
           case 'task.created':
             if (typeof e.payload?.taskId === 'string' && e.payload.taskId.length > 0) ov.taskId = e.payload.taskId;
+            if (e.payload?.scope === 'terminal' && typeof e.payload?.terminalHandle === 'string' && e.payload.terminalHandle.length > 0) {
+              ov.terminalHandle = e.payload.terminalHandle;
+            }
             break;
           case 'worker.started':
             ov.journaledStatus = 'dispatched';
@@ -2885,6 +3759,44 @@ export function createEngine(deps: EngineDeps): Engine {
       }
     }
     if (runOk) ctx.runCreateUnresolved = false;
+
+    // ── Integrity policy + journal-authoritative receipts ────────────────
+    // Marker agreement across council.json + journal (artifacts lane):
+    // 'receipts-v1' mints/verifies exact-byte receipts; 'legacy' stays
+    // honestly untracked; a marker CONFLICT fails closed, never downgrades.
+    const { receipts: collectedReceipts, anomalies: receiptAnomalies } = collectReceipts(journal.value);
+    ctx.receipts = collectedReceipts;
+    const policySignals = await integrityPolicy(store);
+    if (!policySignals.ok) return policySignals as Result<never>;
+    // The journal marker is durable evidence of the run's policy. Primary
+    // architecture: FileStore.initialize writes the receipts-v1
+    // run.initialized marker as seq 1 for new runs, so the journal is marked
+    // before ANY supervisor/engine event. buildCtx only re-declares it into
+    // an EMPTY journal (a pre-marker run or a lost journal — nothing exists
+    // that could launder a stripped marker). A non-empty unmarked journal
+    // under a v1 marker is a policy conflict: never silently blessed.
+    let journalMarked = journalHasPolicyMarker(journal.value);
+    if (policySignals.value.metaPolicy === INTEGRITY_POLICY && journalMarked === null) {
+      emit(ctx, 'run.initialized', {
+        runId: state.runId,
+        integrity: INTEGRITY_POLICY,
+        snapshotId: state.snapshotId,
+      });
+      journalMarked = true;
+    }
+    const resolved = resolveIntegrityPolicy({
+      metaPolicy: policySignals.value.metaPolicy,
+      journalHasMarker: journalMarked,
+      indexPresent: policySignals.value.indexPresent,
+    });
+    if (!resolved.ok) return resolved as Result<never>;
+    ctx.integrity = resolved.value.policy;
+    for (const anomaly of receiptAnomalies) {
+      const detail = `receipt anomaly: ${anomaly}`;
+      if (ctx.journaledErrors.has(detail)) continue;
+      ctx.journaledErrors.add(detail);
+      emit(ctx, 'error', { op: 'integrity-receipts', detail });
+    }
 
     // ── Re-materialize state-side mints the journal proves existed ──────
     // RA-003: participant seeding and addPlannedAttempt are state-only;
@@ -3012,6 +3924,13 @@ export function createEngine(deps: EngineDeps): Engine {
         if (a.taskId === null && ov.taskId !== undefined) a.taskId = ov.taskId;
         if (a.dispatchId === null && ov.dispatchId !== undefined) a.dispatchId = ov.dispatchId;
         if (a.terminalHandle === null && ov.terminalHandle !== undefined) a.terminalHandle = ov.terminalHandle;
+        // Pre-attach custody: a journaled terminal identity restores the
+        // retained handle so the resource stays visible for reuse/release —
+        // never orphaned into a second create.
+        // Retained-session custody is journal-derived: the NEWEST journaled
+        // handle is the live session (a later fresh-fallback attempt on a
+        // different terminal supersedes an earlier one, never vice versa).
+        if (a.terminalHandle !== null) p.retainedTerminal = a.terminalHandle;
         if (a.requestId === undefined && ov.requestId !== undefined) a.requestId = ov.requestId;
         const js = ov.journaledStatus;
         if (js !== undefined && (STATUS_RANK[js] ?? 0) > (STATUS_RANK[a.status] ?? 0)) {
@@ -3024,6 +3943,26 @@ export function createEngine(deps: EngineDeps): Engine {
     state.consumption.launches = Math.max(state.consumption.launches, launchedAttempts.size);
     state.consumption.mailSent = Math.max(state.consumption.mailSent, journaledMailSent);
 
+    // clm_0007 invariant: replay reconstruction must never leave two
+    // participant objects sharing one participantId nor two attempts sharing
+    // one attemptId. Seed sites are idempotent now; this sweep is the
+    // belt-and-suspenders proof that a stale/crafted state.json cannot
+    // smuggle a duplicate past the overlay.
+    {
+      const seenPids = new Set<ParticipantId>();
+      state.participants = state.participants.filter((p) => {
+        if (seenPids.has(p.participantId)) return false;
+        seenPids.add(p.participantId);
+        const seenAids = new Set<AttemptId>();
+        p.attempts = p.attempts.filter((a) => {
+          if (seenAids.has(a.attemptId)) return false;
+          seenAids.add(a.attemptId);
+          return true;
+        });
+        return true;
+      });
+    }
+
     const snap = await store.readSnapshot();
     if (snap.ok) ctx.snapshot = snap.value;
     return ok(ctx);
@@ -3031,7 +3970,8 @@ export function createEngine(deps: EngineDeps): Engine {
 
   const advance = async (): Promise<Result<AdvanceResult>> => {
     try {
-      return await store.withLock(async () => {
+      let plan: WakePlan | null = null;
+      const inner = await store.withLock(async () => {
         const st = await store.loadState();
         if (!st.ok) return st;
         const bc = await buildCtx(st.value);
@@ -3072,10 +4012,17 @@ export function createEngine(deps: EngineDeps): Engine {
         if (step.result.artifacts === undefined && ctx.artifacts.length > 0) {
           step.result.artifacts = ctx.artifacts;
         }
+        // Durable first: the blocked reason is journaled before the flush so
+        // P-D4 catch-up can replay it; the wake plan is computed in-lock
+        // from persisted records and DRAINED after the lock releases.
+        journalBlockedMarker(ctx, step);
         const f = await flush(ctx);
         if (!f.ok) return f;
+        plan = planWakes(ctx, currentStepWakes(ctx, step), TERMINAL_STATUS.has(ctx.state.status));
         return ok(step.result);
       });
+      if (plan !== null) await drainWakes(plan);
+      return inner;
     } catch (e) {
       return failRes(
         err('io_error', `advance crashed: ${e instanceof Error ? e.message : String(e)}`),
@@ -3102,7 +4049,8 @@ export function createEngine(deps: EngineDeps): Engine {
     approver: string;
   }): Promise<Result<{ approvalId: string; hash: string }>> => {
     try {
-      return await store.withLock(async () => {
+      let plan: WakePlan | null = null;
+      const inner = await store.withLock(async () => {
         const st = await store.loadState();
         if (!st.ok) return st;
         const state = st.value;
@@ -3173,9 +4121,11 @@ export function createEngine(deps: EngineDeps): Engine {
         emit(ctx, 'approval.granted', { hash, approvalId: record.approvalId, approver: input.approver, seats: roster.seats.length, reApproval: reapproval });
         if (fresh) {
           for (const seat of roster.seats) {
-            const p = makeParticipant(seat.participantId, 'reviewer', seat.agent, seat.seatId, seat.perspectiveId);
-            state.participants.push(p);
-            addPlannedAttempt(p, 'independent_review', null);
+            // Idempotent (clm_0007): a retried approve after append-ok/
+            // save-fail finds the overlay-minted seat — never a second
+            // participant object nor a duplicate attempt id.
+            const p = ensureParticipant(state, seat.participantId, 'reviewer', seat.agent, seat.seatId, seat.perspectiveId);
+            ensureStageAttempt(p, 'independent_review', null);
           }
           state.status = 'independent_review';
           state.phaseEnteredAt = ctx.now.toISOString();
@@ -3203,8 +4153,17 @@ export function createEngine(deps: EngineDeps): Engine {
         }
         const f2 = await flush(ctx);
         if (!f2.ok) return f2;
+        // Approval is durable + the supervisor is woken — now wake the
+        // initiating orchestrator (approval, then the newly entered stage).
+        // The plan drains AFTER the store lock releases; the approvalHash is
+        // pinned so a later re-approval can't relabel this intent's key.
+        const wakes: WakeEvent[] = [{ kind: 'approval', approver: input.approver, approvalHash: hash }];
+        if (fresh) wakes.push({ kind: 'stage', status: 'independent_review' });
+        plan = planWakes(ctx, wakes, false);
         return ok({ approvalId: record.approvalId, hash });
       });
+      if (plan !== null) await drainWakes(plan);
+      return inner;
     } catch (e) {
       return failRes(err('io_error', `approve crashed: ${e instanceof Error ? e.message : String(e)}`));
     }
@@ -3238,24 +4197,73 @@ export function createEngine(deps: EngineDeps): Engine {
         }
       }
     }
+    // Read-only timing facts — persisted state + journal tail only; nothing
+    // here probes host liveness or mutates the run (operator contract).
+    const at = now().getTime();
+    const dl = state.config.deadlines;
+    const phaseDeadline = phaseDeadlineMs(state);
+    const phaseElapsedMs = Math.max(0, at - Date.parse(state.phaseEnteredAt));
+    const runElapsedMs = Math.max(0, at - Date.parse(state.createdAt));
+    // lastActivity is the newest durable journal event — a fact about the
+    // RECORD, never a heartbeat. An unreadable journal degrades the field
+    // honestly rather than failing the whole read.
+    let lastActivity: EngineStatus['lastActivity'];
+    const journal = await store.readJournal();
+    if (journal.ok && journal.value.length > 0) {
+      const tail = journal.value[journal.value.length - 1];
+      lastActivity = { ts: tail.ts, seq: tail.seq, type: tail.type };
+    }
     return ok({
       status: state.status,
       discussion: state.discussion,
-      participants: state.participants.map((p) => ({
-        participantId: p.participantId,
-        role: p.role,
-        status: p.status,
-        activeAttempt: p.attempts.find((a) => ACTIVE_ATTEMPT.has(a.status) || a.status === 'intent_recorded')?.attemptId ?? null,
-      })),
+      participants: state.participants.map((p) => {
+        const active = p.attempts.find((a) => ACTIVE_ATTEMPT.has(a.status) || a.status === 'intent_recorded');
+        return {
+          participantId: p.participantId,
+          role: p.role,
+          status: p.status,
+          activeAttempt: active?.attemptId ?? null,
+          ...(active !== undefined
+            ? {
+                activeAttemptDetail: {
+                  attemptId: active.attemptId,
+                  phase: active.phase,
+                  round: active.round,
+                  status: active.status,
+                  taskId: active.taskId,
+                  dispatchId: active.dispatchId,
+                  terminalHandle: active.terminalHandle,
+                  ...(active.requestId !== undefined ? { requestId: active.requestId } : {}),
+                },
+              }
+            : {}),
+        };
+      }),
       consumption: { ...state.consumption },
       approvalHash: state.approvalHash,
       pendingDecisions: pending,
+      phaseTiming: {
+        enteredAt: state.phaseEnteredAt,
+        elapsedMs: phaseElapsedMs,
+        ...(phaseDeadline !== undefined
+          ? { deadlineMs: phaseDeadline, graceMs: dl.graceMs, remainingMs: phaseDeadline - phaseElapsedMs }
+          : {}),
+      },
+      runTiming: {
+        createdAt: state.createdAt,
+        elapsedMs: runElapsedMs,
+        deadlineMs: dl.runMs,
+        remainingMs: dl.runMs - runElapsedMs,
+      },
+      ...(lastActivity !== undefined ? { lastActivity } : {}),
+      supervisor: state.supervisor === null ? null : { ...state.supervisor },
     });
   };
 
   const cancel = async (input: { reason: string }): Promise<Result<void>> => {
     try {
-      return await store.withLock(async () => {
+      let plan: WakePlan | null = null;
+      const inner = await store.withLock(async () => {
         const st = await store.loadState();
         if (!st.ok) return st;
         const bc = await buildCtx(st.value);
@@ -3321,8 +4329,13 @@ export function createEngine(deps: EngineDeps): Engine {
         emit(ctx, 'run.finished', { outcome: 'cancelled', reason: input.reason });
         const f = await flush(ctx);
         if (!f.ok) return f;
+        // Terminal call: drain the full pending catch-up — there is no later
+        // advance to recompute it.
+        plan = planWakes(ctx, [{ kind: 'finished', outcome: 'cancelled', note: input.reason }], true);
         return ok(undefined);
       });
+      if (plan !== null) await drainWakes(plan);
+      return inner;
     } catch (e) {
       return failRes(err('io_error', `cancel crashed: ${e instanceof Error ? e.message : String(e)}`));
     }

@@ -6,10 +6,15 @@
  *  - state.json            mutable CouncilState (validated on read AND write)
  *  - objective.md          verbatim review objective text
  *  - snapshot.json         SourceSnapshot of the target at approval time
- *  - events.jsonl          append-only journal; one canonical JSON event per line
+ *  - events.jsonl          append-only journal; one canonical JSON event per
+ *                         line; on receipts-v1 runs line 1 is the genesis
+ *                         run.initialized event carrying the policy marker
+ *                         (integrity: receipts-v1) — written at initialize so
+ *                         the journal is never both non-empty and unmarked
  *  - roster.proposed.json  organiser output (validated before persistence)
  *  - roster.approved.json  orchestrator selection (validated vs proposal+config)
  *  - approval.json         {record, binding} pair (hash must match binding)
+ *  - integrity/index.json  rebuildable receipt projection (src/artifacts.ts)
  *  - lock                  cross-process mutation lock file
  *
  * Atomicity: every file write goes to a same-directory temp file, is fsynced,
@@ -80,6 +85,11 @@ import {
   parseSourceSnapshot,
 } from './validation.js';
 import {
+  INTEGRITY_INDEX_PATH,
+  INTEGRITY_POLICY,
+  emptyIndex,
+} from './artifacts.js';
+import {
   DEFAULT_SNAPSHOT_LIMITS,
   diffSnapshotFiles,
   manifestHeadHash,
@@ -97,6 +107,7 @@ export const STORE_PATHS = {
   proposedRoster: 'roster.proposed.json',
   approvedRoster: 'roster.approved.json',
   approval: 'approval.json',
+  integrityIndex: INTEGRITY_INDEX_PATH,
   lock: 'lock',
 } as const;
 
@@ -353,6 +364,27 @@ export function createStore(options: StoreOpenOptions): Store {
     return ok({ abs });
   };
 
+  /**
+   * Best-effort fsync of a directory after a rename so the directory entry
+   * itself is durable (the file fsync alone does not guarantee the rename
+   * survives an OS crash). Skipped silently where directories cannot be
+   * opened/synced (Windows, some filesystems) — the tmp+rename protocol is
+   * still correct, this only tightens the crash window.
+   */
+  const fsyncDir = async (dir: string): Promise<void> => {
+    if (isWin) return;
+    try {
+      const dh = await fsp.open(dir, 'r');
+      try {
+        await dh.sync();
+      } finally {
+        await dh.close();
+      }
+    } catch {
+      /* platform/filesystem does not support directory fsync — best effort */
+    }
+  };
+
   const atomicWrite = async (abs: string, data: Buffer): Promise<Result<void>> => {
     const tmp = `${abs}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
     try {
@@ -365,6 +397,7 @@ export function createStore(options: StoreOpenOptions): Store {
         await fh.close();
       }
       await fsp.rename(tmp, abs);
+      await fsyncDir(path.dirname(abs));
       return ok(undefined);
     } catch (e) {
       await fsp.unlink(tmp).catch(() => {});
@@ -771,8 +804,39 @@ export function createStore(options: StoreOpenOptions): Store {
           targetRoot: snapshot.targetRoot,
           objective: input.objective,
           snapshotId: snapshot.snapshotId,
+          // New-run integrity policy marker (src/artifacts.ts): receipts-v1
+          // runs journal hash receipts for managed artifacts; legacy runs
+          // without this marker stay honestly untracked, never retroactively
+          // verified. The marker is written BEFORE any managed content.
+          integrityPolicy: INTEGRITY_POLICY,
           createdAt: now,
         };
+
+        // Genesis policy marker: the journal's FIRST line is the
+        // run.initialized event carrying integrity: receipts-v1 — written at
+        // initialization (before initialize returns) so no non-engine first
+        // writer can leave a non-empty unmarked journal on a v1 run, which
+        // resolveIntegrityPolicy would correctly convict as a stripped-marker
+        // conflict. Built through the same parseJournalEvent + eventLine
+        // primitive as appendJournal, so the hash chain and schema are
+        // identical to every later event; the engine's lazy emit skips once
+        // the marker is present, never duplicating it.
+        const genesis: JournalEvent = {
+          seq: 1,
+          ts: now,
+          type: 'run.initialized',
+          actor: 'engine',
+          payload: {
+            runId: input.runId,
+            snapshotId: snapshot.snapshotId,
+            integrity: INTEGRITY_POLICY,
+          },
+        };
+        const genesisParsed = parseJournalEvent(genesis);
+        if (!genesisParsed.ok) {
+          return failRes(schemaErr(genesisParsed.issues, 'journal event'));
+        }
+        const journalSeed = eventLine(genesisParsed.value) + '\n';
 
         // No managed artifact may already exist — never clobber a run.
         for (const p of [
@@ -781,6 +845,7 @@ export function createStore(options: StoreOpenOptions): Store {
           STORE_PATHS.objective,
           STORE_PATHS.snapshot,
           STORE_PATHS.journal,
+          STORE_PATHS.integrityIndex,
         ]) {
           if (existsSync(path.join(runDirAbs, p))) {
             return failRes(
@@ -802,7 +867,8 @@ export function createStore(options: StoreOpenOptions): Store {
           [STORE_PATHS.state, JSON.stringify(stateParsed.value, null, 2) + '\n'],
           [STORE_PATHS.objective, input.objective + '\n'],
           [STORE_PATHS.snapshot, JSON.stringify(snapshot, null, 2) + '\n'],
-          [STORE_PATHS.journal, ''],
+          [STORE_PATHS.journal, journalSeed],
+          [STORE_PATHS.integrityIndex, JSON.stringify(emptyIndex(input.runId), null, 2) + '\n'],
         ];
         for (const [rel, data] of steps) {
           const r = await write(rel, data);
