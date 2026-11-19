@@ -16,7 +16,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -364,8 +364,18 @@ test('init on the seeded fixture target works (read-only)', async () => {
   const dir = tmp('fixture');
   const objective = path.join(dir, 'objective.md');
   writeFileSync(objective, 'Review the Fieldnotes fixture.\n');
+  // Init runs against a clean temp COPY of the tracked fixture tree — live
+  // council artifacts under .council/.council-dev (host-run output, never
+  // tracked source) stay out of the copy, so the check is independent of
+  // any real council run that targeted the fixture. The original fixture
+  // and its artifacts are untouched.
+  const targetCopy = path.join(dir, 'review-target');
+  cpSync(FIXTURE_TARGET, targetCopy, {
+    recursive: true,
+    filter: (source) => !['.council', '.council-dev'].includes(path.basename(source)),
+  });
   const r = await cliJson(
-    ['init', '--objective', objective, '--target', FIXTURE_TARGET, '--config', staffConfig(dir), '--json'],
+    ['init', '--objective', objective, '--target', targetCopy, '--config', staffConfig(dir), '--json'],
     { COUNCIL_HOME: path.join(dir, 'council-home'), ORCA_CLI_COMMAND: NO_ORCA },
   );
   assert.equal(r.code, 0, r.stdout + r.stderr);
@@ -373,8 +383,9 @@ test('init on the seeded fixture target works (read-only)', async () => {
     readFileSync(path.join(r.body.runDir as string, 'snapshot.json'), 'utf8'),
   ) as { files: Record<string, unknown> };
   assert.ok(Object.keys(snap.files).includes('src/pagination.js'));
-  // The fixture itself was not mutated.
-  assert.ok(!existsSync(path.join(FIXTURE_TARGET, '.council')));
+  // The reviewed target itself was not mutated: run state lives under the
+  // external COUNCIL_HOME, so no .council appears inside the copy.
+  assert.ok(!existsSync(path.join(targetCopy, '.council')));
 });
 
 // ─── doctor ──────────────────────────────────────────────────────────────────

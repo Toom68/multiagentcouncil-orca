@@ -665,8 +665,9 @@ describe('OrcaAdapter.launchWorker', () => {
     assert.ok(res.ok);
     if (!res.ok) return;
     assert.equal(res.value.outcome, 'started');
-    const start = calls.find((a) => a[1] === 'worker-start');
-    assert.ok(start?.includes('--terminal') && start.includes('term_keep'));
+    const starts = calls.filter((a) => a[1] === 'worker-start');
+    assert.equal(starts.length, 1, 'a ready retained terminal attaches exactly once');
+    assert.ok(starts[0]?.includes('--terminal') && starts[0].includes('term_keep'));
     assert.ok(calls.every((a) => a[1] !== 'create'), 'reuse lane must not create a terminal');
   });
 
@@ -784,6 +785,83 @@ describe('OrcaAdapter.launchWorker', () => {
     if (!res.ok) return;
     assert.equal(res.value.outcome, 'unknown');
     assert.ok(calls.every((a) => a[1] !== 'worker-start'), 'must not start on a trust-screen terminal');
+  });
+
+  it('reports a FAILED launch (not uncertain) when the retained handle is proven stale', async () => {
+    // Live evidence: after an Orca restart, the retained handle from the
+    // pre-restart session is runtime-stale. Recorded journal
+    // crun_01M7RZE6YCB77MYHWX17YVH9PQ seq 177 — `terminal show` on
+    // term_d737eeae-… failed `terminal_handle_stale: terminal_handle_stale`
+    // and the run blocked 'uncertain'. Custody was already proven settled and
+    // NO mutation was issued: a definitive no-worker-start failure the
+    // engine's bounded fresh-session fallback can act on.
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'worker-list'
+        ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_dead', state: 'succeeded', liveness: 'idle', terminalState: 'retained' }] })
+        : args[1] === 'show'
+          ? failEnv('terminal_handle_stale', 'terminal_handle_stale')
+          : failEnv('unexpected_command', String(args[1])),
+    );
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_dead' }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed');
+    // Concrete stage/code/evidence propagate so the caller can distinguish
+    // this definitive preflight failure from a refused mutation.
+    assert.match(res.value.detail ?? '', /stage=readiness/);
+    assert.match(res.value.detail ?? '', /terminal_handle_stale/);
+    assert.equal(res.value.terminalHandle, 'term_dead');
+    // Preflight only: worker-list + terminal show, zero mutations — no
+    // terminal create and no worker-start on this call.
+    assert.deepEqual(
+      calls.map((a) => `${a[0]} ${a[1]}`),
+      ['orchestration worker-list', 'terminal show'],
+    );
+    assert.ok(calls.every((a) => a[1] !== 'create'), 'must not create a terminal on this call');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'), 'must not issue worker-start on a stale handle');
+    assert.equal(res.value.dispatchId, undefined);
+  });
+
+  it('keeps a NON-stale retained-terminal readiness transport failure uncertain', async () => {
+    // Anything but the verified stale code stays 'unknown' — a transient
+    // read failure cannot prove the terminal is gone.
+    for (const code of ['terminal_not_found', 'runtime_unavailable', 'io_error']) {
+      const { adapter, calls } = makeAdapter((args) =>
+        args[1] === 'worker-list'
+          ? okEnv({ workers: [{ dispatchId: 'ctx_old', terminal: 'term_keep', state: 'succeeded' }] })
+          : args[1] === 'show'
+            ? failEnv(code, `${code} happened`)
+            : failEnv('unexpected_command', String(args[1])),
+      );
+      const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep' }));
+      assert.ok(res.ok);
+      if (!res.ok) continue;
+      assert.equal(res.value.outcome, 'unknown', code);
+      assert.match(res.value.detail ?? '', /readiness_unproven/);
+      assert.ok(calls.every((a) => a[1] !== 'worker-start'), `no attach on ${code}`);
+    }
+  });
+
+  it('keeps a FRESH terminal that reports stale uncertain — custody is not dropped', async () => {
+    // create + wait succeeded, then show reports the SAME definitive code —
+    // contradictory receipts. The adapter owns a created-terminal receipt id
+    // and must NOT claim a clean failure: stay uncertain and retain the
+    // resource handle + Orca request evidence.
+    const { adapter, calls } = makeAdapter((args) => {
+      const cmd = args[1];
+      if (cmd === 'create') return okTerm({ terminal: { handle: 'term_t' } }, 'rcpt-tc-1');
+      if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'show') return failEnv('terminal_handle_stale', 'terminal_handle_stale');
+      return failEnv('unexpected_command', String(cmd));
+    });
+    const res = await adapter.launchWorker(launchSpec());
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.terminalHandle, 'term_t', 'created resource custody retained');
+    assert.equal(res.value.requestId, 'rcpt-tc-1', 'terminal-create receipt id retained for reconcile');
+    assert.match(res.value.detail ?? '', /readiness_unproven/);
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
   });
 });
 

@@ -301,6 +301,18 @@ const UNCERTAIN_CODES = new Set([
   'source_changed',
 ]);
 
+/**
+ * Orca error codes that DEFINITIVELY prove a terminal handle no longer
+ * resolves in this runtime. Handles are runtime-scoped — an Orca restart
+ * invalidates them (docs/design/orca-integration-proposal.md §5, verified
+ * on 1.4.261; live journal crun_01M7RZE6YCB77MYHWX17YVH9PQ seq 177 recorded
+ * on 1.4.263: `terminal show` on a pre-restart retained handle failed
+ * `terminal_handle_stale: terminal_handle_stale`). Closed vocabulary: add a
+ * code only with recorded live evidence — any other failure stays
+ * uncertainty, never a guessed "gone".
+ */
+const STALE_TERMINAL_CODES = new Set(['terminal_handle_stale']);
+
 // ---------------------------------------------------------------------------
 // OrcaHost — bounded operations over the `orca` CLI
 // ---------------------------------------------------------------------------
@@ -701,6 +713,29 @@ export class OrcaHost {
       // same explicit readiness proof as the fresh-argv path applies.
       const ready = await this.terminalReady(handle, expectedAgent);
       receipts.terminalShow = ready.state === 'ready' ? ready.value : ready.value ?? ready.error;
+      // A stale retained handle is a KNOWN no-worker-start failure: custody
+      // was proven settled, the readiness preflight was read-only, and no
+      // terminal-create / worker-start ran — nothing exists to reconcile.
+      // 'failed' (not 'uncertain') lets the engine apply its bounded
+      // fresh-session fallback; every other readiness failure stays
+      // uncertain because a live terminal may sit behind a prompt or a
+      // transient read error.
+      if (ready.state === 'gone') {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'failed',
+          failedStage: 'readiness',
+          terminalHandle: handle,
+          error: {
+            code: ready.error.code,
+            message: ready.message,
+            ...(ready.error.data === undefined ? {} : { data: ready.error.data }),
+          },
+          receipts,
+        };
+      }
       if (ready.state !== 'ready') {
         return {
           taskId,
@@ -941,6 +976,7 @@ export class OrcaHost {
   ): Promise<
     | { state: 'ready'; value: unknown }
     | { state: 'not_ready' | 'unproven'; message: string; error?: OrcaCliErrorShape; value?: unknown }
+    | { state: 'gone'; message: string; error: OrcaCliErrorShape; value?: unknown }
   > {
     const shown = await this.run<Record<string, unknown>>([
       'terminal',
@@ -950,6 +986,17 @@ export class OrcaHost {
       '--json',
     ]);
     if (!shown.ok) {
+      // A stale-handle refusal is DEFINITIVE, not unproven: the runtime-scoped
+      // handle can never resolve again. Reported as 'gone' so the retained-
+      // terminal caller can fail the launch cleanly (no mutation was issued)
+      // instead of parking an unrecoverable seat in 'uncertain'.
+      if (STALE_TERMINAL_CODES.has(shown.error.code)) {
+        return {
+          state: 'gone',
+          message: `terminal show for ${handle} failed (${shown.error.code}: ${shown.error.message}) — the runtime-scoped handle is stale in this Orca runtime; the terminal is definitively gone`,
+          error: shown.error,
+        };
+      }
       return {
         state: 'unproven',
         message: `terminal show for ${handle} failed (${shown.error.code}: ${shown.error.message}) — readiness could not be proven; inspect the terminal before retry`,

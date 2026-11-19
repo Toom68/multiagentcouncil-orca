@@ -435,3 +435,22 @@ approval. Cancellation retained one explicitly unverifiable challenge attempt
 worker is assigned a narrow retained-terminal preflight classification fix with
 regressions that keep transport errors, human prompts and newly-created-terminal
 ambiguity conservative. A fresh live validation follows after that fix.
+
+
+### Stale retained-terminal fix verified
+
+The retained-terminal readiness path now recognizes only the recorded
+`terminal_handle_stale` error as a known pre-attach failure. This enables the
+engine's existing bounded fresh-session fallback. Trust/permission prompts,
+wrong/unknown agents, transport failures, and ambiguity after creating a fresh
+terminal remain uncertain, with custody preserved.
+
+Primary verification: `npm test` **504/504 passed** (including **81 Orca adapter
+tests**). The seeded-fixture CLI test now operates on a clean temporary copy,
+excluding existing `.council`/`.council-dev` artifacts; prior live evidence remains
+untouched. A live preflight probe against the actual vanished handle returned
+`failed`, stage `readiness`, code `terminal_handle_stale` after exactly
+`orchestration worker-list` and `terminal show`. Both results came from the real
+Orca CLI; a process guard refused any mutation if unexpectedly attempted. Thus
+this is live read-only preflight evidence, not a full live worker/review cycle.
+Fresh full-protocol validation follows this fix.
