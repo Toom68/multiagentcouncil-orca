@@ -404,3 +404,15 @@ discussion routing and applied author responses are not yet established by this
 live attempt. Because five selected seats failed, a later report must remain
 partial. Automated 501-test and fake-host re-audit results remain separate from
 this live evidence.
+
+
+### Live independent phase closed
+
+The resumed fixture run closed independent review with **10/10 returned findings
+files admitted**, five restart-lost seats failed, and **zero artifact/evidence
+rejections** in its journal at that boundary. It built 20 canonical claims;
+remedies survived on all 20 and open questions on 17. Thus the live returned-output
+admission and the previously dropped useful-output fields are exercised with
+actual Devin outputs. This does not replace the missing five perspectives.
+A separate scribe-notes worker launched; discussion and final synthesis remain
+pending.
