@@ -1490,11 +1490,12 @@ export function createProgressNotifier(deps: ProgressDeps): ProgressNotifier {
           (r): { tag: 'result'; r: typeof r } => ({ tag: 'result', r }),
           (e): { tag: 'throw'; e: unknown } => ({ tag: 'throw', e }),
         );
+      let timeoutTimer: NodeJS.Timeout | undefined;
       const timeout = new Promise<{ tag: 'timeout' }>((resolvePromise) => {
-        const t = setTimeout(() => resolvePromise({ tag: 'timeout' }), sendTimeoutMs);
-        t.unref?.();
+        timeoutTimer = setTimeout(() => resolvePromise({ tag: 'timeout' }), sendTimeoutMs);
       });
       const raced = await Promise.race([sendPromise, timeout]);
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
       // A late-resolving send must never mutate delivery state post-timeout:
       // the intent is already marked unknown — swallow its result.
       void sendPromise.catch(() => undefined);
