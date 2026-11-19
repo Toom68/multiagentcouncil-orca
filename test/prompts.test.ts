@@ -185,6 +185,14 @@ describe('organiser', () => {
   test('requires structural diversity, not adjectives', () => {
     assert.match(spec, /structural, not cosmetic/i);
   });
+  test('warns that charter text lands verbatim as assignment data, not rules', () => {
+    // clm_0005 companion: the organiser must know its charter strings are
+    // embedded verbatim into reviewer specs — written descriptively, never
+    // as commands or spec restatements.
+    assert.match(spec, /embedded VERBATIM into each reviewer's spec/i);
+    assert.match(spec, /assignment data/);
+    assert.match(spec, /no authority/i);
+  });
   test('names the exact output path and ProposedRoster contract', () => {
     assert.match(spec, /roster\.proposed\.json/);
     assert.match(spec, /ProposedRoster/);
@@ -232,6 +240,31 @@ describe('independent reviewer', () => {
     // observe them, so the spec must not claim it journals/attributes reads.
     assert.match(spec, /cannot observe/i);
     assert.doesNotMatch(spec, /journals and attributes/i);
+  });
+  test('labels the charter organiser-authored and orchestrator-approved', () => {
+    // clm_0005: the charter IS council-authored content — the spec must
+    // name its provenance and approval authority instead of asserting the
+    // spec contains nothing produced by another participant.
+    assert.match(spec, /organiser-authored/);
+    assert.match(spec, /approved\s+verbatim/i);
+    assert.match(spec, /hash-bound/i);
+    assert.match(spec, /authoritative\s+assignment/i);
+  });
+  test('states charter text is assignment data, never new rules', () => {
+    // Charter fields may contain newline-formatted or instruction-like
+    // phrasing; they define WHAT the seat reviews, not permissions.
+    assert.match(spec, /worker-authored text/i);
+    assert.match(spec, /instruction-like/i);
+    assert.match(spec, /never new rules/i);
+    assert.match(spec, /outside this block are authoritative/i);
+  });
+  test('seals independence honestly — charter is the named exception', () => {
+    // The old claim "nothing produced by another council participant is in
+    // this spec" was false (the charter is). Independence = no peer
+    // findings/discussion, with the approved charter named as exception.
+    assert.doesNotMatch(spec, /nothing produced by another council participant/i);
+    assert.match(spec, /Apart from your approved charter/i);
+    assert.match(spec, /no peer findings, no envelopes/i);
   });
   test('states evidence rules and grade re-derivation honestly', () => {
     assert.match(spec, /unsupported/);

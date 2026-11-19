@@ -20,8 +20,10 @@ limitations, and honest coverage.
   ([docs/ORCA-COMPATIBILITY.md](docs/ORCA-COMPATIBILITY.md)).
 - **Agent CLIs** for the staff and seat lanes you choose. The shipped catalog
   (`council catalog --json`) documents `devin`, `claude`, and `codex` argv
-  lanes; `devin` + `swe-2-max` is the only lane exercised live so far —
-  the others are help-verified, not live-verified. There is no default
+  lanes; `devin` + `swe-2-max` has run full live councils and `codex` is
+  live-verified as a bounded supervisor launch — `claude` remains
+  help-verified only (evidence in
+  [docs/VERIFICATION.md](docs/VERIFICATION.md)). There is no default
   provider: fresh runs require an explicit staff and per-seat choices, each
   validated against the catalog and bound by the roster approval.
 
