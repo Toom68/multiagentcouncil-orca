@@ -43,3 +43,14 @@ Manual coordination resumed the same child Run and approval; eight admitted
 reviews survived, five lost workers remained failed, and the two unstarted seats
 were launched. Completion and discussion acceptance remain pending. The runtime
 repair commits are now also on `main` (through `03210ca`).
+
+
+Completion: after the live-discovered stale-terminal preflight fix (`5c7297b`),
+the fresh 15-seat run `crun_01M7S2SDXAW47M0BYZ13JZW5RQ` completed the full
+protocol: 15/15 admitted independent reviews, 30 claims, three distinct qualified
+challenges from identical local C-1 ids, two applied revisions, zero rejections,
+and intact final verification. One cap-omitted response and unchallenged claims
+remain explicit limitations. The code suite passed 504 tests. Detailed evidence
+and workload limits are recorded in docs/VERIFICATION.md; the repair-and-bounded-
+live-validation work is complete. Further production/default-volume testing is
+not claimed by this result.

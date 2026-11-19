@@ -255,10 +255,14 @@ your prior binding afterwards.
 - The product never installs this skill, changes permissions, or edits global
   config; permission posture is chosen explicitly per launch and recorded in
   the approval.
-- Live validation so far: a reduced council completed the full protocol
-  (organiser → approval → reviewers → real peer discussion → separate scribe)
-  with **partial** coverage because one independent output failed schema
-  validation. Child-Run rebind and exact no-effect task reconciliation were
-  exercised live. Scale and long-run stability are unverified — say so.
+- Live validation: a repaired 15-seat small-fixture council completed the
+  full protocol with all 15 independent files admitted, three distinct
+  qualified challenges (all local ids C-1), two author revisions applied,
+  and zero output/evidence rejections. It used reduced per-seat outputs
+  for one round; one cap-omitted response remains explicit dissent.
+  Full admitted-seat coverage is not full peer scrutiny. Default-volume,
+  multi-round and long-run production scale remain unverified. Earlier
+  partial/interrupted runs, child-Run rebind and exact no-effect task
+  reconciliation are recorded separately in docs/VERIFICATION.md.
 - `council` commands are the implemented CLI; `COUNCIL help` prints the
   authoritative command list for the installed version.

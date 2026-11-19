@@ -58,18 +58,16 @@ operating guide.
   discussion → scribe → report; durable journal-backed state; hash-bound
   approval invalidated by config/source drift; bounded launches/concurrency/
   deadlines/envelopes enforced by the runner.
-- **Status**: the reduced live Orca council completed the full protocol
-  (10 proposed perspectives, 2 selected reviewers, one discussion round and
-  a separate scribe) with a partial report. A subsequent 15-seat live
-  council (`crun_01M7RQP9MT8C6PE2MSW48KW3GK`) also completed the protocol
-  but admitted only 3 of 15 seats — dominantly because worker specs never
-  documented the enforced 200-char finding-title cap — and challenge
-  routing collapsed on colliding worker-minted ids. The repair that
-  followed (schema-accurate worker specs, qualified challenge routing,
-  bounded corrective attempts, scribe-notes consumption, honest quorum and
-  drift semantics) is recorded in
-  [docs/COUNCIL-FIX-PLAN.md](docs/COUNCIL-FIX-PLAN.md) and
-  [docs/VERIFICATION.md](docs/VERIFICATION.md).
+- **Status**: 504 automated tests pass locally. A repaired **15-seat live
+  Orca council completed the full protocol** with 15/15 independent files
+  admitted, 30 claims, three distinct qualified challenges (all local ids
+  were `C-1`), two applied author revisions and zero output/evidence
+  rejections. One response was omitted by the configured per-author cap;
+  its dissent remains unresolved. This was a small-fixture, one-round run
+  with reduced per-seat output budgets, not a production load test.
+  [docs/VERIFICATION.md](docs/VERIFICATION.md) records the evidence,
+  earlier interrupted/partial runs and remaining limits; the repair plan
+  is in [docs/COUNCIL-FIX-PLAN.md](docs/COUNCIL-FIX-PLAN.md).
 - **Cooperative (prompt-level, not sandboxed)**: reviewer edit restrictions,
   network/egress limits, and per-worker token/tool budgets. The runner enforces
   what it can observe; the rest is enforced by the worker prompts.

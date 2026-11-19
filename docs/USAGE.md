@@ -482,14 +482,21 @@ outcome recovery.
 
 ## Validation status — honest ledger
 
-- Module + acceptance tests (`npm test`) pass locally on Windows Node 26.7.0;
-  the GitHub CI matrix runs the same suite on Linux Node 22.x/24.x.
-- A **reduced live smoke completed the full protocol**: organiser → approval
-  of 2 seats from 10 perspectives → independent reviews → one real peer
-  challenge/response round → separate scribe → report, all on Devin
-  `swe-2-max`. The report is partial because one independent output failed
-  schema validation. Seven admitted claims covered the four fixture seeds,
-  with dissent and missing coverage preserved. This is small-scale live
-  validation; the 15-seat lifecycle is covered by fake-host tests, not a live
-  load test. [VERIFICATION.md](VERIFICATION.md) records the evidence and the
-  recovery/cleanup findings.
+- `npm test` passed **504/504** locally on macOS Node 26.8.1 after repairs.
+  Historical Windows validation and the Linux Node 22.x/24.x CI matrix are
+  recorded separately; local tests do not establish current CI status.
+- A **15-seat live Orca council completed the full protocol** on the
+  Fieldnotes fixture using Devin `swe-2-max`: organiser, exact roster
+  approval, 15/15 admitted independent files, separate scribe notes,
+  bounded discussion, two applied author revisions, and final synthesis.
+  Three reviewers minted local `C-1` and all retained distinct qualified
+  identities. No output/evidence rejections occurred; final verification
+  found no fixture drift and an intact approval/catalog binding.
+- This run used two findings and one challenge/response per seat for one
+  round. One response was cap-omitted and remains explicit unresolved
+  dissent; 27/30 claims received no challenge. Full seat coverage is not
+  full adversarial scrutiny or proof. Default output-volume throughput,
+  multi-round and long-run production scale remain unverified.
+- [VERIFICATION.md](VERIFICATION.md) preserves the completed run's
+  metrics, prior partial/cancelled runs, fault-injection audits and custody
+  limits. The earlier reduced smoke remains historical evidence.

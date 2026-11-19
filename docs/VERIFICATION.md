@@ -454,3 +454,46 @@ untouched. A live preflight probe against the actual vanished handle returned
 Orca CLI; a process guard refused any mutation if unexpectedly attempted. Thus
 this is live read-only preflight evidence, not a full live worker/review cycle.
 Fresh full-protocol validation follows this fix.
+
+
+## Completed 15-seat live acceptance after repairs (2026-11-19)
+
+Run `crun_01M7S2SDXAW47M0BYZ13JZW5RQ` completed the real Orca protocol on
+Fieldnotes using committed runtime `5c7297b`: organiser → persisted roster
+approval → independent reviews → separate scribe notes → bounded challenge and
+author-response round → separate scribe synthesis → canonical report. This is
+live CLI/worker evidence, independently inspected by the primary orchestrator;
+it is not the fake-host acceptance suite.
+
+| Check | Observed result |
+| --- | --- |
+| Selected/admitted independent seats | 15/15; quorumRatio 1 met; no uncovered perspectives |
+| Canonical claims | 30, all runner-graded plausible_risk |
+| Admitted challenge files | 15 (12 correctly contained zero justified challenges) |
+| Local challenge ID collision case | Three separate reviewers minted C-1; all three retained distinct qualified IDs and claim history |
+| Author responses | Two admitted and applied; clm_0009 and clm_0013 revised |
+| Rejected outputs/evidence | 0 |
+| Corrective attempts needed | 0 |
+| Useful-output retention | Remedies on all 30 claims; open questions on 24 |
+| Run outcome | succeeded / reported, coverage.partial false |
+| Integrity after completion | verify true; no fixture drift; approval and catalog fingerprint intact |
+| Phase launches | 35 engine-accounted launches (plus dedicated supervisor), below approved cap 100 |
+
+The configured workload was 15 perspectives/seats, concurrency 5, one round,
+max two findings and one challenge/response per seat, 8192-byte envelopes. The
+configured small discussion budget matters: 225 challenge-assignment candidates
+were omitted by bounds; one additional author response was omitted because its
+author's single response slot was already allocated. The report preserves that
+unanswered clm_0010 severity challenge as dissent. Twenty-seven claims remain
+proposed without peer challenge. Full admitted-seat coverage is not comprehensive
+peer scrutiny, consensus, or proof of every reviewer assertion. This validates a
+15-seat small-fixture lifecycle, not default seven-findings/three-challenges
+throughput, multi-round behavior, other providers, or long-run production load.
+
+The final report renders deterministic facts before labelled scribe-authored
+narrative, and retains the three challenged positions, original evidence, remedies,
+open questions and revisions. The scribe's admitted notes are explicitly included
+in its synthesis spec. All prior cancelled/partial runs remain available locally;
+none were rewritten to create this successful result. Report/summary/JSON and
+journal are under the run's ignored `.council` directory; no local session or
+credential artifacts are committed.
