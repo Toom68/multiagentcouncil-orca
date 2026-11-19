@@ -247,6 +247,7 @@ test('stage milestones send once each with persisted counts; repeats dedupe', as
   assert.equal(calls[0].to, 'run:run_primary');
   assert.match(calls[0].subject, /organiser/);
   assert.match(calls[0].body, /launches: 2\/30/);
+  assert.match(calls[0].body, /wait for the organiser to propose a roster/);
   assert.match(calls[0].body, /does not verify worker or host liveness/);
 
   const r2 = unwrap(await n.notify({ kind: 'stage', status: 'organising' }));
@@ -825,6 +826,7 @@ test('progressStatus reports recipient, deliveries, budget and helper state', as
     join(dir, HELPER_LEASE_FILE),
     JSON.stringify({ nonce: 'h1', pid: process.pid, startedAt: new Date(T0).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() }),
   );
+  writeFileSync(join(dir, HELPER_STATE_FILE), JSON.stringify({ nonce: 'h1', pid: process.pid, exitReason: null }));
   const r = unwrap(await progressStatus(dir));
   assert.equal(r.recipient?.to, 'run:run_primary');
   assert.equal(r.deliveries.sent, 1);

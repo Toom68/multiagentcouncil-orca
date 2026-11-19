@@ -995,6 +995,8 @@ function currentActionFor(facts: RunFacts): string {
       return 'inspect journal/status for the terminal record';
     case 'initialized':
       return 'launch the supervisor to begin organising';
+    case 'organising':
+      return 'wait for the organiser to propose a roster for approval';
     default:
       if (facts.approvalHash === null && facts.status !== 'unreadable') {
         return 'approval was invalidated — re-approve the exact roster to resume';
@@ -2037,7 +2039,7 @@ export async function progressStatus(runDir: string): Promise<Result<ProgressSta
     const hs = hsR.ok ? parseHelperState(hsR.value) : null;
 
     let helper: HelperStatusView;
-    if (hs !== null && hs.exitReason !== undefined) {
+    if (hs !== null && hs.exitReason !== undefined && hs.exitReason !== null) {
       helper = { ...hs, state: 'exited' };
     } else if (lease === null) {
       helper =
@@ -2048,15 +2050,15 @@ export async function progressStatus(runDir: string): Promise<Result<ProgressSta
       const expired = Date.parse(lease.expiresAt) <= Date.now();
       const alive = lease.pid !== null ? pidAlive(lease.pid) : null;
       if (!expired && alive === true) {
-        helper = { state: 'running', pid: lease.pid!, nonce: lease.nonce, expiresAt: lease.expiresAt, ...(hs ?? {}) };
+        helper = { ...(hs ?? {}), state: 'running', pid: lease.pid!, nonce: lease.nonce, expiresAt: lease.expiresAt };
       } else if (!expired && lease.pid === null) {
         helper = { state: 'starting', nonce: lease.nonce, expiresAt: lease.expiresAt };
       } else if (!expired && alive === null) {
-        helper = { state: 'stale', pid: lease.pid ?? undefined, nonce: lease.nonce, detail: 'owner pid unverifiable', ...(hs ?? {}) };
+        helper = { ...(hs ?? {}), state: 'stale', pid: lease.pid ?? undefined, nonce: lease.nonce, detail: 'owner pid unverifiable' };
       } else if (alive === true) {
-        helper = { state: 'stale', pid: lease.pid!, nonce: lease.nonce, detail: 'lease expired but pid still alive', ...(hs ?? {}) };
+        helper = { ...(hs ?? {}), state: 'stale', pid: lease.pid!, nonce: lease.nonce, detail: 'lease expired but pid still alive' };
       } else {
-        helper = { state: 'dead', pid: lease.pid ?? undefined, nonce: lease.nonce, detail: 'lease expired and owner pid is dead', ...(hs ?? {}) };
+        helper = { ...(hs ?? {}), state: 'dead', pid: lease.pid ?? undefined, nonce: lease.nonce, detail: 'lease expired and owner pid is dead' };
       }
     }
     if (hs !== null && helper.state !== 'exited') {
