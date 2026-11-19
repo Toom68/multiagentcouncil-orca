@@ -17,11 +17,13 @@ import {
   type CouncilReport,
   type CouncilRunId,
   type Evidence,
+  type LimitationSource,
   type Participant,
   type PerspectiveId,
   type PhaseKind,
   type ProposedRoster,
   type ReportCoverage,
+  type RunnerFacts,
   type SeatOutcome,
 } from './contracts.js';
 import { orderedClaims, severityRank, gradeRank } from './claims.js';
@@ -150,24 +152,61 @@ export interface ScribeNarrative {
   limitations?: string[];
 }
 
+/** Honest English plural: `1 claim`, `2 claims`, `3 disputed claims`. */
+function plural(n: number, singular: string, pluralForm?: string): string {
+  return `${n} ${n === 1 ? singular : (pluralForm ?? `${singular}s`)}`;
+}
+
 function deterministicSummary(report: Pick<CouncilReport, 'claims' | 'coverage'>): string {
   const total = report.claims.length;
   const byStatus = new Map<string, number>();
   for (const c of report.claims) byStatus.set(c.status, (byStatus.get(c.status) ?? 0) + 1);
   const completed = report.coverage.seats.filter((s) => s.outcome === 'completed').length;
   const parts = [
-    `Council review: ${total} canonical claim${total === 1 ? '' : '' !== '' ? 's' : ''}`,
+    `Council review: ${plural(total, 'canonical claim')}`,
     `across ${completed}/${report.coverage.selectedSeats} completed seats`,
   ];
   const statusBits = [...byStatus.entries()].sort().map(([k, v]) => `${k}: ${v}`);
   if (statusBits.length > 0) parts.push(`(${statusBits.join(', ')})`);
+  const disputed = report.claims.filter((c) => c.dissent.length > 0).length;
+  if (disputed > 0) parts.push(`— ${plural(disputed, 'disputed claim')}`);
   if (report.coverage.partial) parts.push('— PARTIAL COVERAGE');
   return parts.join(' ');
 }
 
 /**
+ * Deterministic, runner-computed facts for the report — the numbers a
+ * scribe's prose can never obscure: coverage, status counts, unresolved
+ * disputes, and where the narrative summary came from.
+ */
+export function buildRunnerFacts(
+  coverage: ReportCoverage,
+  claims: Claim[],
+  summarySource: 'scribe' | 'runner',
+): RunnerFacts {
+  const byStatus: Record<string, number> = {};
+  for (const c of claims) byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
+  return {
+    seatsCompleted: coverage.seats.filter((s) => s.outcome === 'completed').length,
+    seatsSelected: coverage.selectedSeats,
+    partialCoverage: coverage.partial,
+    uncoveredPerspectiveIds: coverage.uncoveredPerspectiveIds,
+    summarySource,
+    claims: {
+      total: claims.length,
+      byStatus,
+      withDissent: claims.filter((c) => c.dissent.length > 0).map((c) => c.claimId),
+      withdrawn: byStatus['withdrawn'] ?? 0,
+      escalated: byStatus['escalated'] ?? 0,
+    },
+  };
+}
+
+/**
  * Assemble the runner-canonical report. Claims come from the ledger only;
- * the scribe supplies narrative text when its artifact validated.
+ * the scribe supplies narrative text when its artifact validated. Runner
+ * facts disclose coverage and disputes deterministically, and limitations
+ * keep their origin (runner-derived vs scribe-authored) in emission order.
  */
 export function buildCouncilReport(input: {
   runId: CouncilRunId;
@@ -183,18 +222,21 @@ export function buildCouncilReport(input: {
   const coverage = buildCoverage(input);
   const claims = orderedClaims(input.ledger);
   const limitations: string[] = [];
+  const limitationSources: LimitationSource[] = [];
   const seen = new Set<string>();
-  for (const l of [...input.runnerLimitations, ...(input.scribe?.limitations ?? [])]) {
-    const t = l.trim();
-    if (t.length === 0 || seen.has(t) || limitations.length >= 20) continue;
+  const pushLimitation = (origin: 'runner' | 'scribe', text: string): void => {
+    const t = text.trim();
+    if (t.length === 0 || seen.has(t) || limitations.length >= 20) return;
     seen.add(t);
     limitations.push(t.length > 1000 ? t.slice(0, 999) + '…' : t);
-  }
+    limitationSources.push({ origin, text: t.length > 1000 ? t.slice(0, 999) + '…' : t });
+  };
+  for (const l of input.runnerLimitations) pushLimitation('runner', l);
+  for (const l of input.scribe?.limitations ?? []) pushLimitation('scribe', l);
   const partial: Pick<CouncilReport, 'claims' | 'coverage'> = { claims, coverage };
-  const summary =
-    input.scribe?.summary !== undefined && input.scribe.summary.trim().length > 0
-      ? input.scribe.summary
-      : deterministicSummary(partial);
+  const scribeSummary = input.scribe?.summary;
+  const scribeSummaryUsable = scribeSummary !== undefined && scribeSummary.trim().length > 0;
+  const summary = scribeSummaryUsable ? scribeSummary : deterministicSummary(partial);
   return {
     schemaVersion: SCHEMA_VERSION,
     runId: input.runId,
@@ -203,6 +245,8 @@ export function buildCouncilReport(input: {
     coverage,
     claims,
     limitations,
+    runnerFacts: buildRunnerFacts(coverage, claims, scribeSummaryUsable ? 'scribe' : 'runner'),
+    limitationSources,
   };
 }
 
@@ -230,8 +274,18 @@ function renderClaim(c: Claim, lines: string[]): void {
     '',
     `- kind: ${c.kind} | severity: ${c.severity} | grade: ${c.grade} | status: ${c.status} | confidence: ${c.confidence}`,
     `- source findings: ${c.sourceFindings.map((f) => `${f.participantId}/${f.findingId}`).join(', ')}`,
-    '',
   );
+  if (c.mergedTitles !== undefined && c.mergedTitles.length > 0) {
+    lines.push(`- merged titles: ${c.mergedTitles.map((t) => `“${t}”`).join(', ')}`);
+  }
+  if (c.assessments !== undefined && c.assessments.length > 1) {
+    lines.push(
+      `- author assessments: ${c.assessments
+        .map((a) => `${a.participantId} → ${a.severity} @ ${a.confidence}`)
+        .join(', ')}`,
+    );
+  }
+  lines.push('');
   if (c.evidence.length > 0) {
     lines.push('Evidence:');
     for (const ev of c.evidence) fmtEvidence(ev, lines);
@@ -242,10 +296,21 @@ function renderClaim(c: Claim, lines: string[]): void {
     for (const ev of c.counterEvidence) fmtEvidence(ev, lines);
     lines.push('');
   }
+  if (c.remedies !== undefined && c.remedies.length > 0) {
+    lines.push('Remedies:');
+    for (const r of c.remedies) lines.push(`- ${r}`);
+    lines.push('');
+  }
+  if (c.openQuestions !== undefined && c.openQuestions.length > 0) {
+    lines.push('Open questions:');
+    for (const q of c.openQuestions) lines.push(`- ${q}`);
+    lines.push('');
+  }
   if (c.dissent.length > 0) {
     lines.push('Dissent:');
     for (const d of c.dissent) {
       lines.push(`- ${d.participantId}${d.round !== null ? ` (round ${d.round})` : ''}: ${d.position}`);
+      if (d.evidence !== undefined) for (const ev of d.evidence) fmtEvidence(ev, lines);
     }
     lines.push('');
   }
@@ -260,6 +325,53 @@ function renderClaim(c: Claim, lines: string[]): void {
   }
 }
 
+/** Render the deterministic facts block — always present, never prose. */
+function renderRunnerFacts(report: CouncilReport, lines: string[]): void {
+  const rf = report.runnerFacts;
+  if (rf === undefined) {
+    // Legacy report shape: derive the same facts from coverage + claims so
+    // even old artifacts render honest numbers.
+    const disputed = report.claims.filter((c) => c.dissent.length > 0);
+    lines.push(
+      '## Runner facts',
+      '',
+      `- seats completed: ${report.coverage.seats.filter((s) => s.outcome === 'completed').length}/${report.coverage.selectedSeats}`,
+      `- partial coverage: ${report.coverage.partial ? 'YES' : 'no'}`,
+      `- claims: ${plural(report.claims.length, 'claim')}; ${plural(disputed.length, 'disputed claim')}`,
+      `- narrative summary source: unknown (pre-repair artifact)`,
+      '',
+    );
+    return;
+  }
+  lines.push(
+    '## Runner facts',
+    '',
+    `- seats completed: ${rf.seatsCompleted}/${rf.seatsSelected}`,
+    `- **partial coverage: ${rf.partialCoverage ? 'YES' : 'no'}**`,
+    `- narrative summary: ${rf.summarySource === 'scribe' ? 'scribe-authored' : 'deterministic runner fallback'}`,
+    `- claims: ${plural(rf.claims.total, 'claim')}`,
+  );
+  const statusBits = Object.entries(rf.claims.byStatus).sort().map(([k, v]) => `${k}: ${v}`);
+  if (statusBits.length > 0) lines.push(`- status counts: ${statusBits.join(', ')}`);
+  if (rf.claims.withDissent.length > 0) {
+    lines.push(`- **${plural(rf.claims.withDissent.length, 'claim')} with unresolved dissent: ${rf.claims.withDissent.join(', ')}**`);
+  }
+  if (rf.claims.withdrawn > 0) lines.push(`- withdrawn: ${rf.claims.withdrawn}`);
+  if (rf.claims.escalated > 0) lines.push(`- escalated to orchestrator: ${rf.claims.escalated}`);
+  if (rf.uncoveredPerspectiveIds.length > 0) {
+    lines.push(`- **uncovered perspectives: ${rf.uncoveredPerspectiveIds.join(', ')}**`);
+  }
+  lines.push('');
+}
+
+/** Label a report's narrative by who authored it — never implied. */
+function summaryLabel(report: CouncilReport): string {
+  if (report.runnerFacts === undefined) return 'unattributed — pre-repair artifact';
+  return report.runnerFacts.summarySource === 'scribe'
+    ? 'scribe-authored'
+    : 'deterministic runner fallback';
+}
+
 /** Render the canonical report deterministically — same input, same bytes. */
 export function renderReportMarkdown(report: CouncilReport): string {
   const lines: string[] = [
@@ -267,10 +379,12 @@ export function renderReportMarkdown(report: CouncilReport): string {
     '',
     `Generated: ${report.generatedAt}`,
     '',
-    '## Summary',
-    '',
-    report.summary,
-    '',
+  ];
+  // Deterministic runner facts lead: coverage and disputes are verified
+  // numbers and must not sit beneath unverified authored prose.
+  renderRunnerFacts(report, lines);
+  lines.push(`## Narrative summary — ${summaryLabel(report)}`, '', report.summary, '');
+  lines.push(
     '## Coverage',
     '',
     `- requested perspectives: ${report.coverage.requestedPerspectives}`,
@@ -280,7 +394,7 @@ export function renderReportMarkdown(report: CouncilReport): string {
     '',
     '| seat | perspective | participant | outcome | phases completed | detail |',
     '| --- | --- | --- | --- | --- | --- |',
-  ];
+  );
   for (const s of report.coverage.seats) {
     lines.push(
       `| ${s.seatId} | ${s.perspectiveId} | ${s.participantId} | ${s.outcome} | ${s.phasesCompleted.join(',') || '—'} | ${s.detail ?? ''} |`,
@@ -302,7 +416,11 @@ export function renderReportMarkdown(report: CouncilReport): string {
       a.claimId.localeCompare(b.claimId),
   );
   for (const c of sorted) renderClaim(c, lines);
-  if (report.limitations.length > 0) {
+  if (report.limitationSources !== undefined && report.limitationSources.length > 0) {
+    lines.push('## Limitations', '');
+    for (const l of report.limitationSources) lines.push(`- [${l.origin}] ${l.text}`);
+    lines.push('');
+  } else if (report.limitations.length > 0) {
     lines.push('## Limitations', '');
     for (const l of report.limitations) lines.push(`- ${l}`);
     lines.push('');
@@ -311,20 +429,24 @@ export function renderReportMarkdown(report: CouncilReport): string {
   return lines.join('\n');
 }
 
-/** Short fallback summary.md when no scribe narrative was admitted. */
+/**
+ * Short fallback summary.md when no scribe narrative was admitted. Verified
+ * facts lead; the narrative text carries an explicit authorship label.
+ */
 export function renderSummaryMarkdown(report: CouncilReport): string {
   const completed = report.coverage.seats.filter((s) => s.outcome === 'completed').length;
+  const disputed = report.claims.filter((c) => c.dissent.length > 0).length;
   const lines = [
     `# Council summary — ${report.runId}`,
     '',
-    report.summary,
-    '',
-    `- ${report.claims.length} claims; ${completed}/${report.coverage.selectedSeats} seats completed`,
+    `- ${plural(report.claims.length, 'claim')}; ${completed}/${report.coverage.selectedSeats} seats completed`,
     `- partial coverage: ${report.coverage.partial ? 'YES' : 'no'}`,
+    `- ${plural(disputed, 'disputed claim')}`,
   ];
   if (report.coverage.uncoveredPerspectiveIds.length > 0) {
     lines.push(`- uncovered perspectives: ${report.coverage.uncoveredPerspectiveIds.join(', ')}`);
   }
+  lines.push('', `Narrative summary (${summaryLabel(report)}):`, '', report.summary, '');
   const top = [...report.claims]
     .filter((c) => c.status !== 'withdrawn')
     .sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.claimId.localeCompare(b.claimId))

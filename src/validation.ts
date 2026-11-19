@@ -20,6 +20,7 @@ import type {
   ChallengesFile,
   ChallengeKind,
   Claim,
+  ClaimAssessment,
   ClaimEvent,
   ClaimId,
   ClaimView,
@@ -36,6 +37,7 @@ import type {
   FindingsFile,
   JournalEvent,
   JournalEventType,
+  LimitationSource,
   Participant,
   ParseResult,
   Perspective,
@@ -43,6 +45,7 @@ import type {
   PhaseDeadlines,
   ProposedRoster,
   ReportCoverage,
+  RunnerFacts,
   ResponseAssignment,
   ResponseDisposition,
   ResponseEnvelope,
@@ -51,6 +54,7 @@ import type {
   SeatAssignment,
   Severity,
   SourceSnapshot,
+  SynthesisFile,
   ValidationIssue,
   ClaimStatus,
   CouncilStaff,
@@ -314,7 +318,7 @@ const CLAIM_EVENT_TYPES = ['admitted', 'challenged', 'defended', 'revised', 'wit
 const SEAT_OUTCOMES = ['completed', 'partial', 'failed', 'timed_out', 'not_launched'] as const;
 const JOURNAL_EVENT_TYPES = [
   'run.initialized', 'phase.entered', 'barrier.refused', 'task.created',
-  'launch.intent', 'worker.started', 'worker.settled', 'worker.unknown',
+  'launch.intent', 'launch.resume', 'worker.started', 'worker.settled', 'worker.unknown',
   'worker.timed_out', 'worker.stop_requested', 'worker.stopped', 'worker.released',
   'mail.sent', 'mail.observed', 'roster.proposed', 'approval.granted',
   'approval.invalidated', 'artifact.written', 'artifact.admitted',
@@ -322,9 +326,16 @@ const JOURNAL_EVENT_TYPES = [
   'claim.updated', 'report.written', 'error', 'run.finished',
 ] as const;
 
-// Compile-time exhaustiveness: fails to compile if a union member is missing.
+// Compile-time exhaustiveness: fails to compile if EITHER the enum misses a
+// union member OR carries one the union does not declare. Bracketed tuple
+// form checks whole-union subset in both directions; the failure branches
+// are non-true literals so a mismatch cannot silently collapse to `never`.
 type AssertCover<A extends readonly string[], U> =
-  U extends A[number] ? (A[number] extends U ? true : never) : never;
+  [U] extends [A[number]]
+    ? [A[number]] extends [U]
+      ? true
+      : 'enum member missing from union'
+    : 'union member missing from enum';
 const _cover: true[] = [
   null as unknown as AssertCover<typeof EVIDENCE_KINDS, EvidenceKind>,
   null as unknown as AssertCover<typeof FINDING_KINDS, FindingKind>,
@@ -825,8 +836,22 @@ function parseChallenge(u: unknown, path: string, issues: ValidationIssue[]): Ch
   const kind = reqEnum(o.kind, CHALLENGE_KINDS, `${path}.kind`, issues);
   const argument = reqStr(o.argument, `${path}.argument`, issues, { max: 4000 });
   const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 10 });
+  // A 'counterexample' challenge asserts a concrete counter-case — it must
+  // carry at least one evidence item to be justifiable; other kinds keep
+  // evidence optional so nothing forces fabricated citations.
+  if (kind === 'counterexample' && evidence.length === 0) {
+    issues.push(fail(`${path}.evidence`, 'required', 'counterexample challenges require at least one evidence item'));
+  }
+  // Runner-stamped provenance on routed copies — parsed when present, never
+  // required (worker-minted challenge files lack it).
+  const localChallengeId = optId(o.localChallengeId, `${path}.localChallengeId`, issues);
+  const challengerPid = optId(o.challengerPid, `${path}.challengerPid`, issues);
   if (challengeId === null || claimId === null || kind === null || argument === null) return null;
-  return { challengeId, claimId, kind, argument, evidence };
+  if (kind === 'counterexample' && evidence.length === 0) return null;
+  const out: Challenge = { challengeId, claimId, kind, argument, evidence };
+  if (localChallengeId !== undefined) out.localChallengeId = localChallengeId;
+  if (challengerPid !== undefined) out.challengerPid = challengerPid;
+  return out;
 }
 
 export function parseChallengesFile(
@@ -940,7 +965,7 @@ function parseEnvelopeBase(
   raw: unknown,
   ctx: { runId?: string; phase?: string; round?: number; maxAssignments?: number },
   issues: ValidationIssue[],
-): { runId: string; round: number | null; recipientId: string; outputPath: string; outputContract: string } | null {
+): { runId: string; round: number | null; recipientId: string; outputPath: string; outputContract: string; omittedCount?: number } | null {
   const o = reqObj(raw, 'envelope', issues);
   if (o === null) return null;
   reqVersion(o.schemaVersion, 'envelope.schemaVersion', issues);
@@ -961,10 +986,17 @@ function parseEnvelopeBase(
   })();
   const outputContract = reqEnum(
     o.outputContract,
-    ['FindingsFile', 'ChallengesFile', 'ResponsesFile', 'ScribeNotesFile', 'ReportFile'] as const,
+    ['FindingsFile', 'ChallengesFile', 'ResponsesFile', 'ScribeNotesFile', 'SynthesisFile', 'ReportFile'] as const,
     'envelope.outputContract',
     issues,
   );
+  // Self-declared omission count: optional, but when present must be a
+  // non-negative integer consistent with the cap semantics — a malformed
+  // counter is a parse issue, never silently accepted.
+  let omittedCount: number | undefined;
+  if (o.omittedCount !== undefined && o.omittedCount !== null) {
+    omittedCount = reqInt(o.omittedCount, 'envelope.omittedCount', issues, { min: 0 }) ?? undefined;
+  }
   if (!isArr(o.assignments)) {
     issues.push(fail('envelope.assignments', 'type', 'expected array'));
     return null;
@@ -975,7 +1007,8 @@ function parseEnvelopeBase(
     return null;
   }
   if (runId === null || recipientId === null || outputPath === null || outputContract === null || round === undefined) return null;
-  return { runId, round, recipientId, outputPath, outputContract };
+  const base = { runId, round, recipientId, outputPath, outputContract };
+  return omittedCount !== undefined ? { ...base, omittedCount } : base;
 }
 
 export function parseChallengeEnvelope(
@@ -1007,6 +1040,7 @@ export function parseChallengeEnvelope(
     round: base.round,
     recipientId: base.recipientId,
     assignments,
+    ...(base.omittedCount !== undefined ? { omittedCount: base.omittedCount } : {}),
     outputPath: base.outputPath,
     outputContract: 'ChallengesFile',
   });
@@ -1047,6 +1081,7 @@ export function parseResponseEnvelope(
     round: base.round,
     recipientId: base.recipientId,
     assignments,
+    ...(base.omittedCount !== undefined ? { omittedCount: base.omittedCount } : {}),
     outputPath: base.outputPath,
     outputContract: 'ResponsesFile',
   });
@@ -1094,6 +1129,46 @@ export function parseScribeNotesFile(
   return ok(out);
 }
 
+/** SynthesisFile bounds — shared with the prompts contract. */
+export const SYNTHESIS_SUMMARY_MAX = 8000;
+export const SYNTHESIS_LIMITATIONS_MAX_ITEMS = 20;
+export const SYNTHESIS_LIMITATION_MAX_LEN = 1000;
+export const SYNTHESIS_GENERATED_AT_MAX = 40;
+
+/**
+ * scribe/report.json — the NARRATIVE-ONLY scribe artifact. The engine consumes
+ * exactly `summary` and `limitations`; claims/coverage are runner-canonical
+ * and never scribe-authored. A legacy file carrying a full CouncilReport
+ * deliberately fails here (extra fields tolerated, but the required report
+ * shape `coverage`/`claims` is absent so it cannot masquerade as narrative) —
+ * callers fall back to parseReportFile for those.
+ */
+export function parseSynthesisFile(
+  raw: unknown,
+  ctx: { runId?: string; participantId?: string },
+): ParseResult<SynthesisFile> {
+  const issues: ValidationIssue[] = [];
+  const o = reqObj(raw, 'file', issues);
+  if (o === null) return parseFail(issues);
+  reqVersion(o.schemaVersion, 'file.schemaVersion', issues);
+  const runId = reqId(o.runId, 'file.runId', issues);
+  const participantId = reqId(o.participantId, 'file.participantId', issues);
+  if (runId !== null && ctx.runId !== undefined && runId !== ctx.runId)
+    issues.push(fail('file.runId', 'mismatch', `expected ${ctx.runId}`));
+  if (participantId !== null && ctx.participantId !== undefined && participantId !== ctx.participantId)
+    issues.push(fail('file.participantId', 'mismatch', `expected ${ctx.participantId}`));
+  const generatedAt = optStr(o.generatedAt, 'file.generatedAt', issues, { max: SYNTHESIS_GENERATED_AT_MAX });
+  const summary = reqStr(o.summary, 'file.summary', issues, { max: SYNTHESIS_SUMMARY_MAX });
+  const limitations = reqStrArr(o.limitations, 'file.limitations', issues, {
+    maxItems: SYNTHESIS_LIMITATIONS_MAX_ITEMS,
+    maxItemLen: SYNTHESIS_LIMITATION_MAX_LEN,
+  });
+  if (issues.length || runId === null || participantId === null || summary === null) return parseFail(issues);
+  const out: SynthesisFile = { schemaVersion: SCHEMA_VERSION, runId, participantId, summary, limitations };
+  if (generatedAt !== undefined) out.generatedAt = generatedAt;
+  return ok(out);
+}
+
 function parseClaimEvent(u: unknown, path: string, issues: ValidationIssue[]): ClaimEvent | null {
   const o = reqObj(u, path, issues);
   if (o === null) return null;
@@ -1120,8 +1195,10 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
   const status = reqEnum(o.status, CLAIM_STATUSES, `${path}.status`, issues);
   const severity = reqEnum(o.severity, SEVERITIES, `${path}.severity`, issues);
   const confidence = reqNum(o.confidence, `${path}.confidence`, issues, { min: 0, max: 1 });
-  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 20, required: true });
-  const counterEvidence = parseEvidenceArr(o.counterEvidence, `${path}.counterEvidence`, issues, { maxItems: 20 });
+  // Canonical claim lists are the union of up to N merged findings — the cap
+  // matches the ledger bound (200), not the per-finding worker cap.
+  const evidence = parseEvidenceArr(o.evidence, `${path}.evidence`, issues, { maxItems: 200, required: true });
+  const counterEvidence = parseEvidenceArr(o.counterEvidence, `${path}.counterEvidence`, issues, { maxItems: 200 });
   const sourceFindings: Claim['sourceFindings'] = [];
   if (!isArr(o.sourceFindings) || o.sourceFindings.length === 0) {
     issues.push(fail(`${path}.sourceFindings`, 'required', 'claim requires >=1 source finding'));
@@ -1155,8 +1232,36 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
         const position = reqStr(obj.position, `${p}.position`, issues, { max: 2000 });
         const ts = reqStr(obj.ts, `${p}.ts`, issues, { max: 40 });
         const round = obj.round === null || obj.round === undefined ? null : reqInt(obj.round, `${p}.round`, issues, { min: 1, max: 3 });
-        if (participantId !== null && position !== null && ts !== null && round !== undefined)
-          dissent.push({ participantId, position, ts, round });
+        // Challenger-authored evidence retained on the dissent record —
+        // optional (legacy records lack it), validated like any evidence list.
+        const dEvidence = parseEvidenceArr(obj.evidence, `${p}.evidence`, issues, { maxItems: 20 });
+        if (participantId !== null && position !== null && ts !== null && round !== undefined) {
+          const rec: DissentRecord = { participantId, position, ts, round };
+          if (dEvidence.length > 0) rec.evidence = dEvidence;
+          dissent.push(rec);
+        }
+      });
+  }
+  // Canonical retention fields — additive; absent on pre-repair ledgers.
+  const remedies = reqStrArr(o.remedies, `${path}.remedies`, issues, { maxItems: 100, maxItemLen: 500 });
+  const openQuestions = reqStrArr(o.openQuestions, `${path}.openQuestions`, issues, { maxItems: 100, maxItemLen: 500 });
+  const mergedTitles = reqStrArr(o.mergedTitles, `${path}.mergedTitles`, issues, { maxItems: 100, maxItemLen: 200 });
+  const assessments: ClaimAssessment[] = [];
+  if (o.assessments !== undefined) {
+    if (!isArr(o.assessments)) issues.push(fail(`${path}.assessments`, 'type', 'expected array'));
+    else if (o.assessments.length > 100) issues.push(fail(`${path}.assessments`, 'too_many', 'at most 100 assessments'));
+    else
+      o.assessments.forEach((a, i) => {
+        const p = `${path}.assessments[${i}]`;
+        const obj = reqObj(a, p, issues);
+        if (obj === null) return;
+        const participantId = reqId(obj.participantId, `${p}.participantId`, issues);
+        const findingId = reqId(obj.findingId, `${p}.findingId`, issues);
+        const aSeverity = reqEnum(obj.severity, SEVERITIES, `${p}.severity`, issues);
+        const aConfidence = reqNum(obj.confidence, `${p}.confidence`, issues, { min: 0, max: 1 });
+        if (participantId !== null && findingId !== null && aSeverity !== null && aConfidence !== null) {
+          assessments.push({ participantId, findingId, severity: aSeverity, confidence: aConfidence });
+        }
       });
   }
   if (
@@ -1164,7 +1269,12 @@ function parseClaim(u: unknown, path: string, issues: ValidationIssue[]): Claim 
     severity === null || confidence === null || sourceFindings.length === 0
   )
     return null;
-  return { claimId, title, kind, grade, status, severity, confidence, evidence, counterEvidence, sourceFindings, history, dissent };
+  const out: Claim = { claimId, title, kind, grade, status, severity, confidence, evidence, counterEvidence, sourceFindings, history, dissent };
+  if (remedies.length > 0) out.remedies = remedies;
+  if (openQuestions.length > 0) out.openQuestions = openQuestions;
+  if (assessments.length > 0) out.assessments = assessments;
+  if (mergedTitles.length > 0) out.mergedTitles = mergedTitles;
+  return out;
 }
 
 export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseResult<CouncilReport> {
@@ -1224,8 +1334,70 @@ export function parseReportFile(raw: unknown, ctx: { runId?: string }): ParseRes
       if (parsed !== null) claims.push(parsed);
     });
   const limitations = reqStrArr(o.limitations, 'file.limitations', issues, { maxItems: 20, maxItemLen: 1000 });
+  // Deterministic runner facts — optional (absent on pre-repair reports),
+  // fully validated when present so a malformed fact block is a parse issue.
+  let runnerFacts: RunnerFacts | undefined;
+  if (o.runnerFacts !== undefined && o.runnerFacts !== null) {
+    const rf = reqObj(o.runnerFacts, 'file.runnerFacts', issues);
+    if (rf !== null) {
+      const seatsCompleted = reqInt(rf.seatsCompleted, 'file.runnerFacts.seatsCompleted', issues, { min: 0 });
+      const seatsSelected = reqInt(rf.seatsSelected, 'file.runnerFacts.seatsSelected', issues, { min: 0 });
+      const partialCoverage = isBool(rf.partialCoverage)
+        ? rf.partialCoverage
+        : (issues.push(fail('file.runnerFacts.partialCoverage', 'type', 'expected boolean')), undefined);
+      const uncoveredPerspectiveIds = reqStrArr(rf.uncoveredPerspectiveIds, 'file.runnerFacts.uncoveredPerspectiveIds', issues, {
+        maxItems: 25,
+        maxItemLen: 128,
+      });
+      const summarySource = reqEnum(rf.summarySource, ['scribe', 'runner'] as const, 'file.runnerFacts.summarySource', issues);
+      const claimsObj = reqObj(rf.claims, 'file.runnerFacts.claims', issues);
+      let claimsFacts: RunnerFacts['claims'] | null = null;
+      if (claimsObj !== null) {
+        const total = reqInt(claimsObj.total, 'file.runnerFacts.claims.total', issues, { min: 0 });
+        const byStatus: Record<string, number> = {};
+        if (!isObj(claimsObj.byStatus)) issues.push(fail('file.runnerFacts.claims.byStatus', 'type', 'expected object'));
+        else
+          for (const [k, v] of Object.entries(claimsObj.byStatus)) {
+            const n = reqInt(v, `file.runnerFacts.claims.byStatus[${JSON.stringify(k)}]`, issues, { min: 0 });
+            if (n !== null) byStatus[k] = n;
+          }
+        const withDissent = reqStrArr(claimsObj.withDissent, 'file.runnerFacts.claims.withDissent', issues, {
+          maxItems: 500,
+          maxItemLen: 128,
+        });
+        const withdrawn = reqInt(claimsObj.withdrawn, 'file.runnerFacts.claims.withdrawn', issues, { min: 0 });
+        const escalated = reqInt(claimsObj.escalated, 'file.runnerFacts.claims.escalated', issues, { min: 0 });
+        if (total !== null && withdrawn !== null && escalated !== null) {
+          claimsFacts = { total, byStatus, withDissent, withdrawn, escalated };
+        }
+      }
+      if (
+        seatsCompleted !== null && seatsSelected !== null && partialCoverage !== undefined &&
+        partialCoverage !== null && summarySource !== null && claimsFacts !== null
+      ) {
+        runnerFacts = { seatsCompleted, seatsSelected, partialCoverage, uncoveredPerspectiveIds, summarySource, claims: claimsFacts };
+      }
+    }
+  }
+  const limitationSources: LimitationSource[] = [];
+  if (o.limitationSources !== undefined && o.limitationSources !== null) {
+    if (!isArr(o.limitationSources)) issues.push(fail('file.limitationSources', 'type', 'expected array'));
+    else if (o.limitationSources.length > 40) issues.push(fail('file.limitationSources', 'too_many', 'at most 40 limitation sources'));
+    else
+      o.limitationSources.forEach((l, i) => {
+        const p = `file.limitationSources[${i}]`;
+        const obj = reqObj(l, p, issues);
+        if (obj === null) return;
+        const origin = reqEnum(obj.origin, ['runner', 'scribe'] as const, `${p}.origin`, issues);
+        const text = reqStr(obj.text, `${p}.text`, issues, { max: 1000 });
+        if (origin !== null && text !== null) limitationSources.push({ origin, text });
+      });
+  }
   if (issues.length || runId === null || generatedAt === null || summary === null || coverage === null) return parseFail(issues);
-  return ok({ schemaVersion: SCHEMA_VERSION, runId, generatedAt, summary, coverage, claims, limitations });
+  const out: CouncilReport = { schemaVersion: SCHEMA_VERSION, runId, generatedAt, summary, coverage, claims, limitations };
+  if (runnerFacts !== undefined) out.runnerFacts = runnerFacts;
+  if (limitationSources.length > 0) out.limitationSources = limitationSources;
+  return ok(out);
 }
 
 // ─── Snapshot / approval ─────────────────────────────────────────────────────

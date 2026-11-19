@@ -106,7 +106,10 @@ report.json, report.md, summary.md      # the canonical final report artifacts
 Nothing under the run directory requires the reviewed project to be modified.
 Reviewer read-only behavior is a **cooperative prompt rule**, not a sandbox —
 the snapshot re-hash performed during the run detects that files changed; it
-cannot prevent the change and cannot say who changed it.
+cannot prevent the change and cannot say who changed it. The `.council` and
+`.council-dev` trees are themselves **excluded** from the snapshot manifest:
+run artifacts are managed and validated by the runner, but they are not
+drift-protected and are never part of the reviewed corpus.
 
 ## Commands
 
@@ -328,8 +331,9 @@ council status --run <runDir> --json
 ```
 
 Prints the run status, per-participant status and active attempt, consumption
-(`launches` vs `maxLaunches`, `mailSent`), `approvalHash`, quorum position
-(settled reviewers vs `ceil(quorumRatio × seats)`), and `pendingDecisions`
+(`launches` vs `maxLaunches`, `mailSent`), `approvalHash`, the quorum
+position (reviewers with admitted independent findings vs
+`ceil(quorumRatio × seats)` — a coverage diagnostic, not a gate), and `pendingDecisions`
 (e.g. re-approve after invalidation, reconcile an `unknown` attempt — never
 relaunch). Read-only.
 
@@ -355,8 +359,14 @@ recorded execution fingerprint against the shipped catalog (`catalog`:
 `intact` / `drifted`, or `legacy` on pre-catalog runs). `verified: true`
 means no drift, an intact approval, and a matching catalog fingerprint — it
 is **not** a proof of truth of findings, and it never executes or validates
-cited code. A drifted tree, mismatched binding, or drifted catalog means
-re-snapshot/re-approve/reconcile before any launch.
+cited code. Recovery differs by failure: a changed pinned file means the
+approved corpus is invalidated — **pinned snapshots are immutable, so start
+a NEW run** (there is no re-snapshot path; re-approval alone cannot cure it
+because the binding still references the stale snapshot). A mismatched
+approval binding is cured by re-approving the *exact same* seats and config.
+A drifted catalog fingerprint refuses launches until the catalog again
+matches the bound `execution.policyHash` — restore the prior catalog or
+create a new run. A persisted no-task intent is resolved by `reconcile`.
 
 ### `council cancel` — explicit cancellation
 
@@ -392,7 +402,7 @@ only cap and validate outputs afterwards.
 | `participants` | 15 (≤ `requestedPerspectives`) | reviewer seats selected from the proposal |
 | `concurrency` | 5 | launch window — cost rate, not coverage |
 | `rounds` | 1 (valid 1–3) | bounded challenge+response rounds |
-| `quorumRatio` | 0.67 ((0,1]) | fraction of seats that must settle for a phase to close with partial coverage |
+| `quorumRatio` | 0.67 ((0,1]) | coverage diagnostic, not a gate: the fraction of selected seats that must produce **admitted** independent findings for the run to count as full coverage — below it the report carries an explicit quorum limitation and stays visibly partial; a settled-but-rejected seat does not count |
 | `maxLaunches` | `minViable + 8` | hard cap on total worker launches; the floor is `minViableLaunches = participants + 2·participants·rounds + 3`: organiser (1) + independent reviews + scribe notes (1) + challenge and response launches per seat per round + scribe synthesis (1); retries consume it too — an explicit value below the floor is refused |
 | `maxFindingsPerSeat` | 7 | findings cap per reviewer — forces prioritisation |
 | `maxChallengesPerSeatPerRound` | 3 | per-seat per-round challenge cap |

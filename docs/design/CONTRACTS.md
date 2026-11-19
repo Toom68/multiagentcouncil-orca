@@ -43,9 +43,17 @@ AttemptId, SnapshotId, ApprovalId`; `SCHEMA_VERSION = 1`.
   `minViableLaunches(config)` gives that minimum and `resolveConfig` refuses
   an explicit `maxLaunches` below it.
 - `PhaseDeadlines` — `{organiserMs, independentMs, scribeNotesMs, challengeMs,
-  responseMs, synthesisMs, runMs, graceMs}`.
-- `AgentChoice { agent, model, effort?, permissionMode }` — explicit, approval-
-  bound, token-charset validated; no model fallback.
+  responseMs, synthesisMs, runMs, graceMs}`. Deadline enforcement is
+  wake-driven: evaluated inside `advance` calls; there is no daemon.
+- `quorumRatio` — coverage diagnostic, not a gate. The quorum measure counts
+  reviewers with **admitted** independent findings against
+  `ceil(quorumRatio × selectedSeats)`; settled-but-rejected seats do not
+  count. A below-quorum run emits an explicitly partial diagnostic report —
+  never success-looking coverage.
+- `AgentChoice { agent, model, effort?, permissionMode, profile? }` —
+  explicit, approval-bound, token-charset validated; no model fallback.
+  `profile` is an optional named CLI profile (Codex `--profile`), part of
+  the approved seat identity.
 
 ### Roster / approval / snapshot
 
@@ -74,10 +82,15 @@ AttemptId, SnapshotId, ApprovalId`; `SCHEMA_VERSION = 1`.
   evidence[], counterEvidence?, remedies?, openQuestions? }`
 - `FindingsFile` (findings/`<pid>`.json) — independent phase.
 - `Challenge { challengeId, claimId, kind, argument, evidence[] }`;
-  `ChallengesFile` (rounds/`<n>`/challenges/`<pid>`.json).
+  `ChallengesFile` (rounds/`<n>`/challenges/`<pid>`.json). Challengers mint
+  locally-unique ids; the ledger **qualifies** each id by challenger and
+  round before routing/history (deterministic, ID_RE-bounded, e.g.
+  `ch-r<round>-<32 hex>`), so identical local ids across seats cannot
+  collide.
 - `AuthorResponse { claimId, challengeId, disposition:
   'defend'|'revise'|'withdraw'|'escalate', argument, evidence[],
   revisedFinding? }`; `ResponsesFile` (rounds/`<n>`/responses/`<pid>`.json).
+  Responses echo the qualified `challengeId` from the assignment verbatim.
 - `WorkEnvelope<TAssignment> { phase, round, recipientId, assignments[],
   outputPath, outputContract }` — the ONLY way a reviewer sees peer output:
   exactly one recipient, never the transcript. `ChallengeEnvelope`,
@@ -93,7 +106,13 @@ AttemptId, SnapshotId, ApprovalId`; `SCHEMA_VERSION = 1`.
   'plausible_risk'|'speculative'|'unsupported'`; `ClaimLedger`,
   `ClaimEvent`, `DissentRecord`, `FindingKind`, `Severity`, `EvidenceKind`,
   `ChallengeKind`.
-- `ScribeNotesFile` — initial scribe pass artifact.
+- `ScribeNotesFile` — initial scribe pass artifact; an explicit input to
+  `scribeSynthesis` via `notesPath` (a prior read, never an authority).
+- `SynthesisFile { schemaVersion, runId, participantId, generatedAt?,
+  summary, limitations[] }` — the ONLY narrative contract the runner reads
+  from the scribe (`parseSynthesisFile`); the runner renders the canonical
+  `CouncilReport`/report.md/summary.md itself. Legacy full-report scribe
+  artifacts remain accepted via `parseReportFile`.
 - `CouncilReport` + `ReportCoverage` + `SeatOutcome` — `coverage.partial`
   visible; failed seats named; a wholly failed run produces no report.
 
@@ -158,19 +177,25 @@ errors. `CreateStore` type exported from contracts.
 ### `PromptBuilder` — implement in `src/prompts.ts` as `createPromptBuilder(): PromptBuilder`
 
 ```
-organiser(ctx, {participantId, outputPath})
-reviewerIndependent(ctx, {participantId, perspective, outputPath})   // never sees peer data
-scribeNotes(ctx, {participantId, admittedFindingsPaths[], outputPath})
-challenge(ctx, {participantId, envelopePath, outputPath})
-authorResponse(ctx, {participantId, envelopePath, outputPath})
-scribeSynthesis(ctx, {participantId, ledgerPath, journalPath, reportJsonPath, reportMdPath, summaryPath})
+organiser(ctx, {participantId, outputPath, repair?})
+reviewerIndependent(ctx, {participantId, perspective, outputPath, repair?})   // never sees peer data
+scribeNotes(ctx, {participantId, admittedFindingsPaths[], outputPath, repair?})
+challenge(ctx, {participantId, envelopePath, outputPath, repair?})
+authorResponse(ctx, {participantId, envelopePath, outputPath, repair?})
+scribeSynthesis(ctx, {participantId, ledgerPath, journalPath, notesPath?, reportJsonPath, reportMdPath, summaryPath, repair?})
 supervisor(ctx, {advanceCommand})
 ```
 
 `PromptContext` supplies `runId, runDir, targetRoot, objective, snapshotId,
 config`. Every builder names exact writable paths, JSON output contract,
 budgets, untrusted-content boundary, no-further-agents, honest cooperative
-labels for edit/egress restrictions.
+labels for edit/egress restrictions. Optional `repair?: RepairContext
+{contract, diagnostics[], previousArtifactPath?}` is present only on the
+single bounded corrective attempt for a participant/phase/round —
+diagnostics are verbatim validator issues, rendered delimited as untrusted
+data, and the spec bounds the retry to repairing only the assigned
+artifact. `notesPath` points at the admitted `scribe/notes.json` when it
+exists. Spec output rules state the real validator caps verbatim.
 
 ### `Engine` — implement in `src/engine.ts` as `createEngine(deps): Engine`
 
@@ -197,7 +222,9 @@ one-call-per-wake alone can deadlock internal transitions).
 - `parseFindingsFile(raw, ctx): ParseResult<FindingsFile>`
 - `parseChallengesFile(raw, ctx)`, `parseResponsesFile(raw, ctx)`
 - `parseChallengeEnvelope(raw, ctx)`, `parseResponseEnvelope(raw, ctx)`
-- `parseScribeNotesFile(raw, ctx)`, `parseReportFile(raw, ctx)`
+- `parseScribeNotesFile(raw, ctx)`, `parseReportFile(raw, ctx)`,
+  `parseSynthesisFile(raw, ctx)` — the slim scribe narrative contract;
+  `parseReportFile` remains for legacy full-report artifacts.
 - `parseSourceSnapshot(raw): ParseResult<SourceSnapshot>`
 - `parseApprovalRecord(raw)`, `parseApprovalBinding(raw)`
 - `parseCouncilState(raw)`, `parseJournalEvent(raw)`, `parsePhaseAttempt(raw)`,

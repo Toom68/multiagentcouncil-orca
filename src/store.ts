@@ -182,6 +182,28 @@ function pidAlive(pid: number): boolean {
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Write the ENTIRE buffer to an open filehandle: a single write() may
+ * short-write (partial bytes accepted), so loop until everything is out.
+ * No position arg — callers must open in 'a' mode so each write lands at
+ * EOF and concurrent O_APPEND writers cannot overwrite each other.
+ * Exported for tests: the loop is exercised against a stub handle that
+ * deliberately accepts only partial chunks per call.
+ */
+export async function writeFully(
+  fh: { write(buf: Buffer, offset?: number): Promise<{ bytesWritten: number }> },
+  buf: Buffer,
+): Promise<void> {
+  let off = 0;
+  while (off < buf.length) {
+    const { bytesWritten } = await fh.write(buf, off);
+    if (bytesWritten <= 0) {
+      throw new Error(`write stalled after ${off}/${buf.length} bytes`);
+    }
+    off += bytesWritten;
+  }
+}
+
 // ─── Store factory ──────────────────────────────────────────────────────────
 
 export function createStore(options: StoreOpenOptions): Store {
@@ -538,14 +560,31 @@ export function createStore(options: StoreOpenOptions): Store {
     lastLine: string | null;
   }
 
+  /**
+   * Fail-closed journal recovery guidance surfaced on every corruption
+   * error. The journal is the durable record of issued host mutations —
+   * silently dropping lines can make a later advance blind-retry a mutation
+   * that already landed, so repair is an operator decision, never automatic.
+   */
+  const JOURNAL_RECOVERY_GUIDANCE =
+    'journal corrupt: the run is halted (fail closed). Recovery: (1) copy events.jsonl ' +
+    'to events.corrupt.jsonl in the run dir for forensics; (2) if and only if the reported ' +
+    'line is an incomplete FINAL-line fragment, you may remove exactly that fragment after ' +
+    'confirming its event carried no unaccounted host mutation (a lost launch.intent/error ' +
+    'event can trigger a duplicate task-create or relaunch on resume); (3) for any ' +
+    'mid-journal corruption, prevHash/seq mismatch, or uncertainty about landed mutations, ' +
+    'abandon this run and start a new one — never delete intent events, they may have live ' +
+    'host side effects';
+
   const corrupt = (
     cause: string,
     lineIndex: number,
     extra: Record<string, unknown> = {},
   ): CouncilError =>
-    ioErr('journal_corrupt', `journal corrupt at line ${lineIndex + 1}: ${cause}`, {
+    ioErr('journal_corrupt', `journal corrupt at line ${lineIndex + 1}: ${cause} — run halted; see details.recovery for the safe procedure`, {
       cause,
       line: lineIndex + 1,
+      recovery: JOURNAL_RECOVERY_GUIDANCE,
       ...extra,
     });
 
@@ -566,7 +605,14 @@ export function createStore(options: StoreOpenOptions): Store {
     if (content === '') return ok({ events: [], lastLine: null });
     if (!content.endsWith('\n')) {
       const lineIndex = content.split('\n').length - 1;
-      return failRes(corrupt('truncated final line', lineIndex));
+      const byteOffset = Buffer.byteLength(content.slice(0, content.lastIndexOf('\n') + 1), 'utf8');
+      return failRes(
+        corrupt('truncated final line (possible torn append)', lineIndex, {
+          byteOffset,
+          tornBytes: Buffer.byteLength(content, 'utf8') - byteOffset,
+          tornFragment: content.slice(content.lastIndexOf('\n') + 1).slice(0, 200),
+        }),
+      );
     }
 
     const lines = content.slice(0, -1).split('\n');
@@ -994,7 +1040,18 @@ export function createStore(options: StoreOpenOptions): Store {
         }
         const block = lines.join('\n') + '\n';
         try {
-          await fsp.appendFile(path.join(runDirAbs, STORE_PATHS.journal), block, 'utf8');
+          // Same durability discipline as atomicWrite: fsync before success so
+          // a journaled intent/effect survives an OS crash — the engine acts on
+          // what the journal records, so a lost tail must not be possible.
+          const fh = await fsp.open(path.join(runDirAbs, STORE_PATHS.journal), 'a');
+          try {
+            // 'a' mode guarantees every write lands at EOF; writeFully loops
+            // until the whole block is out; fsync before reporting success.
+            await writeFully(fh, Buffer.from(block, 'utf8'));
+            await fh.sync();
+          } finally {
+            await fh.close();
+          }
         } catch (e2) {
           return failRes(ioErr('write_failed', `journal append failed: ${describeErr(e2)}`));
         }

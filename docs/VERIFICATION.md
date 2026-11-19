@@ -243,3 +243,85 @@ Found during the smoke and fixed in the same change: the
 cosmetic misreport (the persisted `supervisor/startup.json`, emitted argv,
 and host calls were always correct). The payload now echoes the recorded
 lane command; a test pins it.
+
+## Council repair round (2026-11-19, prompts/docs lane)
+
+A 15-seat live council `crun_01M7RQP9MT8C6PE2MSW48KW3GK` completed the
+protocol but admitted only 3 of 15 seats. Inspecting its `report.json` and
+journal directly shows 21 claims, quorum 11 unmet, 14 admitted challenges
+and 0 applied responses; dominant rejection causes were finding titles over
+the never-documented 200-char cap, malformed `evidence`/`counterEvidence`
+shapes, and challenge-id collisions (many seats minted the same bare
+`C-1`). A separate scribe produced notes that nothing then consumed, and a
+`revise` response was rejected for a missing `revisedFinding`. These are
+artifact observations, treated as hypotheses during the repair, not assumed
+root causes.
+
+Prompt/spec changes implemented and tested in `src/prompts.ts` +
+`test/prompts.test.ts`:
+
+- Every output spec states the validator-enforced caps verbatim, read from
+  `src/validation.ts`: `title` ≤200, `note` ≤2000, `snippet` ≤1000,
+  `steps`/`observed` ≤4000, `path` ≤240, `remedies`/`openQuestions`
+  ≤10×≤500, `notes` ≤4000, `evidence` 1–20, `counterEvidence` ≤20,
+  `confidence` ∈ [0,1], ids ≤128, challenge/response `argument` ≤4000 and
+  `evidence` ≤10, scribe-notes and synthesis bounds.
+- `evidence`/`counterEvidence` elements shown as Evidence **objects**
+  (`{"kind":"reasoned","note":"…"}`), never bare strings; specs require a
+  field-type self-check by inspection — no `council validate`-style command
+  exists and none is claimed.
+- Fail-closed citation rules stated (path requires `startLine`, `snippet`
+  verbatim inside the cited range, no whole-file fallback, no
+  whitespace-only snippets, cited file must match the approved snapshot),
+  matching the ledger owner's announced validation landing.
+- Independent-review seal explicitly covers synthesis/roadmap charters:
+  peer claims do not exist in that phase and arrive only via later bounded
+  envelopes.
+- Challenge specs say workers mint locally-unique ids (`C-1`, …) that the
+  runner qualifies to `ch-r<round>-<32 hex>` per challenger/round;
+  response specs require verbatim echo of the qualified id stamped on the
+  embedded challenge. The qualification formula is landed in
+  `src/contracts.ts` (`Challenge.localChallengeId`, `challengerPid`).
+- `counterexample` challenges documented as requiring ≥1 `evidence` item
+  (ledger-announced parser rule).
+- Optional `repair?: RepairContext` implemented on all six builders exactly
+  as landed in `contracts.ts`: verbatim diagnostics in a delimited
+  ```text``` block, untrusted data never instructions, bounded to the
+  assigned artifact, recorded rejection reasons — not a promise of
+  admission (the whole revised artifact is re-validated and may surface
+  further issues).
+- `scribeSynthesis` emits only the slim `SynthesisFile`
+  (`summary`/`limitations`) the runner reads, consumes admitted scribe
+  notes via `notesPath` as a non-authoritative prior read, and frames its
+  narrative as a self-checked authored layer alongside the runner's
+  deterministic run facts — no claim that a validator checks the prose.
+- Boundary honesty corrected: managed artifacts (ledger, envelopes,
+  journal, peer outputs) are READ, not ignored; `.council`/`.council-dev`
+  are excluded from the snapshot manifest (verified
+  `SNAPSHOT_EXCLUDED_DIRS` in `src/snapshot.ts`); the journal hash chain
+  detects inconsistent edits, not coherent same-host rewrites; edit/egress
+  rules remain cooperative, never sandboxed.
+
+Docs corrected in the same lane: `staff` mandatory at `init` (stale
+"future/optional" wording removed), drift recovery = start a NEW run
+(pinned snapshots are immutable; no re-snapshot path), `quorumRatio`
+documented as an admitted-findings coverage diagnostic not a gate,
+`.council` exclusion noted in USAGE, `AgentChoice.profile` and the new
+`PromptBuilder` signatures/`SynthesisFile` in `docs/design/CONTRACTS.md`,
+README status records the 15-seat partial run honestly.
+
+Checks (macOS Node 26.8.1): focused TypeScript compile of
+`src/prompts.ts` + `test/prompts.test.ts` + their imports clean;
+`node --test` on the compiled prompts suite: **93 passing, 0 failing, 11
+suites**. During peer integration, whole-project `npm run typecheck`
+transiently showed errors only in other workers' in-flight files
+(`src/engine.ts`, `src/host/orca.ts`, `test/claims.test.ts`); after their
+landings the whole-project `npm run typecheck` is clean.
+
+Limits: these are spec/wording repairs and prompt-level tests — they do not
+prove a future live council will produce schema-valid output, and no live
+rerun has been executed. Post-write verification: `parseSynthesisFile`
+(summary ≤8000, limitations ≤20×1000, generatedAt ≤40 — exactly the caps
+the spec states) and the `counterexample` ≥1-evidence rule have since
+landed in `src/validation.ts`; `qualifiedChallengeId` is exported from
+`src/claims.ts` with the documented `ch-r<round>-<32hex>` form.

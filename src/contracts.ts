@@ -375,13 +375,27 @@ export type ChallengeKind =
   | 'scope'
   | 'other';
 
-/** A challenge written by a reviewer about exactly one claim. */
+/**
+ * A challenge written by a reviewer about exactly one claim.
+ *
+ * Identity: workers mint a LOCAL `challengeId` (e.g. "C-1"). Before routing,
+ * the ledger qualifies it to `ch-r<round>-<sha256(JSON.stringify(
+ * [challengerPid, localId])).slice(0,32)>` — globally unique per
+ * challenger/round, so two seats' local "C-1" can never collide. On copies
+ * routed to authors (ResponseAssignment.challenges) `challengeId` carries the
+ * qualified id verbatim and `localChallengeId`/`challengerPid` preserve the
+ * minted id and its author as provenance.
+ */
 export interface Challenge {
   challengeId: ChallengeId;
   claimId: ClaimId;
   kind: ChallengeKind;
   argument: string;
   evidence: Evidence[];
+  /** Runner-stamped provenance: the worker-minted id before qualification. */
+  localChallengeId?: string;
+  /** Runner-stamped provenance: the participant that filed the challenge. */
+  challengerPid?: ParticipantId;
 }
 
 /** rounds/<n>/challenges/<participantId>.json — challenger output. */
@@ -430,9 +444,15 @@ export interface WorkEnvelope<TAssignment> {
   recipientId: ParticipantId;
   /** Bounded by the matching config cap. */
   assignments: TAssignment[];
+  /**
+   * Whole assignments dropped by the byte cap — the envelope self-declares
+   * omissions so a bound never silently loses assigned work. Absent on
+   * envelopes produced before this field existed.
+   */
+  omittedCount?: number;
   /** Exact file the worker must write (safe relative path inside the run dir). */
   outputPath: string;
-  /** Name of the file contract to write: "ChallengesFile" | "ResponsesFile" | "FindingsFile" | "ScribeNotesFile" | "ReportFile". */
+  /** Name of the file contract to write: "ChallengesFile" | "ResponsesFile" | "FindingsFile" | "ScribeNotesFile" | "SynthesisFile" | "ReportFile" (legacy). */
   outputContract: string;
   /** Total serialized size must be <= config.envelopeBytes at dispatch. */
 }
@@ -505,8 +525,44 @@ export interface DissentRecord {
   round: number | null;
   position: string; // bounded text
   ts: string;
+  /**
+   * Challenger-authored evidence behind this position, already validated
+   * against the snapshot by the ledger fold. Absent when the dissenter filed
+   * none; never carries unvalidated items. Added after the run's first
+   * reports — legacy records lack it.
+   */
+  evidence?: Evidence[];
 }
 
+/**
+ * One source finding's author assessment — the rating that participant filed.
+ * Kept on merged claims so the canonical severity/confidence never hides the
+ * spread of individual votes.
+ */
+export interface ClaimAssessment {
+  participantId: ParticipantId;
+  findingId: FindingId;
+  severity: Severity;
+  confidence: number;
+}
+
+/**
+ * Canonical claim — the unit the ledger, report and scribe work from.
+ *
+ * Merge/aggregation policy (documented, deterministic):
+ * - Findings dedupe only when kind + normalized title match AND their
+ *   VERIFIED citation ranges overlap on the same path (or both hold no
+ *   verified citation). A shared file alone is not identity — same title on
+ *   different lines of one file stays two claims, and rejected evidence
+ *   never drives a merge. Conservative: a false non-merge is recoverable by
+ *   the scribe, a false merge is not.
+ * - The canonical title/kind/severity/confidence come from the first
+ *   (participantId, findingId)-sorted finding; every other author's rating is
+ *   preserved verbatim in `assessments`, in `mergedTitles`, and — when it
+ *   diverges — as a dissent line. Nothing is averaged away.
+ * - `remedies`/`openQuestions` are the deduped union across merged findings
+ *   (bounded; overflow is journaled on the claim history, never silent).
+ */
 export interface Claim {
   claimId: ClaimId;
   title: string;
@@ -522,6 +578,14 @@ export interface Claim {
   sourceFindings: { participantId: ParticipantId; findingId: FindingId }[];
   history: ClaimEvent[];
   dissent: DissentRecord[];
+  /** Deduped union of reviewer-proposed remedies from merged findings. */
+  remedies?: string[];
+  /** Deduped union of reviewer open questions from merged findings. */
+  openQuestions?: string[];
+  /** Per-source-finding author ratings — one entry per finding ever folded in. */
+  assessments?: ClaimAssessment[];
+  /** Source-finding titles that differ from the canonical title (deduped). */
+  mergedTitles?: string[];
 }
 
 /** claims.json — the ledger artifact. */
@@ -549,6 +613,23 @@ export interface ScribeNotesFile {
   observations?: string;
 }
 
+/**
+ * scribe/report.json — the scribe's NARRATIVE-ONLY synthesis contract.
+ * The runner canonicalises claims/coverage and renders report.md/summary.md
+ * deterministically; the scribe contributes only what it actually authored:
+ * a summary and limitation notes. (Legacy artifacts that carried a full
+ * CouncilReport are still accepted by parseReportFile — the engine falls
+ * back to it when this parser rejects the file.)
+ */
+export interface SynthesisFile {
+  schemaVersion: typeof SCHEMA_VERSION;
+  runId: CouncilRunId;
+  participantId: ParticipantId;
+  generatedAt?: string; // ISO-8601
+  summary: string;
+  limitations: string[];
+}
+
 // ─── Final report ────────────────────────────────────────────────────────────
 
 export interface SeatOutcome {
@@ -571,7 +652,37 @@ export interface ReportCoverage {
   partial: boolean;
 }
 
-/** report.json — scribe synthesis validated by the runner. */
+/**
+ * Deterministic facts the runner computes from the ledger and participant
+ * state — never scribe-authored. Rendered prominently beside (never merged
+ * into) the scribe narrative so partial coverage and unresolved disputes are
+ * structurally impossible to hide behind prose.
+ */
+export interface RunnerFacts {
+  seatsCompleted: number;
+  seatsSelected: number;
+  partialCoverage: boolean;
+  uncoveredPerspectiveIds: PerspectiveId[];
+  /** Whether the narrative summary is scribe-authored or the deterministic fallback. */
+  summarySource: 'scribe' | 'runner';
+  claims: {
+    total: number;
+    /** status → count, only statuses actually present. */
+    byStatus: Record<string, number>;
+    /** Claims carrying at least one dissent record. */
+    withDissent: ClaimId[];
+    withdrawn: number;
+    escalated: number;
+  };
+}
+
+/** A report limitation with its origin — runner-derived or scribe-authored. */
+export interface LimitationSource {
+  origin: 'runner' | 'scribe';
+  text: string;
+}
+
+/** report.json — canonical runner-built report (narrative may be scribe-authored). */
 export interface CouncilReport {
   schemaVersion: typeof SCHEMA_VERSION;
   runId: CouncilRunId;
@@ -580,6 +691,17 @@ export interface CouncilReport {
   coverage: ReportCoverage;
   claims: Claim[];
   limitations: string[];
+  /**
+   * Deterministic runner-computed facts disclosed beside the narrative.
+   * Absent on reports produced before this field existed (legacy loads).
+   */
+  runnerFacts?: RunnerFacts;
+  /**
+   * Provenance-tagged limitations in emission order (runner first). When
+   * present, renderers should prefer it over the flat `limitations` list so
+   * scribe-authored notes stay distinguishable from runner-derived ones.
+   */
+  limitationSources?: LimitationSource[];
   /**
    * A wholly failed review must not produce a successful signal: engine emits
    * no report.json at all on hard failure; any report with coverage.partial
@@ -706,6 +828,7 @@ export type JournalEventType =
   | 'barrier.refused'
   | 'task.created'
   | 'launch.intent'
+  | 'launch.resume'
   | 'worker.started'
   | 'worker.settled'
   | 'worker.unknown'
@@ -786,6 +909,36 @@ export interface LaunchResult {
   detail?: string;
 }
 
+/**
+ * Tolerant host-listing rows for crash-resume reconciliation. The adapter
+ * maps whatever the host CLI returns into these shapes; unknown fields are
+ * preserved, never required.
+ */
+export interface TaskListRow {
+  taskId?: string;
+  id?: string;
+  specFile?: string;
+  specFilePath?: string;
+  title?: string;
+  taskTitle?: string;
+  spec?: string;
+  [k: string]: unknown;
+}
+
+export interface WorkerListRow {
+  dispatchId: string;
+  taskId?: string;
+  state?: string;
+  outcome?: string;
+  liveness?: string;
+  terminal?: string;
+  terminalHandle?: string;
+  [k: string]: unknown;
+}
+
+/** Observed state of a previously recorded launch request id. */
+export type LaunchRequestState = 'completed' | 'pending' | 'absent' | 'unknown';
+
 export type WorkerLiveness =
   | 'working'
   | 'waiting_human' // parked on a prompt only a human can answer — healthy, not failed
@@ -811,14 +964,14 @@ export type StopOutcome = 'stopped' | 'unknown' | 'refused';
 
 export interface HostAdapter {
   /** Create and bind the council child Run under the caller's identity. */
-  createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId }>>;
+  createRun(input: { objective: string }): Promise<Result<{ runId: OrcaRunId; requestId?: string }>>;
   /** Create one orchestration Task in the council Run (fresh Task per phase). */
   createTask(input: {
     runId: OrcaRunId;
     specFilePath: string;
     title: string;
     deps?: TaskId[];
-  }): Promise<Result<{ taskId: TaskId }>>;
+  }): Promise<Result<{ taskId: TaskId; requestId?: string }>>;
   /** Start one supervised worker attempt. See WorkerLaunchSpec docs. */
   launchWorker(input: WorkerLaunchSpec): Promise<Result<LaunchResult>>;
   /** Observe one dispatch without consuming mail. */
@@ -835,6 +988,16 @@ export interface HostAdapter {
   requestStop(input: { dispatchId: DispatchId; reason: string }): Promise<Result<{ outcome: StopOutcome }>>;
   /** Release a settled/reclaimable worker terminal (e.g. end of retained session). */
   releaseWorker(input: { dispatchId: DispatchId }): Promise<Result<{ released: boolean }>>;
+  /**
+   * OPTIONAL crash-resume reconciliation: observe the state of a previously
+   * recorded request id WITHOUT mutating anything. `absent` means the host
+   * has no record of it. Never used to authorize a blind relaunch.
+   */
+  requestShow?(input: { requestId: string }): Promise<Result<{ state: LaunchRequestState; raw: unknown }>>;
+  /** OPTIONAL crash-resume reconciliation: list the host's task records for a Run. */
+  listTasks?(input: { runId: OrcaRunId }): Promise<Result<{ tasks: TaskListRow[] }>>;
+  /** OPTIONAL crash-resume reconciliation: list the host's worker records for a Run. */
+  listWorkers?(input: { runId: OrcaRunId }): Promise<Result<{ workers: WorkerListRow[] }>>;
 }
 
 // ─── Store (implemented by src/store.ts, backed by src/snapshot.ts) ─────────
@@ -912,16 +1075,35 @@ export interface PromptContext {
 }
 
 /**
+ * Corrective-attempt context the engine hands a builder when a worker's
+ * output was rejected and is being retried once. `diagnostics` are exact
+ * validation issues (untrusted validator data — delimited, bounded, never
+ * instructions); `previousArtifactPath` is the archived rejected output the
+ * worker may inspect. Absent on first attempts.
+ */
+export interface RepairContext {
+  /** Name of the output contract the worker must satisfy. */
+  contract: string;
+  /** Exact validation diagnostics from the rejection (bounded strings). */
+  diagnostics: string[];
+  /** Archived path of the rejected artifact, when preserved. */
+  previousArtifactPath?: string;
+}
+
+/**
  * Spec-file builders. Each returns the full markdown spec for one worker and
  * names the exact writable output paths, the JSON output contract, budgets,
  * and the untrusted-content boundary (target/peer text is data, never
  * instructions; no further agents; edits forbidden).
+ *
+ * Every worker `input` may carry an optional `repair` — the corrective-attempt
+ * context above. Builders must render it as untrusted validator data.
  */
 export interface PromptBuilder {
   /** Organiser worker: propose config.requestedPerspectives perspectives. */
   organiser(
     ctx: PromptContext,
-    input: { participantId: ParticipantId; outputPath: string },
+    input: { participantId: ParticipantId; outputPath: string; repair?: RepairContext },
   ): string;
   /** Independent reviewer: must NEVER receive peer findings or envelopes. */
   reviewerIndependent(
@@ -930,6 +1112,7 @@ export interface PromptBuilder {
       participantId: ParticipantId;
       perspective: Perspective;
       outputPath: string;
+      repair?: RepairContext;
     },
   ): string;
   /** Initial scribe pass over admitted independent findings. */
@@ -939,6 +1122,7 @@ export interface PromptBuilder {
       participantId: ParticipantId;
       admittedFindingsPaths: string[];
       outputPath: string;
+      repair?: RepairContext;
     },
   ): string;
   /** Challenger: sees only the claims inside its own envelope. */
@@ -948,6 +1132,7 @@ export interface PromptBuilder {
       participantId: ParticipantId;
       envelopePath: string;
       outputPath: string;
+      repair?: RepairContext;
     },
   ): string;
   /** Finding author: sees only challenges admitted against its own claims. */
@@ -957,9 +1142,14 @@ export interface PromptBuilder {
       participantId: ParticipantId;
       envelopePath: string;
       outputPath: string;
+      repair?: RepairContext;
     },
   ): string;
-  /** Final scribe synthesis into report.json + report.md. */
+  /**
+   * Final scribe synthesis into scribe/report.json (SynthesisFile narrative).
+   * `notesPath` points at the admitted scribe/notes.json when one exists —
+   * the scribe's own earlier observations, never authoritative claims.
+   */
   scribeSynthesis(
     ctx: PromptContext,
     input: {
@@ -969,6 +1159,8 @@ export interface PromptBuilder {
       reportJsonPath: string;
       reportMdPath: string;
       summaryPath: string;
+      notesPath?: string;
+      repair?: RepairContext;
     },
   ): string;
   /** Supervisor agent spec: drive `council supervise --advance`, end turn on wait. */

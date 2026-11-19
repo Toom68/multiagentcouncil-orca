@@ -13,11 +13,14 @@
  * order of untrusted input or from wall-clock randomness.
  */
 
+import { createHash } from 'node:crypto';
+
 import {
   SCHEMA_VERSION,
   type Challenge,
   type ChallengeAssignment,
   type Claim,
+  type ClaimAssessment,
   type ClaimEvent,
   type ClaimId,
   type ClaimLedger,
@@ -49,6 +52,14 @@ const REVIEWER_GRADE_CEILING: EvidenceGrade = 'plausible_risk';
 /** Bound for free-text fields copied into ledger history/dissent. */
 const HISTORY_DETAIL_CHARS = 400;
 const DISSENT_POSITION_CHARS = 1000;
+/**
+ * Canonical-claim list bounds. Merged findings can carry up to 20 evidence
+ * items each, so a claim may legitimately exceed the per-finding cap; 200 is
+ * generous and keeps claims.json parseable. Overflow is recorded on the
+ * claim's history — bounded, never silently dropped.
+ */
+const MAX_CLAIM_EVIDENCE = 200;
+const MAX_CLAIM_TEXT_ITEMS = 100;
 
 const GRADE_ORDER: Record<EvidenceGrade, number> = {
   unsupported: 0,
@@ -105,8 +116,10 @@ export function dedupeKey(f: Pick<Finding, 'title' | 'kind'>): string {
 
 /**
  * Read-only access to the reviewed source used to check code_location
- * citations. `readFile` may be omitted (structure-only checks) but then line
- * and snippet claims stay unverifiable and cannot raise a grade.
+ * citations. `readFile` returns the current utf8 text of a manifest-pinned
+ * path; the returned bytes are hash-bound to the approved snapshot entry, so
+ * citations fail closed on missing, unreadable or drifted files — an
+ * unverifiable citation is a rejection, never a silent "structure-only" pass.
  */
 export interface SourceAccess {
   snapshot: SourceSnapshot;
@@ -128,23 +141,43 @@ function normalizeSnippet(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-function checkCodeLocation(ev: Evidence, src: SourceAccess): string | null {
-  if (ev.path === undefined) return 'code_location missing path';
+function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/**
+ * Check the citation-shaped fields on one evidence item — invoked for
+ * code_location always and for ANY kind carrying path/line fields, so
+ * relabeling kind cannot bypass verification.
+ *
+ * Fails closed: the cited path must be safe, manifest-pinned, readable, and
+ * byte-identical (sha256+size) to the approved snapshot entry. A snippet must
+ * be non-blank and appear inside the cited line range — the whole-file
+ * fallback that made line numbers decorative is gone.
+ */
+function checkCitation(ev: Evidence, src: SourceAccess): string | null {
+  const hasLines = ev.startLine !== undefined || ev.endLine !== undefined;
+  if (ev.path === undefined) {
+    if (hasLines) return 'citation line fields without path';
+    return ev.kind === 'code_location' ? 'code_location missing path' : null;
+  }
   const safe = assertSafeRelativePath(ev.path);
   if (!safe.ok) return `unsafe path: ${ev.path}`;
   const rel = safe.value;
   const entry = src.snapshot.files[rel];
   if (entry === undefined) return `path not in snapshot: ${rel}`;
   if (ev.startLine === undefined || !Number.isInteger(ev.startLine) || ev.startLine < 1) {
-    return `missing/invalid startLine`;
+    return 'missing/invalid startLine';
   }
   if (ev.endLine !== undefined && (!Number.isInteger(ev.endLine) || ev.endLine < ev.startLine)) {
     return `endLine ${ev.endLine} before startLine ${ev.startLine}`;
   }
   const text = src.readFile?.(rel);
   if (text === undefined) {
-    // Path exists in the snapshot; line/snippet contents are unverifiable.
-    return null;
+    return `cited file unreadable — cannot verify against approved snapshot: ${rel}`;
+  }
+  if (Buffer.byteLength(text, 'utf8') !== entry.size || sha256Hex(text) !== entry.sha256) {
+    return `cited file drifted from approved snapshot (sha256/size mismatch): ${rel}`;
   }
   const lines = text.split('\n');
   if (ev.startLine > lines.length) {
@@ -154,28 +187,34 @@ function checkCodeLocation(ev: Evidence, src: SourceAccess): string | null {
     return `endLine ${ev.endLine} beyond file length ${lines.length}`;
   }
   if (ev.snippet !== undefined) {
+    const want = normalizeSnippet(ev.snippet);
+    if (want.length === 0) return 'snippet is empty/whitespace-only';
     const cited = normalizeSnippet(
       lines.slice(ev.startLine - 1, ev.endLine ?? ev.startLine).join(' '),
     );
-    const want = normalizeSnippet(ev.snippet);
-    if (want.length > 0 && !cited.includes(want) && !normalizeSnippet(text).includes(want)) {
-      return `snippet not found in cited source`;
-    }
+    if (!cited.includes(want)) return 'snippet not found in cited line range';
   }
   return null;
 }
 
 /**
- * Split evidence into admissible and rejected pieces. Invalid pieces are
- * returned with a reason so the caller can journal them; they are never
- * admitted into the canonical claim.
+ * Split evidence into admissible and rejected pieces. Citation-shaped fields
+ * (path/startLine/endLine) are verified on every evidence kind — an item that
+ * carries them must pass the same checks as code_location or is rejected with
+ * an explicit reason. Rejected pieces are returned so callers can journal
+ * them; they are never admitted into the canonical claim.
  */
 export function validateEvidenceList(evs: Evidence[], src: SourceAccess): EvidenceCheck {
   const valid: Evidence[] = [];
   const invalid: InvalidEvidence[] = [];
   for (const ev of evs) {
-    if (ev.kind === 'code_location') {
-      const reason = checkCodeLocation(ev, src);
+    const citationShaped =
+      ev.kind === 'code_location' ||
+      ev.path !== undefined ||
+      ev.startLine !== undefined ||
+      ev.endLine !== undefined;
+    if (citationShaped) {
+      const reason = checkCitation(ev, src);
       if (reason !== null) {
         invalid.push({ evidence: ev, reason });
         continue;
@@ -240,25 +279,105 @@ function evidenceKey(ev: Evidence): string {
   return JSON.stringify(ev);
 }
 
-function unionEvidence(into: Evidence[], extra: Evidence[]): void {
+/**
+ * Dedupe-union evidence into a bounded list. Returns the number of items that
+ * were distinct but did not fit under `cap` — callers journal that overflow
+ * visibly (history event), it is never silent.
+ */
+function unionEvidenceBounded(into: Evidence[], extra: Evidence[], cap: number): number {
   const seen = new Set(into.map(evidenceKey));
+  let dropped = 0;
   for (const ev of extra) {
     const k = evidenceKey(ev);
-    if (!seen.has(k)) {
-      seen.add(k);
-      into.push(ev);
+    if (seen.has(k)) continue;
+    if (into.length >= cap) {
+      dropped += 1;
+      continue;
+    }
+    seen.add(k);
+    into.push(ev);
+  }
+  return dropped;
+}
+
+/** Dedupe-union bounded free-text lists (remedies, openQuestions, titles). */
+function unionStrings(into: string[], extra: readonly string[] | undefined, cap: number): number {
+  if (extra === undefined) return 0;
+  const seen = new Set(into);
+  let dropped = 0;
+  for (const s of extra) {
+    if (seen.has(s)) continue;
+    if (into.length >= cap) {
+      dropped += 1;
+      continue;
+    }
+    seen.add(s);
+    into.push(s);
+  }
+  return dropped;
+}
+
+/**
+ * A verified citation span — the concrete identity dedupe merges on. Paths
+ * are normalized exactly as the citation checker normalizes them, so
+ * "src/a.ts" and "./src/a.ts" identify the same span.
+ */
+interface CitedRange {
+  path: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * Verified citation ranges of a finding's ADMITTED evidence — computed from
+ * `check.valid`, never from raw finding.evidence, so rejected pieces cannot
+ * drive merge identity.
+ */
+function citedRanges(evs: Evidence[]): CitedRange[] {
+  const out: CitedRange[] = [];
+  for (const ev of evs) {
+    if (ev.path === undefined || ev.startLine === undefined) continue;
+    const safe = assertSafeRelativePath(ev.path);
+    if (!safe.ok) continue;
+    out.push({ path: safe.value, start: ev.startLine, end: ev.endLine ?? ev.startLine });
+  }
+  return out;
+}
+
+/**
+ * Conservative merge gate: findings merge only when their VERIFIED citation
+ * ranges overlap on the same path — a shared file alone is not identity,
+ * since same-title reports of different lines in one file are distinct
+ * defects. When BOTH findings hold no verified citation at all, title+kind
+ * alone cannot distinguish them and they merge. One side holding verified
+ * ranges the other cannot match stays a separate claim — a false non-merge
+ * is scribe-recoverable, a false merge destroys a distinct defect's
+ * identity.
+ */
+function mergeCompatible(claimRanges: CitedRange[], findingRanges: CitedRange[]): boolean {
+  if (claimRanges.length === 0 || findingRanges.length === 0) {
+    return claimRanges.length === 0 && findingRanges.length === 0;
+  }
+  for (const a of claimRanges) {
+    for (const b of findingRanges) {
+      if (a.path === b.path && a.start <= b.end && b.start <= a.end) return true;
     }
   }
+  return false;
 }
 
 /**
  * Merge admitted independent findings into the canonical ledger.
  *
  * Input is sorted by (participantId, findingId) so dedup output is identical
- * regardless of the order artifacts arrived. Same (kind, normalized title)
- * merges into one claim; provenance is retained in sourceFindings/provenance,
- * every merge is a history event, and disagreeing severities/confidences are
- * kept as dissent rather than silently averaged.
+ * regardless of the order artifacts arrived. Findings merge under the
+ * conservative policy on Claim: same (kind, normalized title) AND overlapping
+ * VERIFIED citation ranges on the same path (or both hold no verified
+ * citation). Canonical title/kind/severity/confidence come from the
+ * first-sorted finding; every author's rating is preserved in `assessments`,
+ * alternate titles in `mergedTitles`, divergent ratings as dissent, and
+ * remedies/openQuestions union across all merged findings — bounded, with
+ * overflow journaled on the claim history.
  */
 export function buildClaimLedger(
   runId: CouncilRunId,
@@ -267,7 +386,7 @@ export function buildClaimLedger(
   now: Date,
 ): LedgerBuild {
   const claims: Claim[] = [];
-  const byKey = new Map<string, Claim>();
+  const byKey = new Map<string, { claim: Claim; ranges: CitedRange[] }[]>();
   const provenance: Record<ClaimId, ParticipantId[]> = {};
   const evidenceRejections: LedgerBuild['evidenceRejections'] = [];
 
@@ -294,15 +413,57 @@ export function buildClaimLedger(
     }
 
     const key = dedupeKey(finding);
-    const existing = byKey.get(key);
-    if (existing !== undefined) {
+    // Identity comes from VERIFIED citations only — rejected evidence above
+    // can never make two findings look like the same defect.
+    const fRanges = citedRanges(check.valid);
+    const bucket = byKey.get(key);
+    let existing: Claim | undefined;
+    let entryRanges: CitedRange[] | undefined;
+    if (bucket !== undefined) {
+      for (const e of bucket) {
+        if (mergeCompatible(e.ranges, fRanges)) {
+          existing = e.claim;
+          entryRanges = e.ranges;
+          break;
+        }
+      }
+    }
+    if (existing !== undefined && entryRanges !== undefined) {
       existing.sourceFindings.push({ participantId, findingId: finding.findingId });
       provenance[existing.claimId].push(participantId);
-      unionEvidence(existing.evidence, check.valid);
-      unionEvidence(existing.counterEvidence, counterCheck.valid);
+      const seenRange = new Set(entryRanges.map((r) => `${r.path}:${r.start}-${r.end}`));
+      for (const r of fRanges) {
+        const rk = `${r.path}:${r.start}-${r.end}`;
+        if (!seenRange.has(rk)) {
+          seenRange.add(rk);
+          entryRanges.push(r);
+        }
+      }
+      const evDrop = unionEvidenceBounded(existing.evidence, check.valid, MAX_CLAIM_EVIDENCE);
+      const ceDrop = unionEvidenceBounded(existing.counterEvidence, counterCheck.valid, MAX_CLAIM_EVIDENCE);
+      const rems = (existing.remedies ??= []);
+      const oqs = (existing.openQuestions ??= []);
+      const remDrop = unionStrings(rems, finding.remedies, MAX_CLAIM_TEXT_ITEMS);
+      const oqDrop = unionStrings(oqs, finding.openQuestions, MAX_CLAIM_TEXT_ITEMS);
+      (existing.assessments ??= []).push({
+        participantId,
+        findingId: finding.findingId,
+        severity: finding.severity,
+        confidence: finding.confidence,
+      });
+      if (finding.title !== existing.title) {
+        unionStrings((existing.mergedTitles ??= []), [finding.title], MAX_CLAIM_TEXT_ITEMS);
+      }
       existing.history.push(
         event(now, null, participantId, 'merged', `merged into ${existing.claimId} from ${participantId}/${finding.findingId}`, finding.findingId),
       );
+      const dropped = evDrop + ceDrop + remDrop + oqDrop;
+      if (dropped > 0) {
+        existing.history.push(
+          event(now, null, 'runner', 'merged',
+            `union bounded: ${dropped} item(s) over canonical cap retained only in findings/${participantId}.json`),
+        );
+      }
       if (finding.severity !== existing.severity || finding.confidence !== existing.confidence) {
         existing.dissent.push({
           participantId,
@@ -331,8 +492,20 @@ export function buildClaimLedger(
       sourceFindings: [{ participantId, findingId: finding.findingId }],
       history: [event(now, null, participantId, 'admitted', `from ${participantId}/${finding.findingId}`, finding.findingId)],
       dissent: [],
+      assessments: [{
+        participantId,
+        findingId: finding.findingId,
+        severity: finding.severity,
+        confidence: finding.confidence,
+      }],
     };
-    byKey.set(key, claim);
+    const remedies: string[] = [];
+    const openQuestions: string[] = [];
+    unionStrings(remedies, finding.remedies, MAX_CLAIM_TEXT_ITEMS);
+    unionStrings(openQuestions, finding.openQuestions, MAX_CLAIM_TEXT_ITEMS);
+    if (remedies.length > 0) claim.remedies = remedies;
+    if (openQuestions.length > 0) claim.openQuestions = openQuestions;
+    (byKey.get(key) ?? byKey.set(key, []).get(key)!).push({ claim, ranges: fRanges });
     claims.push(claim);
     provenance[claimId] = [participantId];
   }
@@ -456,17 +629,56 @@ export interface AdmittedChallenge {
   challenge: Challenge;
   challengerPid: ParticipantId;
   round: number;
+  /**
+   * Globally-unique identity the ledger assigned before routing: responses
+   * reference it verbatim, ledger history refId stores it, and the routed
+   * Challenge copy carries it as challengeId.
+   */
+  qualifiedId: string;
 }
 
-/** Index admitted challenges by challengeId for response routing. */
+/**
+ * Globally-qualify a worker-minted local challenge id. Workers keep simple
+ * ids ("C-1"); the ledger is the only place identity is assigned:
+ * `ch-r<round>-<sha256(JSON.stringify([challengerPid, localId])).slice(0,32)>`
+ * — deterministic, ID_RE-safe (≤38 chars), and collision-free across
+ * challengers and rounds.
+ */
+export function qualifiedChallengeId(
+  round: number,
+  challengerPid: ParticipantId,
+  localId: string,
+): string {
+  const h = createHash('sha256')
+    .update(JSON.stringify([challengerPid, localId]), 'utf8')
+    .digest('hex')
+    .slice(0, 32);
+  return `ch-r${round}-${h}`;
+}
+
+/**
+ * Index admitted challenges by QUALIFIED challengeId for response routing.
+ * A bare local id additionally resolves only when exactly one admitted
+ * challenge minted it — legacy artifacts and unique-id responses keep working,
+ * while two seats' identical "C-1" can never silently collapse into one.
+ */
 export function indexAdmittedChallenges(
   files: { participantId: ParticipantId; file: ChallengesFile }[],
 ): Map<string, AdmittedChallenge> {
   const out = new Map<string, AdmittedChallenge>();
+  const byLocal = new Map<string, AdmittedChallenge[]>();
   for (const { participantId, file } of files) {
     for (const challenge of file.challenges) {
-      out.set(challenge.challengeId, { challenge, challengerPid: participantId, round: file.round });
+      const qualifiedId = qualifiedChallengeId(file.round, participantId, challenge.challengeId);
+      const ac: AdmittedChallenge = { challenge, challengerPid: participantId, round: file.round, qualifiedId };
+      out.set(qualifiedId, ac);
+      const bucket = byLocal.get(challenge.challengeId);
+      if (bucket === undefined) byLocal.set(challenge.challengeId, [ac]);
+      else bucket.push(ac);
     }
+  }
+  for (const [localId, bucket] of byLocal) {
+    if (bucket.length === 1 && !out.has(localId)) out.set(localId, bucket[0]);
   }
   return out;
 }
@@ -480,8 +692,12 @@ export interface ResponsePlan {
 }
 
 /**
- * Route admitted challenges to claim authors. Each author only ever sees
- * challenges against claims they authored, capped per seat per round.
+ * Route admitted challenges to claim authors. EVERY merged source author of a
+ * claim receives the challenge (except the challenger itself) — a co-author
+ * of a merged claim can always defend their contribution. Each author only
+ * ever sees challenges against claims they authored, capped per seat per
+ * round. Routed Challenge copies carry the qualified challengeId verbatim
+ * plus localChallengeId/challengerPid provenance.
  */
 export function assignResponses(input: {
   challenges: Map<string, AdmittedChallenge>;
@@ -493,42 +709,60 @@ export function assignResponses(input: {
   const unroutable: ResponsePlan['unroutable'] = [];
   const omitted: ResponsePlan['omitted'] = [];
 
-  const sorted = [...challenges.entries()].sort(([a], [b]) => a.localeCompare(b));
-  for (const [challengeId, { challenge, challengerPid }] of sorted) {
+  // The index may hold both qualified ids and unambiguous local aliases —
+  // iterate each admitted challenge exactly once, in qualified-id order.
+  const unique = new Map<string, AdmittedChallenge>();
+  for (const ac of challenges.values()) unique.set(ac.qualifiedId, ac);
+  const sorted = [...unique.values()].sort((a, b) => a.qualifiedId.localeCompare(b.qualifiedId));
+
+  for (const { challenge, challengerPid, qualifiedId } of sorted) {
     const claim = claimsById.get(challenge.claimId);
     if (claim === undefined || claim.status === 'withdrawn') {
       unroutable.push({
-        challengeId,
+        challengeId: qualifiedId,
         claimId: challenge.claimId,
         reason: claim === undefined ? 'claim not in ledger' : 'claim withdrawn',
       });
       continue;
     }
-    const authorPid = claim.sourceFindings[0]?.participantId;
-    if (authorPid === undefined || authorPid === challengerPid) {
-      unroutable.push({ challengeId, claimId: claim.claimId, reason: 'no distinct author to respond' });
+    const authors = [...new Set(claim.sourceFindings.map((f) => f.participantId))].filter(
+      (pid) => pid !== challengerPid,
+    );
+    if (authors.length === 0) {
+      unroutable.push({ challengeId: qualifiedId, claimId: claim.claimId, reason: 'no distinct author to respond' });
       continue;
     }
-    let list = assignments.get(authorPid);
-    if (list === undefined) {
-      list = [];
-      assignments.set(authorPid, list);
-    }
-    const existing = list.find((a) => a.claimId === claim.claimId);
-    const total = list.reduce((n, a) => n + a.challenges.length, 0);
-    if (total >= maxPerSeat) {
-      omitted.push({ challengeId, claimId: claim.claimId, authorPid });
-      continue;
-    }
-    if (existing !== undefined) {
-      existing.challenges.push(challenge);
-    } else {
-      list.push({
-        claimId: claim.claimId,
-        findingId: claim.sourceFindings[0].findingId,
-        claim: projectClaimView(claim),
-        challenges: [challenge],
-      });
+    const routed: Challenge = {
+      ...challenge,
+      challengeId: qualifiedId,
+      localChallengeId: challenge.challengeId,
+      challengerPid,
+    };
+    for (const authorPid of authors) {
+      let list = assignments.get(authorPid);
+      if (list === undefined) {
+        list = [];
+        assignments.set(authorPid, list);
+      }
+      const existing = list.find((a) => a.claimId === claim.claimId);
+      const total = list.reduce((n, a) => n + a.challenges.length, 0);
+      if (total >= maxPerSeat) {
+        omitted.push({ challengeId: qualifiedId, claimId: claim.claimId, authorPid });
+        continue;
+      }
+      const findingId =
+        claim.sourceFindings.find((f) => f.participantId === authorPid)?.findingId ??
+        claim.sourceFindings[0].findingId;
+      if (existing !== undefined) {
+        existing.challenges.push(routed);
+      } else {
+        list.push({
+          claimId: claim.claimId,
+          findingId,
+          claim: projectClaimView(claim),
+          challenges: [routed],
+        });
+      }
     }
   }
   return { assignments, unroutable, omitted };
@@ -545,8 +779,10 @@ export interface EnvelopeFit<T> {
 /**
  * Serialize an envelope, appending whole assignments in the given (already
  * deterministic) order until the next entry would exceed byteCap. Omitted
- * entries are returned so the caller can journal them visibly. The cap is
- * measured against the exact artifact serialization (two-space JSON) that
+ * entries are returned so the caller can journal them visibly AND declared
+ * inside the artifact itself as `omittedCount` — the declaration costs bytes,
+ * so kept items are popped until the self-describing envelope fits. The cap
+ * is measured against the exact artifact serialization (two-space JSON) that
  * callers persist — never a different representation.
  */
 export function fitEnvelope<T>(
@@ -558,15 +794,26 @@ export function fitEnvelope<T>(
     Buffer.byteLength(JSON.stringify(e, null, 2), 'utf8');
   const kept: T[] = [];
   const omitted: T[] = [];
-  let envelope: WorkEnvelope<T> = { ...base, assignments: kept };
   for (const item of ordered) {
     kept.push(item);
-    if (serialize(envelope) > byteCap) {
+    if (serialize({ ...base, assignments: kept }) > byteCap) {
       kept.pop();
       omitted.push(item);
-    } else {
-      envelope = { ...base, assignments: kept };
     }
+  }
+  // Self-describe omissions: the counter consumes bytes too, so pop kept
+  // entries until the declared envelope fits. An empty envelope still
+  // declares its omissions rather than pretending nothing was assigned.
+  let envelope: WorkEnvelope<T>;
+  for (;;) {
+    envelope = {
+      ...base,
+      assignments: kept,
+      ...(omitted.length > 0 ? { omittedCount: omitted.length } : {}),
+    };
+    if (serialize(envelope) <= byteCap || kept.length === 0) break;
+    const popped = kept.pop();
+    if (popped !== undefined) omitted.push(popped);
   }
   return { envelope, omitted, bytes: serialize(envelope) };
 }
@@ -583,21 +830,44 @@ export interface ApplyResult {
   skipped: { refId: string; reason: string }[];
 }
 
-/** Fold admitted challenges into the ledger: status, history, dissent. */
+/**
+ * One evidence item rejected by the discussion-stage folds. `refId` carries
+ * the canonical identity the engine journals (the QUALIFIED challengeId for
+ * challenge/response evidence). Round and participant travel with it so the
+ * journal keeps full provenance.
+ */
+export interface EvidenceRejection {
+  refId: string;
+  participantId: ParticipantId;
+  round: number | null;
+  evidence: Evidence;
+  reason: string;
+}
+
+/**
+ * Fold admitted challenges into the ledger: qualified identity, status,
+ * history, dissent — and the challenger's own evidence, validated against the
+ * snapshot like any finding's. Valid items land in claim.counterEvidence and
+ * on the DissentRecord itself (provenance); invalid ones are returned for
+ * journaling, never silently dropped.
+ */
 export function applyChallengesToLedger(
   ledger: ClaimLedger,
   admitted: ChallengeAdmission[],
+  src: SourceAccess,
   now: Date,
-): ApplyResult {
+): ApplyResult & { evidenceRejections: EvidenceRejection[] } {
   const byId = new Map(ledger.claims.map((c) => [c.claimId, c]));
-  const applied: Claim[] = [];
   const skipped: ApplyResult['skipped'] = [];
+  const evidenceRejections: EvidenceRejection[] = [];
+  let applied = 0;
 
   for (const { participantId, file } of admitted) {
     for (const ch of file.challenges) {
+      const qid = qualifiedChallengeId(file.round, participantId, ch.challengeId);
       const claim = byId.get(ch.claimId);
       if (claim === undefined) {
-        skipped.push({ refId: ch.challengeId, reason: `unknown claimId ${ch.claimId}` });
+        skipped.push({ refId: qid, reason: `unknown claimId ${ch.claimId}` });
         continue;
       }
       // Idempotent under crash-replay: the fold persists before the stage
@@ -607,30 +877,54 @@ export function applyChallengesToLedger(
       const already = claim.history.some(
         (h) =>
           h.type === 'challenged' &&
-          h.refId === ch.challengeId &&
+          h.refId === qid &&
           h.round === file.round &&
           h.actor === participantId,
       );
       if (already) {
-        skipped.push({ refId: ch.challengeId, reason: 'already applied — duplicate fold' });
+        skipped.push({ refId: qid, reason: 'already applied — duplicate fold' });
         continue;
       }
+      const check = validateEvidenceList(ch.evidence, src);
+      for (const bad of check.invalid) {
+        evidenceRejections.push({
+          refId: qid,
+          participantId,
+          round: file.round,
+          evidence: bad.evidence,
+          reason: bad.reason,
+        });
+      }
+      const ceDrop = unionEvidenceBounded(claim.counterEvidence, check.valid, MAX_CLAIM_EVIDENCE);
       claim.history.push(
-        event(now, file.round, participantId, 'challenged', ch.argument, ch.challengeId),
+        event(now, file.round, participantId, 'challenged', ch.argument, qid),
       );
-      claim.dissent.push({
+      const record: DissentRecord = {
         participantId,
         round: file.round,
         position: truncate(`challenge (${ch.kind}): ${ch.argument}`, DISSENT_POSITION_CHARS),
         ts: now.toISOString(),
-      });
+      };
+      if (check.valid.length > 0) record.evidence = check.valid;
+      claim.dissent.push(record);
+      if (ceDrop > 0) {
+        claim.history.push(
+          event(
+            now,
+            file.round,
+            'runner',
+            'merged',
+            `counter-evidence union capped at ${MAX_CLAIM_EVIDENCE} — ${ceDrop} item(s) retained only in rounds/${file.round}/challenges/${participantId}.json`,
+          ),
+        );
+      }
       if (claim.status !== 'withdrawn' && claim.status !== 'challenged') {
         claim.status = 'challenged';
       }
-      applied.push(claim);
+      applied += 1;
     }
   }
-  return { applied: applied.length, skipped };
+  return { applied, skipped, evidenceRejections };
 }
 
 export interface ResponseAdmission {
@@ -639,8 +933,28 @@ export interface ResponseAdmission {
 }
 
 /**
- * Fold admitted author responses into the ledger. `src` is used to
- * re-validate any evidence introduced by a revision or a defence.
+ * Re-derive a claim's grade after an evidence mutation and record a
+ * `regraded` history event when it actually changed. The event is
+ * runner-attributed: grades are derived, never voted or asserted.
+ */
+function regradeIfChanged(claim: Claim, now: Date, round: number | null): void {
+  const next = deriveGrade(claim.evidence);
+  if (next === claim.grade) return;
+  const prev = claim.grade;
+  claim.grade = next;
+  claim.history.push(
+    event(now, round, 'runner', 'regraded', `grade ${prev} → ${next} after evidence update`),
+  );
+}
+
+/**
+ * Fold admitted author responses into the ledger. `src` re-validates any
+ * evidence introduced by a revision or a defence; rejections are returned
+ * with the challenged ref for journaling. Defend AND revise both re-derive
+ * the grade (a defended claim no longer carries a stale grade); revise UNIONS
+ * its evidence so co-author contributions merged earlier are never erased.
+ * Responses resolve their challenge by qualified id — or by a bare local id
+ * only when the admitted set makes it unambiguous.
  */
 export function applyResponsesToLedger(
   ledger: ClaimLedger,
@@ -648,10 +962,10 @@ export function applyResponsesToLedger(
   challengeIndex: Map<string, AdmittedChallenge>,
   src: SourceAccess,
   now: Date,
-): ApplyResult & { evidenceRejections: InvalidEvidence[] } {
+): ApplyResult & { evidenceRejections: EvidenceRejection[] } {
   const byId = new Map(ledger.claims.map((c) => [c.claimId, c]));
   const skipped: ApplyResult['skipped'] = [];
-  const evidenceRejections: InvalidEvidence[] = [];
+  const evidenceRejections: EvidenceRejection[] = [];
   let applied = 0;
 
   for (const { participantId, file } of admitted) {
@@ -671,58 +985,105 @@ export function applyResponsesToLedger(
         skipped.push({ refId: res.challengeId, reason: `response to unadmitted challenge ${res.challengeId}` });
         continue;
       }
+      // Pair identity, fail closed: a challenge id resolves only for the
+      // (claimId, round) it was minted against. A co-author with assignments
+      // on several claims cannot echo a valid id onto the wrong claim, and a
+      // stale round's id cannot land in a later response file.
+      if (admittedCh.challenge.claimId !== res.claimId || admittedCh.round !== file.round) {
+        skipped.push({
+          refId: res.challengeId,
+          reason: `challenge ${admittedCh.qualifiedId} targets ${admittedCh.challenge.claimId}@round ${admittedCh.round}, not ${res.claimId}@round ${file.round}`,
+        });
+        continue;
+      }
+      // Canonical identity for this response: the qualified id the routing
+      // layer stamped, regardless of what the author echoed back.
+      const qid = admittedCh.qualifiedId;
       // Idempotent under crash-replay (see applyChallengesToLedger).
       const already = claim.history.some(
         (h) =>
           RESPONSE_EVENT_TYPES.has(h.type) &&
-          h.refId === res.challengeId &&
+          h.refId === qid &&
           h.round === file.round &&
           h.actor === participantId,
       );
       if (already) {
-        skipped.push({ refId: res.challengeId, reason: 'already applied — duplicate fold' });
+        skipped.push({ refId: qid, reason: 'already applied — duplicate fold' });
         continue;
       }
 
       const check = validateEvidenceList(res.evidence ?? [], src);
-      evidenceRejections.push(...check.invalid);
+      for (const bad of check.invalid) {
+        evidenceRejections.push({ refId: qid, participantId, round: file.round, evidence: bad.evidence, reason: bad.reason });
+      }
 
       switch (res.disposition) {
         case 'defend': {
-          unionEvidence(claim.evidence, check.valid);
+          const drop = unionEvidenceBounded(claim.evidence, check.valid, MAX_CLAIM_EVIDENCE);
           claim.status = 'defended';
-          claim.history.push(event(now, file.round, participantId, 'defended', res.argument, res.challengeId));
+          claim.history.push(event(now, file.round, participantId, 'defended', res.argument, qid));
+          if (drop > 0) {
+            claim.history.push(
+              event(now, file.round, 'runner', 'merged',
+                `evidence union capped at ${MAX_CLAIM_EVIDENCE} — ${drop} item(s) retained only in rounds/${file.round}/responses/${participantId}.json`),
+            );
+          }
+          regradeIfChanged(claim, now, file.round);
           break;
         }
         case 'revise': {
           const revised = res.revisedFinding;
           if (revised === undefined) {
-            skipped.push({ refId: res.challengeId, reason: 'revise without revisedFinding' });
+            skipped.push({ refId: qid, reason: 'revise without revisedFinding' });
             continue;
           }
           const revCheck = validateEvidenceList(revised.evidence, src);
-          evidenceRejections.push(...revCheck.invalid);
+          for (const bad of revCheck.invalid) {
+            evidenceRejections.push({ refId: qid, participantId, round: file.round, evidence: bad.evidence, reason: bad.reason });
+          }
           const revCounter = validateEvidenceList(revised.counterEvidence ?? [], src);
-          evidenceRejections.push(...revCounter.invalid);
+          for (const bad of revCounter.invalid) {
+            evidenceRejections.push({ refId: qid, participantId, round: file.round, evidence: bad.evidence, reason: bad.reason });
+          }
           claim.title = revised.title;
           claim.kind = revised.kind;
           claim.severity = revised.severity;
           claim.confidence = revised.confidence;
-          claim.evidence = revCheck.valid;
-          unionEvidence(claim.counterEvidence, revCounter.valid);
-          claim.grade = deriveGrade(claim.evidence);
+          // Union — never replace: evidence merged in from co-authors is not
+          // the reviser's to delete. (Withdrawal removes a claim, revision
+          // amends it.)
+          const drop = unionEvidenceBounded(claim.evidence, revCheck.valid, MAX_CLAIM_EVIDENCE);
+          const ceDrop = unionEvidenceBounded(claim.counterEvidence, revCounter.valid, MAX_CLAIM_EVIDENCE);
+          const rems = (claim.remedies ??= []);
+          const oqs = (claim.openQuestions ??= []);
+          const remDrop = unionStrings(rems, revised.remedies, MAX_CLAIM_TEXT_ITEMS);
+          const oqDrop = unionStrings(oqs, revised.openQuestions, MAX_CLAIM_TEXT_ITEMS);
+          (claim.assessments ??= []).push({
+            participantId,
+            findingId: revised.findingId,
+            severity: revised.severity,
+            confidence: revised.confidence,
+          });
           claim.status = 'revised';
-          claim.history.push(event(now, file.round, participantId, 'revised', res.argument, res.challengeId));
+          claim.history.push(event(now, file.round, participantId, 'revised', res.argument, qid));
+          const dropped = drop + ceDrop + remDrop + oqDrop;
+          if (dropped > 0) {
+            claim.history.push(
+              event(now, file.round, 'runner', 'merged',
+                `union bounded: ${dropped} item(s) over canonical cap retained only in rounds/${file.round}/responses/${participantId}.json`),
+            );
+          }
+          regradeIfChanged(claim, now, file.round);
           break;
         }
         case 'withdraw': {
           claim.status = 'withdrawn';
-          claim.history.push(event(now, file.round, participantId, 'withdrawn', res.argument, res.challengeId));
+          claim.history.push(event(now, file.round, participantId, 'withdrawn', res.argument, qid));
           break;
         }
         case 'escalate': {
           claim.status = 'escalated';
-          claim.history.push(event(now, file.round, participantId, 'escalated', res.argument, res.challengeId));
+          claim.history.push(event(now, file.round, participantId, 'escalated', res.argument, qid));
           break;
         }
       }

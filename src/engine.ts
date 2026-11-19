@@ -29,6 +29,7 @@ import {
   type ApprovalRecord,
   type ApprovedRoster,
   type AttemptId,
+  type AttemptStatus,
   type ChallengeAssignment,
   type ChallengesFile,
   type ClaimLedger,
@@ -51,10 +52,15 @@ import {
   type ResponsesFile,
   type Result,
   type RunStatus,
+  type SnapshotDrift,
   type SourceSnapshot,
+  type Store,
+  type TaskListRow,
+  type WorkerListRow,
 } from './contracts.js';
 import {
   assertSafeRelativePath,
+  buildApprovalBinding,
   canonicalApprovalHash,
   canonicalRosterHash,
   err,
@@ -66,6 +72,7 @@ import {
   parseResponsesFile,
   parseScribeNotesFile,
 } from './validation.js';
+import * as validationNs from './validation.js';
 import {
   applyChallengesToLedger,
   applyResponsesToLedger,
@@ -119,6 +126,8 @@ const paths = {
 
 const TERMINAL_ATTEMPT = new Set(['settled_ok', 'settled_failed', 'timed_out', 'stopped']);
 const ACTIVE_ATTEMPT = new Set(['dispatched', 'working', 'unknown']);
+/** Bounded retries for provably no-effect worker-launch errors. */
+const MAX_WORKER_LAUNCH_ERRORS = 2;
 /**
  * Attempts whose worker may physically still be running — or whose launch
  * outcome was never disproven. Each holds a concurrency slot until
@@ -152,16 +161,61 @@ interface StepCtx {
   rejectedAttempts: Set<AttemptId>;
   /** Attempt ids whose task-create already failed (journal-derived, durable). */
   taskCreateFailed: Set<AttemptId>;
+  /**
+   * Journaled worker-launch error counts per attempt (durable). A journaled
+   * error is provably no-effect (uncertainty arrives as outcome 'unknown'),
+   * so a bounded retry is safe — but a deterministic failure must not
+   * livelock: after MAX_WORKER_LAUNCH_ERRORS the seat fails visibly.
+   */
+  workerLaunchFailures: Map<AttemptId, number>;
+  /**
+   * Corrective repair context per attempt id — journaled on the rejection
+   * event so a restart rebuilds the exact spec context before relaunch.
+   */
+  repairByAttempt: Map<AttemptId, RepairSpec>;
+  /** "pid|phase|round" tuples that already consumed their one corrective attempt. */
+  repairedKeys: Set<string>;
+  /** Per-recipient runner mail counts (journal-derived, durable). */
+  mailSentByTarget: Map<string, number>;
   /** True when a prior run-create intent exists without a recorded success. */
   runCreateUnresolved: boolean;
   /** Attempt ids with a stop already requested (journal-derived, durable). */
   stopRequestedAttempts: Set<AttemptId>;
+  /**
+   * Operation-stage chronology (journal-derived, last-write-wins): the most
+   * recent durable entry for each host mutation. 'issued' ⇒ the op ran and
+   * its outcome is uncertain; 'refused' ⇒ a definitive no-effect refusal was
+   * receipted; absent ⇒ see intentProtocol (v2+ proves never-issued, legacy
+   * intents cannot).
+   */
+  taskCreateStage: Map<AttemptId, 'issued' | 'refused'>;
+  workerLaunchStage: Map<AttemptId, 'issued' | 'refused'>;
+  /**
+   * Launch-protocol version per attempt (max `v` on attempt-level
+   * launch.intent events). v≥2 intents participate in the stage-marker
+   * scheme; absent/lower means the attempt was journaled by a runner without
+   * markers — its markerless stages are 'uncertain', never 'never-issued'.
+   */
+  intentProtocol: Map<AttemptId, number>;
   /** Perspective catalog from the admitted proposal (reviewer spec inputs). */
   perspectives?: Map<string, Perspective>;
   /** Admitted findings paths handed to the scribe-notes prompt. */
   admittedFindingsPaths?: string[];
   /** Snapshot resolved once per step (prompt ctx + evidence validation). */
   snapshot?: SourceSnapshot;
+  /** Approved roster verified by this step's revalidation (bound seat agents). */
+  approvedRoster?: ApprovedRoster;
+  /** Drift verdict cached once per advance — never re-scans per launch. */
+  driftResult?: Result<SnapshotDrift>;
+}
+
+/** Corrective-attempt context handed to the spec builders (RepairContext). */
+interface RepairSpec {
+  /** The rejected attempt this repair corrects (journaled lineage). */
+  repairOf: AttemptId;
+  contract: string;
+  diagnostics: string[];
+  previousArtifactPath?: string;
 }
 
 type StepResult =
@@ -208,14 +262,23 @@ export function createEngine(deps: EngineDeps): Engine {
     ctx.events.push(ev);
   };
 
-  /** Persist state + pending journal events. Called before every host mutation. */
+  /**
+   * Persist pending journal events, then state. Called before every host
+   * mutation. Journal FIRST: it is the durable record of issued intents and
+   * observed effects; state.json is a reconcilable projection — a crash after
+   * the append but before saveState is recovered by observation, while the
+   * reverse order could orphan unjournaled state mutations. Events are
+   * drained only after a successful append so a failed flush never silently
+   * drops the guard events they carry.
+   */
   const flush = async (ctx: StepCtx): Promise<Result<void>> => {
+    if (ctx.events.length > 0) {
+      const j = await store.appendJournal(ctx.events);
+      if (!j.ok) return j;
+      ctx.events.splice(0);
+    }
     const s = await store.saveState(ctx.state);
     if (!s.ok) return s;
-    if (ctx.events.length > 0) {
-      const j = await store.appendJournal(ctx.events.splice(0));
-      if (!j.ok) return j;
-    }
     return ok(undefined);
   };
 
@@ -301,6 +364,59 @@ export function createEngine(deps: EngineDeps): Engine {
   // ── Observation ────────────────────────────────────────────────────────────
 
   /**
+   * Recover custody of an 'unknown' launch that has no dispatchId. First
+   * probe the retained requestId via requestShow (journaled as evidence);
+   * then scan the host worker-list for exactly one worker bound to this
+   * attempt's task. A unique match is adopted — its dispatch becomes
+   * observable like any launched attempt. Zero or ambiguous matches stay
+   * 'unknown'; nothing here ever mutates the host.
+   */
+  const adoptUnknownDispatch = async (
+    ctx: StepCtx,
+    p: Participant,
+    attempt: PhaseAttempt,
+  ): Promise<void> => {
+    if (attempt.taskId === null) return;
+    if (attempt.requestId !== undefined && typeof host.requestShow === 'function') {
+      const req = await host.requestShow({ requestId: attempt.requestId });
+      emit(ctx, 'mail.observed', {
+        attemptId: attempt.attemptId,
+        scope: 'request-show',
+        requestId: attempt.requestId,
+        observation: req.ok ? req.value.state : 'error',
+        ...(req.ok ? {} : { error: req.error.message }),
+      }, { participantId: p.participantId, phase: attempt.phase });
+    }
+    if (typeof host.listWorkers !== 'function') return;
+    const listed = await host.listWorkers({ runId: ctx.state.orcaRunId! });
+    if (!listed.ok) {
+      emit(ctx, 'mail.observed', {
+        attemptId: attempt.attemptId,
+        scope: 'worker-list',
+        observation: 'error',
+        error: listed.error.message,
+      }, { participantId: p.participantId, phase: attempt.phase });
+      return;
+    }
+    const rowTask = (w: WorkerListRow): unknown => w.taskId ?? w.task ?? w.task_id;
+    const matches = listed.value.workers.filter((w) => rowTask(w) === attempt.taskId);
+    if (matches.length !== 1) return; // zero or ambiguous — stays 'unknown'
+    const row = matches[0];
+    attempt.dispatchId = row.dispatchId;
+    const th = row.terminalHandle ?? row.terminal;
+    if (typeof th === 'string' && th.length > 0) {
+      attempt.terminalHandle = th;
+      if (p.retainedTerminal === null) p.retainedTerminal = th;
+    }
+    emit(ctx, 'launch.resume', {
+      attemptId: attempt.attemptId,
+      resolution: 'adopted-dispatch',
+      dispatchId: attempt.dispatchId,
+      taskId: attempt.taskId,
+    }, { participantId: p.participantId, phase: attempt.phase });
+  };
+
+  /**
    * Observe every launched attempt once; updates attempt status in place.
    * Timed-out attempts keep being observed: their workers may still be
    * running, and a proven finish is what releases their concurrency slot.
@@ -309,7 +425,16 @@ export function createEngine(deps: EngineDeps): Engine {
     for (const p of ctx.state.participants) {
       for (const attempt of p.attempts) {
         const observable = ACTIVE_ATTEMPT.has(attempt.status) || attempt.status === 'timed_out';
-        if (!observable || attempt.dispatchId === null) continue;
+        if (!observable) continue;
+        if (attempt.dispatchId === null) {
+          // 'unknown' without a dispatch: the launch receipt never arrived —
+          // but the worker may have landed. Recover custody through the
+          // documented READ APIs only (requestShow evidence + worker-list
+          // adoption). A unique match is adopted as an ordinary dispatch;
+          // anything else stays unknown — never relaunched blind.
+          if (attempt.status === 'unknown') await adoptUnknownDispatch(ctx, p, attempt);
+          if (attempt.dispatchId === null) continue;
+        }
         const obs = await host.observeWorker({ dispatchId: attempt.dispatchId });
         if (!obs.ok) {
           emit(ctx, 'mail.observed', {
@@ -564,12 +689,13 @@ export function createEngine(deps: EngineDeps): Engine {
         }),
       );
     }
-    const binding = buildBinding(state, rosterR.value, proposedR.value, snapR.value);
+    const binding = buildApprovalBinding(state, rosterR.value, proposedR.value, snapR.value);
     const recomputed = canonicalApprovalHash(binding);
     if (recomputed !== state.approvalHash || recomputed !== appr.value.record.hash) {
       state.approvalHash = null;
       emit(ctx, 'approval.invalidated', {
         reason: 'binding_mismatch',
+        approvalId: appr.value.record.approvalId,
         expected: appr.value.record.hash,
         recomputed,
       });
@@ -577,7 +703,11 @@ export function createEngine(deps: EngineDeps): Engine {
         err('approval_stale', 'approval binding no longer matches persisted artifacts; re-approval required'),
       );
     }
-    const drift = await store.verifySourceSnapshot();
+    ctx.approvedRoster = rosterR.value;
+    // One drift verdict per advance — launches and finalize share it rather
+    // than re-scanning the live tree for every attempt.
+    if (ctx.driftResult === undefined) ctx.driftResult = await store.verifySourceSnapshot();
+    const drift = ctx.driftResult;
     if (!drift.ok) {
       return failRes(
         err('snapshot_drift', `source snapshot verification failed: ${drift.error.message}`),
@@ -598,7 +728,7 @@ export function createEngine(deps: EngineDeps): Engine {
       if (manifestChanged.length > 0) {
         emit(ctx, 'snapshot.drift', { scope: 'manifest', changed: manifestChanged, blocking: true });
         return failRes(
-          err('snapshot_drift', 'reviewed source changed since approval; re-snapshot and re-approve', {
+          err('snapshot_drift', 'reviewed source changed since approval; pinned snapshots are immutable — create a new run to review the new state', {
             details: { changed: manifestChanged, added },
           }),
         );
@@ -607,21 +737,31 @@ export function createEngine(deps: EngineDeps): Engine {
     return ok(undefined);
   };
 
-  const buildBinding = (
-    state: CouncilState,
-    roster: ApprovedRoster,
-    proposed: ProposedRoster,
-    snapshot: SourceSnapshot,
-  ): ApprovalBinding => ({
-    schemaVersion: SCHEMA_VERSION,
-    runId: state.runId,
-    objective: state.objective,
-    seats: roster.seats,
-    proposedRosterHash: canonicalRosterHash(proposed),
-    config: state.config,
-    snapshotId: snapshot.snapshotId,
-    snapshotHeadHash: snapshot.headHash,
-  });
+  /**
+   * Full AgentChoice equality — the launch-time bound-choice check (clm_0002 /
+   * rev-04): `profile` is compared, unlike the legacy staff/supervisor gate.
+   */
+  const agentChoiceEqual = (a: AgentChoice, b: AgentChoice): boolean =>
+    a.agent === b.agent &&
+    a.model === b.model &&
+    (a.effort ?? null) === (b.effort ?? null) &&
+    (a.permissionMode ?? null) === (b.permissionMode ?? null) &&
+    (a.profile ?? null) === (b.profile ?? null);
+
+  /**
+   * The AgentChoice a participant is bound to: reviewers → their approved
+   * seat choice from the verified roster; staff → the approved config's
+   * staff choice. 'unbound' means a reviewer without a matching seat —
+   * a launch blocker. undefined means "no binding applies" (organiser).
+   */
+  const boundAgentChoice = (ctx: StepCtx, p: Participant): AgentChoice | 'unbound' | undefined => {
+    if (p.role === 'reviewer') {
+      const seat = ctx.approvedRoster?.seats.find((s) => s.participantId === p.participantId);
+      return seat === undefined ? 'unbound' : seat.agent;
+    }
+    if (p.role === 'scribe') return staffAgent(ctx.state, 'scribe');
+    return undefined; // organiser — staff choice comes from the same config
+  };
 
   // ── Launch machinery ───────────────────────────────────────────────────────
 
@@ -637,60 +777,81 @@ export function createEngine(deps: EngineDeps): Engine {
     };
     const outRel = expectedOutputPath(attempt);
     const outAbs = abs(outRel);
+    // Corrective-attempt context (bounded validator diagnostics + archived
+    // rejected artifact path), journaled at rejection time so a restart
+    // rebuilds the identical spec. Passed through to all six spec builders
+    // as the optional `repair` input — never present on first attempts.
+    const rs = ctx.repairByAttempt.get(attempt.attemptId);
+    const repair = rs !== undefined
+      ? {
+          contract: rs.contract,
+          diagnostics: rs.diagnostics,
+          ...(rs.previousArtifactPath !== undefined ? { previousArtifactPath: rs.previousArtifactPath } : {}),
+        }
+      : undefined;
+    const withRepair = <T extends object>(input: T): T & { repair?: typeof repair } => {
+      if (repair !== undefined) (input as { repair?: typeof repair }).repair = repair;
+      return input as T & { repair?: typeof repair };
+    };
     switch (attempt.phase) {
       case 'organiser':
-        return { spec: prompts.organiser(promptCtx, { participantId: p.participantId, outputPath: outAbs }), outRel };
+        return { spec: prompts.organiser(promptCtx, withRepair({ participantId: p.participantId, outputPath: outAbs })), outRel };
       case 'independent_review': {
         const perspective = ctx.perspectives?.get(p.perspectiveId ?? '');
         if (perspective === undefined) return null;
         return {
-          spec: prompts.reviewerIndependent(promptCtx, {
+          spec: prompts.reviewerIndependent(promptCtx, withRepair({
             participantId: p.participantId,
             perspective,
             outputPath: outAbs,
-          }),
+          })),
           outRel,
         };
       }
       case 'scribe_notes':
         return {
-          spec: prompts.scribeNotes(promptCtx, {
+          spec: prompts.scribeNotes(promptCtx, withRepair({
             participantId: p.participantId,
             admittedFindingsPaths: ctx.admittedFindingsPaths ?? [],
             outputPath: outAbs,
-          }),
+          })),
           outRel,
         };
       case 'challenge':
         return {
-          spec: prompts.challenge(promptCtx, {
+          spec: prompts.challenge(promptCtx, withRepair({
             participantId: p.participantId,
             envelopePath: abs(paths.challengeEnv(p.participantId, attempt.round ?? 1)),
             outputPath: outAbs,
-          }),
+          })),
           outRel,
         };
       case 'author_response':
         return {
-          spec: prompts.authorResponse(promptCtx, {
+          spec: prompts.authorResponse(promptCtx, withRepair({
             participantId: p.participantId,
             envelopePath: abs(paths.responseEnv(p.participantId, attempt.round ?? 1)),
             outputPath: outAbs,
-          }),
+          })),
           outRel,
         };
-      case 'scribe_synthesis':
+      case 'scribe_synthesis': {
+        const input = withRepair({
+          participantId: p.participantId,
+          ledgerPath: abs(paths.ledger),
+          journalPath: abs('events.jsonl'),
+          reportJsonPath: abs(paths.scribeReportJson),
+          reportMdPath: abs(paths.scribeReportMd),
+          summaryPath: abs(paths.scribeSummary),
+        });
+        // Admitted scribe notes become EXPLICIT synthesis input (clm_0021):
+        // narrative context only — never authoritative claims or consensus.
+        (input as { notesPath?: string }).notesPath = abs(paths.scribeNotesOut);
         return {
-          spec: prompts.scribeSynthesis(promptCtx, {
-            participantId: p.participantId,
-            ledgerPath: abs(paths.ledger),
-            journalPath: abs('events.jsonl'),
-            reportJsonPath: abs(paths.scribeReportJson),
-            reportMdPath: abs(paths.scribeReportMd),
-            summaryPath: abs(paths.scribeSummary),
-          }),
+          spec: prompts.scribeSynthesis(promptCtx, input),
           outRel,
         };
+      }
     }
   };
 
@@ -701,9 +862,197 @@ export function createEngine(deps: EngineDeps): Engine {
   }
 
   /**
+   * Crash-window resolution for an attempt whose launch.intent is persisted
+   * but whose receipts never reached the journal/state. The durable stage
+   * chronology decides whether the host is even consulted:
+   *  - 'never' (v2 intent, no marker) or 'refused' (journaled definitive
+   *    refusal) → proceed without any host read;
+   *  - 'uncertain' (issued but unreceipted, or a legacy pre-marker intent) →
+   *    OBSERVATION ONLY through the documented read APIs: exactly one
+   *    EXACT-identity host record → ADOPT it; zero / ambiguous / malformed /
+   *    unobservable → the attempt becomes 'unknown' and blocks — a listing
+   *    can never prove no-effects, so a blind retry could duplicate a
+   *    landed mutation.
+   */
+  const resolveRecordedIntent = async (
+    ctx: StepCtx,
+    p: Participant,
+    attempt: PhaseAttempt,
+  ): Promise<{ kind: 'proceed' } | { kind: 'adopted' } | { kind: 'blocked'; outcome: LaunchOutcome }> => {
+    const block = (reason: string, detail: Record<string, unknown>): { kind: 'blocked'; outcome: LaunchOutcome } => {
+      attempt.status = 'unknown';
+      emit(ctx, 'worker.unknown', {
+        attemptId: attempt.attemptId,
+        taskId: attempt.taskId,
+        requestId: attempt.requestId,
+        detail: reason,
+      }, { participantId: p.participantId, phase: attempt.phase });
+      emit(ctx, 'launch.resume', {
+        attemptId: attempt.attemptId,
+        resolution: 'blocked',
+        reason,
+        ...detail,
+      }, { participantId: p.participantId, phase: attempt.phase });
+      return {
+        kind: 'blocked',
+        outcome: {
+          kind: 'unknown',
+          error: err('launch_unknown', `${reason} — reconcile before continuing; never relaunch`, {
+            details: { attemptId: attempt.attemptId, taskId: attempt.taskId, requestId: attempt.requestId, ...detail },
+          }),
+        },
+      };
+    };
+    const resumeOk = async (resolution: string, detail: Record<string, unknown>): Promise<{ kind: 'proceed' } | { kind: 'blocked'; outcome: LaunchOutcome }> => {
+      emit(ctx, 'launch.resume', { attemptId: attempt.attemptId, resolution, ...detail },
+        { participantId: p.participantId, phase: attempt.phase });
+      const f = await flush(ctx);
+      if (!f.ok) return { kind: 'blocked', outcome: { kind: 'task_error', error: f.error } };
+      return { kind: 'proceed' };
+    };
+
+    /**
+     * Durable chronology for one host mutation: 'uncertain' when the last
+     * journaled stage entry is an issue marker with no outcome, 'refused'
+     * when a definitive no-effect refusal was receipted most recently, and
+     * 'never' only when a v2+ launch intent proves the marker scheme was in
+     * force yet no marker exists — a legacy (pre-marker) intent_recorded
+     * attempt can have invoked the host, so its absent marker proves nothing.
+     */
+    const opStage = (op: 'task-create' | 'worker-launch'): 'uncertain' | 'refused' | 'never' => {
+      const stage = (op === 'task-create' ? ctx.taskCreateStage : ctx.workerLaunchStage).get(attempt.attemptId);
+      if (stage === 'issued') return 'uncertain';
+      if (stage === 'refused') return 'refused';
+      return (ctx.intentProtocol.get(attempt.attemptId) ?? 1) >= 2 ? 'never' : 'uncertain';
+    };
+
+    if (attempt.taskId === null) {
+      const st = opStage('task-create');
+      if (st !== 'uncertain') {
+        return resumeOk('no-issue-marker', { op: 'task-create', detail: st === 'never' ? 'v2 intent proves createTask was never issued' : 'journaled definitive refusal resolves createTask outcome' });
+      }
+      // Issued with no journaled outcome — UNCERTAIN. A zero listing can
+      // never prove no-effects (host ledgers prune / lag), so it stays
+      // blocked; only a unique EXACT-spec task with a valid id is adopted.
+      if (typeof host.listTasks !== 'function') {
+        return block('task-create outcome unobservable (adapter lacks listTasks)', { op: 'task-create' });
+      }
+      const specAbs = abs(paths.spec(attempt.attemptId));
+      const listed = await host.listTasks({ runId: ctx.state.orcaRunId! });
+      if (!listed.ok) {
+        return block(`task-create outcome unobservable: ${listed.error.message}`, { op: 'task-create' });
+      }
+      const rowSpec = (t: TaskListRow): unknown => t.specFile ?? t.specFilePath ?? t.spec;
+      // An unidentifiable row could BE the landed task — the read cannot
+      // prove a zero-match, so it cannot authorize anything.
+      if (listed.value.tasks.some((t) => rowSpec(t) === undefined || rowSpec(t) === null)) {
+        return block('task-create outcome unobservable: task-list rows lack spec identity', { op: 'task-create' });
+      }
+      // Exact identity only: never title-only or suffix-only alias identity.
+      const matches = listed.value.tasks.filter((t) => rowSpec(t) === specAbs);
+      if (matches.length === 0) {
+        return block('task-create issued but no host record found — outcome uncertain; reconcile via documented reads or council reconcile', { op: 'task-create' });
+      }
+      if (matches.length > 1) {
+        return block('task-create outcome ambiguous: multiple host tasks share this attempt spec', {
+          op: 'task-create',
+          matches: matches.length,
+        });
+      }
+      const taskId = matches[0].taskId ?? matches[0].id;
+      if (typeof taskId !== 'string' || taskId.length === 0) {
+        return block('task-create adoption blocked: matched host task has no usable taskId', { op: 'task-create' });
+      }
+      attempt.taskId = taskId;
+      emit(ctx, 'task.created', {
+        attemptId: attempt.attemptId,
+        taskId,
+        scope: 'task',
+        reconciled: 'adopted',
+      }, { participantId: p.participantId, phase: attempt.phase });
+      emit(ctx, 'launch.resume', { attemptId: attempt.attemptId, resolution: 'adopted-task', taskId },
+        { participantId: p.participantId, phase: attempt.phase });
+      const f = await flush(ctx);
+      if (!f.ok) return { kind: 'blocked', outcome: { kind: 'task_error', error: f.error } };
+      // Fall through — a task adoption does NOT prove the worker stage is
+      // safe to issue; it must be resolved by the same stage chronology.
+    }
+
+    if (attempt.taskId !== null && attempt.dispatchId === null) {
+      // Same stage-chronology rule for worker-start: only the MOST RECENT
+      // durable stage entry counts — an older refusal cannot authorize a
+      // retry whose newer issue marker lost its receipt.
+      const st = opStage('worker-launch');
+      if (st !== 'uncertain') {
+        return resumeOk('no-issue-marker', { op: 'worker-launch', detail: st === 'never' ? 'v2 intent proves launchWorker was never issued' : 'journaled definitive refusal resolves launch outcome' });
+      }
+      if (typeof host.listWorkers !== 'function') {
+        return block('worker-launch outcome unobservable (adapter lacks listWorkers)', { op: 'worker-launch' });
+      }
+      const listed = await host.listWorkers({ runId: ctx.state.orcaRunId! });
+      if (!listed.ok) {
+        return block(`worker-launch outcome unobservable: ${listed.error.message}`, { op: 'worker-launch' });
+      }
+      const rowTask = (w: WorkerListRow): unknown => w.taskId ?? w.task ?? w.task_id;
+      if (listed.value.workers.some((w) => rowTask(w) === undefined || rowTask(w) === null)) {
+        return block('worker-launch outcome unobservable: worker-list rows lack task ids', { op: 'worker-launch' });
+      }
+      const matches = listed.value.workers.filter((w) => rowTask(w) === attempt.taskId);
+      if (matches.length === 0) {
+        return block('worker-launch issued but no host record found — outcome uncertain; reconcile via documented reads or council reconcile', { op: 'worker-launch' });
+      }
+      if (matches.length > 1) {
+        return block('worker-launch outcome ambiguous: multiple dispatches for this task', {
+          op: 'worker-launch',
+          matches: matches.length,
+        });
+      }
+      const row = matches[0];
+      if (typeof row.dispatchId !== 'string' || row.dispatchId.length === 0) {
+        return block('worker-launch adoption blocked: matched worker has no usable dispatchId', { op: 'worker-launch' });
+      }
+      attempt.dispatchId = row.dispatchId;
+      const th = row.terminalHandle ?? row.terminal;
+      if (typeof th === 'string' && th.length > 0) {
+        attempt.terminalHandle = th;
+        if (p.retainedTerminal === null) p.retainedTerminal = th;
+      }
+      attempt.status = 'dispatched';
+      ctx.state.consumption.launches += 1; // the launch landed — charge it once
+      p.status = 'active';
+      emit(ctx, 'worker.started', {
+        attemptId: attempt.attemptId,
+        taskId: attempt.taskId,
+        dispatchId: attempt.dispatchId,
+        terminalHandle: attempt.terminalHandle,
+        agent: p.agent,
+        reconciled: 'adopted',
+      }, { participantId: p.participantId, phase: attempt.phase });
+      emit(ctx, 'launch.resume', {
+        attemptId: attempt.attemptId,
+        resolution: 'adopted-dispatch',
+        dispatchId: attempt.dispatchId,
+      }, { participantId: p.participantId, phase: attempt.phase });
+      const f = await flush(ctx);
+      if (!f.ok) return { kind: 'blocked', outcome: { kind: 'task_error', error: f.error } };
+      return { kind: 'adopted' };
+    }
+    // Both identities already recorded — the launch is live, nothing to
+    // re-issue. Mark it dispatched so normal observation reconciles it.
+    attempt.status = 'dispatched';
+    emit(ctx, 'launch.resume', { attemptId: attempt.attemptId, resolution: 'already-dispatched', taskId: attempt.taskId, dispatchId: attempt.dispatchId },
+      { participantId: p.participantId, phase: attempt.phase });
+    const f = await flush(ctx);
+    if (!f.ok) return { kind: 'blocked', outcome: { kind: 'task_error', error: f.error } };
+    return { kind: 'adopted' };
+  };
+
+  /**
    * Persist intent → write spec → createTask (resumed when taskId already
    * exists) → launchWorker. Fresh Task per phase; reuseTerminal only when the
-   * participant's previous dispatch is proven settled.
+   * participant's previous dispatch is proven settled. An 'intent_recorded'
+   * resume NEVER replays a mutation blind — resolveRecordedIntent observes
+   * the host first and adopts or blocks.
    */
   const launchAttempt = async (
     ctx: StepCtx,
@@ -731,6 +1080,27 @@ export function createEngine(deps: EngineDeps): Engine {
     if (attempt.phase !== 'organiser') {
       const ap = await revalidateApproval(ctx);
       if (!ap.ok) return { kind: 'approval', error: ap.error };
+      // Bound-choice check (clm_0002 / rev-04): the participant's AgentChoice
+      // must equal the choice the approval actually binds — state.json is
+      // mutable and its participant records are NOT inside the approval hash,
+      // so a divergent choice here means tampering or a profile-blind
+      // re-approval; never launch it. Full field equality, profile included.
+      const bound = boundAgentChoice(ctx, p);
+      if (bound === 'unbound' || (bound !== undefined && !agentChoiceEqual(bound, p.agent))) {
+        emit(ctx, 'error', {
+          op: 'agent-choice',
+          attemptId: attempt.attemptId,
+          detail: 'participant AgentChoice diverges from the approved binding — refusing launch',
+          participant: p.agent,
+          approved: bound === 'unbound' ? null : bound,
+        }, { participantId: p.participantId, phase: attempt.phase });
+        return {
+          kind: 'approval',
+          error: err('roster_invalid', bound === 'unbound'
+            ? `participant ${p.participantId} is not in the approved roster — refusing launch`
+            : `participant ${p.participantId} AgentChoice does not equal the approved ${p.role === 'reviewer' ? 'seat' : 'staff'} choice — refusing launch; restore the approved roster or re-approve`),
+        };
+      }
     }
     // Concurrency: every attempt whose worker may still be alive holds a
     // slot — dispatched/working, timed_out (deadline is not proof of death),
@@ -744,6 +1114,14 @@ export function createEngine(deps: EngineDeps): Engine {
     ) {
       return { kind: 'concurrency' };
     }
+    // Resume of a persisted intent: the host mutation may have landed after
+    // the intent flush but before its receipt — resolve by OBSERVATION first.
+    if (attempt.status === 'intent_recorded') {
+      const resolved = await resolveRecordedIntent(ctx, p, attempt);
+      if (resolved.kind === 'blocked') return resolved.outcome;
+      if (resolved.kind === 'adopted') return { kind: 'launched' };
+      // 'proceed': host confirmed nothing landed (or records were adopted).
+    }
     const reuseAllowed =
       !opts.isFreshFallback &&
       p.retainedTerminal !== null &&
@@ -756,15 +1134,21 @@ export function createEngine(deps: EngineDeps): Engine {
     const freshFallback =
       opts.isFreshFallback === true || (p.retainedTerminal !== null && !reuseAllowed);
 
+    const repairSpec = ctx.repairByAttempt.get(attempt.attemptId);
     attempt.status = 'intent_recorded';
     if (opts.isFreshFallback !== true) attempt.createdAt = ctx.now.toISOString();
     emit(ctx, 'launch.intent', {
       attemptId: attempt.attemptId,
       launchIntentId: attempt.launchIntentId,
+      v: 2, // launch protocol: per-op stage markers govern this attempt's resume
       phase: attempt.phase,
       round: attempt.round,
       reuseTerminal: reuse,
       freshSessionFallback: freshFallback,
+      agent: p.agent,
+      ...(repairSpec !== undefined
+        ? { repairOf: repairSpec.repairOf, repairTuple: `${p.participantId}|${attempt.phase}|${attempt.round ?? 'null'}` }
+        : {}),
     }, { participantId: p.participantId, phase: attempt.phase });
     let f = await flush(ctx);
     if (!f.ok) return { kind: 'task_error', error: f.error };
@@ -788,6 +1172,13 @@ export function createEngine(deps: EngineDeps): Engine {
           error: err('adapter_error', `task-create for attempt ${attempt.attemptId} already failed; reconcile before retry`),
         };
       }
+      // Operation-stage marker: durable proof createTask WAS issued — on a
+      // later resume its presence makes the outcome 'uncertain' (reconcile
+      // by observation) and its absence proves the op never ran.
+      emit(ctx, 'launch.intent', { attemptId: attempt.attemptId, stage: 'task-create' },
+        { participantId: p.participantId, phase: attempt.phase });
+      const fm = await flush(ctx);
+      if (!fm.ok) return { kind: 'task_error', error: fm.error };
       const task = await host.createTask({
         runId: state.orcaRunId!,
         specFilePath: abs(specRel),
@@ -800,7 +1191,8 @@ export function createEngine(deps: EngineDeps): Engine {
           code: task.error.code,
           message: task.error.message,
         });
-        await flush(ctx);
+        const f2 = await flush(ctx);
+        if (!f2.ok) return { kind: 'task_error', error: f2.error };
         return { kind: 'task_error', error: task.error };
       }
       attempt.taskId = task.value.taskId;
@@ -808,11 +1200,37 @@ export function createEngine(deps: EngineDeps): Engine {
         attemptId: attempt.attemptId,
         taskId: attempt.taskId,
         scope: 'task',
+        ...(task.value.requestId !== undefined ? { requestId: task.value.requestId } : {}),
       }, { participantId: p.participantId, phase: attempt.phase });
       f = await flush(ctx);
       if (!f.ok) return { kind: 'task_error', error: f.error };
     }
 
+    // A journaled worker-launch error is a DEFINITIVE no-effect failure —
+    // retrying cannot duplicate anything (uncertainty would have returned
+    // outcome 'unknown'). But a deterministic failure must not livelock:
+    // bound the retries and fail the seat visibly after the cap.
+    const priorLaunchErrors = ctx.workerLaunchFailures.get(attempt.attemptId) ?? 0;
+    if (priorLaunchErrors >= MAX_WORKER_LAUNCH_ERRORS) {
+      attempt.status = 'settled_failed';
+      attempt.settledAt = ctx.now.toISOString();
+      p.status = 'failed';
+      emit(ctx, 'worker.settled', {
+        attemptId: attempt.attemptId,
+        outcome: 'failed',
+        detail: `worker-launch failed ${priorLaunchErrors}× (journaled); bounded retry exhausted — seat marked failed, run continues partial`,
+      }, { participantId: p.participantId, phase: attempt.phase });
+      const fx = await flush(ctx);
+      if (!fx.ok) return { kind: 'task_error', error: fx.error };
+      return { kind: 'failed' };
+    }
+
+    // Operation-stage marker for worker-start — same durable-proof rule as
+    // task-create: issued ⇒ reconcile on resume, absent ⇒ provably never ran.
+    emit(ctx, 'launch.intent', { attemptId: attempt.attemptId, stage: 'worker-launch' },
+      { participantId: p.participantId, phase: attempt.phase });
+    const fm = await flush(ctx);
+    if (!fm.ok) return { kind: 'task_error', error: fm.error };
     const launch = await host.launchWorker({
       participantId: p.participantId,
       phase: attempt.phase,
@@ -833,7 +1251,8 @@ export function createEngine(deps: EngineDeps): Engine {
         code: launch.error.code,
         message: launch.error.message,
       });
-      await flush(ctx);
+      const f2 = await flush(ctx);
+      if (!f2.ok) return { kind: 'task_error', error: f2.error };
       return { kind: 'task_error', error: launch.error };
     }
     const res = launch.value;
@@ -854,22 +1273,32 @@ export function createEngine(deps: EngineDeps): Engine {
         terminalHandle: attempt.terminalHandle,
         reuseTerminal: reuse,
         freshSessionFallback: freshFallback,
+        agent: p.agent,
       }, { participantId: p.participantId, phase: attempt.phase });
-      await flush(ctx);
+      const f2 = await flush(ctx);
+      if (!f2.ok) return { kind: 'task_error', error: f2.error };
       return { kind: 'launched' };
     }
     if (res.outcome === 'unknown') {
       attempt.status = 'unknown';
       if (res.requestId !== undefined) attempt.requestId = res.requestId;
+      if (res.dispatchId !== undefined) attempt.dispatchId = res.dispatchId;
+      if (res.terminalHandle !== undefined) {
+        attempt.terminalHandle = res.terminalHandle;
+        if (p.retainedTerminal === null) p.retainedTerminal = res.terminalHandle;
+      }
       // The worker may have started — charge the possible launch honestly.
       state.consumption.launches += 1;
       emit(ctx, 'worker.unknown', {
         attemptId: attempt.attemptId,
         taskId: attempt.taskId,
         requestId: res.requestId,
+        dispatchId: res.dispatchId,
+        terminalHandle: res.terminalHandle,
         detail: res.detail,
       }, { participantId: p.participantId, phase: attempt.phase });
-      await flush(ctx);
+      const f2 = await flush(ctx);
+      if (!f2.ok) return { kind: 'task_error', error: f2.error };
       return {
         kind: 'unknown',
         error: err('launch_unknown', `launch outcome unknown for ${p.participantId}/${attempt.phase}; reconcile requestId ${res.requestId ?? '(none)'} — never relaunch`, {
@@ -900,7 +1329,8 @@ export function createEngine(deps: EngineDeps): Engine {
       outcome: 'failed',
       detail: res.detail,
     }, { participantId: p.participantId, phase: attempt.phase });
-    await flush(ctx);
+    const f2 = await flush(ctx);
+    if (!f2.ok) return { kind: 'task_error', error: f2.error };
     return { kind: 'failed' };
   };
 
@@ -916,9 +1346,121 @@ export function createEngine(deps: EngineDeps): Engine {
     }
   };
 
-  const reject = (ctx: StepCtx, attempt: PhaseAttempt, path: string, issues: unknown): void => {
+  /** Contract name per phase output — carried into RepairContext. */
+  const OUTPUT_CONTRACT: Record<PhaseKind, string> = {
+    organiser: 'ProposedRoster',
+    independent_review: 'FindingsFile',
+    scribe_notes: 'ScribeNotesFile',
+    challenge: 'ChallengesFile',
+    author_response: 'ResponsesFile',
+    scribe_synthesis: 'SynthesisFile',
+  };
+
+  const repairKey = (pid: ParticipantId, phase: PhaseKind, round: number | null): string =>
+    `${pid}|${phase}|${round ?? 'null'}`;
+
+  /** Validator issues → bounded untrusted-diagnostic lines for the repair spec. */
+  const diagnosticsFor = (issues: unknown): string[] => {
+    const lines: string[] = [];
+    const push = (s: string): void => {
+      if (lines.length < 50) lines.push(s.slice(0, 500));
+    };
+    if (typeof issues === 'string') {
+      push(issues);
+    } else if (Array.isArray(issues)) {
+      for (const i of issues) {
+        if (typeof i === 'object' && i !== null) {
+          const o = i as { path?: unknown; code?: unknown; message?: unknown };
+          push(
+            `${typeof o.path === 'string' ? `${o.path} ` : ''}${
+              typeof o.code === 'string' ? `[${o.code}] ` : ''
+            }${typeof o.message === 'string' ? o.message : JSON.stringify(i)}`.trim(),
+          );
+        } else {
+          push(JSON.stringify(i));
+        }
+      }
+    } else {
+      push(JSON.stringify(issues));
+    }
+    return lines;
+  };
+
+  /**
+   * Copy the rejected artifact to a distinct archive path BEFORE any
+   * corrective attempt can rewrite the canonical output path. Copy (not
+   * move): the canonical path keeps the rejected bytes until the repair
+   * worker's own write replaces them.
+   */
+  const preserveRejected = async (
+    ctx: StepCtx,
+    attempt: PhaseAttempt,
+    outRel: string,
+  ): Promise<string | undefined> => {
+    const existing = await store.readArtifact(outRel);
+    if (!existing.ok) {
+      emit(ctx, 'error', {
+        op: 'rejected-preserve',
+        attemptId: attempt.attemptId,
+        detail: `rejected artifact ${outRel} unreadable; nothing to archive: ${existing.error.message}`,
+      }, { participantId: attempt.participantId, phase: attempt.phase });
+      return undefined;
+    }
+    const rel = `rejected/${attempt.attemptId}__${outRel.split('/').pop()}`;
+    const w = await store.writeArtifact(rel, existing.value);
+    if (!w.ok) {
+      emit(ctx, 'error', {
+        op: 'rejected-preserve',
+        attemptId: attempt.attemptId,
+        detail: `failed to archive rejected artifact to ${rel}: ${w.error.message}`,
+      }, { participantId: attempt.participantId, phase: attempt.phase });
+      return undefined;
+    }
+    emit(ctx, 'artifact.written', { path: rel, kind: 'rejected-archive', supersedes: outRel }, {
+      participantId: attempt.participantId,
+      phase: attempt.phase,
+    });
+    return rel;
+  };
+
+  /**
+   * Reject an attempt's output: mark it, journal the rejection, and — when
+   * eligible — mint exactly ONE corrective repair attempt per
+   * (participant, phase, round). Eligibility and the repair context are
+   * journaled on this event so a restart rebuilds both; a repair attempt's
+   * own rejection never spawns another (max one fresh attempt per tuple).
+   */
+  const rejectOutput = async (
+    ctx: StepCtx,
+    p: Participant,
+    attempt: PhaseAttempt,
+    outRel: string,
+    issues: unknown,
+  ): Promise<void> => {
     ctx.rejectedAttempts.add(attempt.attemptId);
-    emit(ctx, 'artifact.rejected', { attemptId: attempt.attemptId, path, issues }, {
+    const payload: Record<string, unknown> = { attemptId: attempt.attemptId, path: outRel, issues };
+    const tuple = repairKey(p.participantId, attempt.phase, attempt.round);
+    const eligible =
+      !ctx.repairedKeys.has(tuple) &&
+      !ctx.repairByAttempt.has(attempt.attemptId) &&
+      !phaseDeadlineExpired(ctx);
+    if (eligible) {
+      const preserved = await preserveRejected(ctx, attempt, outRel);
+      const repairAttempt = addPlannedAttempt(p, attempt.phase, attempt.round);
+      const spec: RepairSpec = {
+        repairOf: attempt.attemptId,
+        contract: OUTPUT_CONTRACT[attempt.phase],
+        diagnostics: diagnosticsFor(issues),
+        ...(preserved !== undefined ? { previousArtifactPath: abs(preserved) } : {}),
+      };
+      ctx.repairByAttempt.set(repairAttempt.attemptId, spec);
+      ctx.repairedKeys.add(tuple);
+      payload.repairAttemptId = repairAttempt.attemptId;
+      payload.repairTuple = tuple;
+      payload.repair = spec;
+      if (preserved !== undefined) payload.preservedAs = preserved;
+    }
+    emit(ctx, 'artifact.rejected', payload, {
       participantId: attempt.participantId,
       phase: attempt.phase,
       ...(attempt.round !== null ? { round: attempt.round } : {}),
@@ -969,7 +1511,7 @@ export function createEngine(deps: EngineDeps): Engine {
         const outPath = expectedOutputPath(attempt);
         const raw = await readJson(outPath);
         if (!raw.ok) {
-          reject(ctx, attempt, outPath, raw.reason);
+          await rejectOutput(ctx, p, attempt, outPath, raw.reason);
           continue;
         }
         switch (attempt.phase) {
@@ -979,7 +1521,7 @@ export function createEngine(deps: EngineDeps): Engine {
               requestedPerspectives: state.config.requestedPerspectives,
             });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
             const roster = parsed.value;
@@ -1004,7 +1546,7 @@ export function createEngine(deps: EngineDeps): Engine {
               maxFindings: state.config.maxFindingsPerSeat,
             });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
             admit(ctx, attempt, outPath);
@@ -1016,7 +1558,7 @@ export function createEngine(deps: EngineDeps): Engine {
               participantId: p.participantId,
             });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
             admit(ctx, attempt, outPath);
@@ -1030,7 +1572,7 @@ export function createEngine(deps: EngineDeps): Engine {
               max: state.config.maxChallengesPerSeatPerRound,
             });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
             const allowed = await assignedClaimIds(paths.challengeEnv(p.participantId, attempt.round ?? 1));
@@ -1038,7 +1580,7 @@ export function createEngine(deps: EngineDeps): Engine {
             const ids = parsed.value.challenges.map((c) => c.challengeId);
             const dup = ids.length !== new Set(ids).size;
             if (bad.length > 0 || dup) {
-              reject(ctx, attempt, outPath, {
+              await rejectOutput(ctx, p, attempt, outPath, {
                 unassignedClaimIds: bad.map((c) => c.claimId),
                 duplicateChallengeIds: dup,
               });
@@ -1055,13 +1597,13 @@ export function createEngine(deps: EngineDeps): Engine {
               max: state.config.maxResponsesPerSeatPerRound,
             });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              await rejectOutput(ctx, p, attempt, outPath, parsed.issues);
               break;
             }
             const allowed = await assignedChallengeIds(paths.responseEnv(p.participantId, attempt.round ?? 1));
             const bad = parsed.value.responses.filter((r) => !allowed.has(r.challengeId));
             if (bad.length > 0) {
-              reject(ctx, attempt, outPath, {
+              await rejectOutput(ctx, p, attempt, outPath, {
                 unassignedChallengeIds: bad.map((r) => r.challengeId),
               });
               break;
@@ -1070,9 +1612,26 @@ export function createEngine(deps: EngineDeps): Engine {
             break;
           }
           case 'scribe_synthesis': {
-            const parsed = parseReportFile(raw.value, { runId: state.runId });
+            // SynthesisFile (narrative contract) first, full ReportFile
+            // fallback for legacy artifacts — both are admissible scribe
+            // output; schemas are never relaxed.
+            const synParse = (validationNs as {
+              parseSynthesisFile?: (
+                v: unknown,
+                o: { runId: string; participantId?: string },
+              ) => { ok: true; value: unknown } | { ok: false; issues?: unknown[] };
+            }).parseSynthesisFile?.(raw.value, {
+              runId: state.runId,
+              participantId: p.participantId,
+            });
+            const parsed = synParse !== undefined && synParse.ok
+              ? { ok: true as const, value: synParse.value }
+              : parseReportFile(raw.value, { runId: state.runId });
             if (!parsed.ok) {
-              reject(ctx, attempt, outPath, parsed.issues);
+              const issues = synParse !== undefined && !synParse.ok && 'issues' in synParse
+                ? [...(synParse.issues ?? []), ...((parsed as { issues?: unknown[] }).issues ?? [])]
+                : (parsed as { issues?: unknown[] }).issues;
+              await rejectOutput(ctx, p, attempt, outPath, issues);
               break;
             }
             admit(ctx, attempt, outPath);
@@ -1198,11 +1757,16 @@ export function createEngine(deps: EngineDeps): Engine {
       const run = await host.createRun({ objective: state.objective });
       if (!run.ok) {
         emit(ctx, 'error', { op: 'run-create', code: run.error.code, message: run.error.message });
-        await flush(ctx);
+        const f2 = await flush(ctx);
+        if (!f2.ok) return { kind: 'error', error: f2.error };
         return blocked(state.status, `run-create failed: ${run.error.message}. The intent is persisted; reconcile before retry.`);
       }
       state.orcaRunId = run.value.runId;
-      emit(ctx, 'task.created', { scope: 'run', orcaRunId: run.value.runId });
+      emit(ctx, 'task.created', {
+        scope: 'run',
+        orcaRunId: run.value.runId,
+        ...(run.value.requestId !== undefined ? { requestId: run.value.requestId } : {}),
+      });
     }
     const organiser = makeParticipant(ORGANISER_PID, 'organiser', staffAgent(state, 'organiser'), null, null);
     state.participants.push(organiser);
@@ -1326,7 +1890,8 @@ export function createEngine(deps: EngineDeps): Engine {
         outcome: 'failed',
         reason: `no successful reviewers (${rejected.length} failed/rejected seat(s))`,
       });
-      await flush(ctx);
+      const fz = await flush(ctx);
+      if (!fz.ok) return { kind: 'error', error: fz.error };
       return advanceResult('finished', state.status, 'no reviewer produced admissible findings', { outcome: 'failed' });
     }
     let snapshot = ctx.snapshot;
@@ -1355,7 +1920,8 @@ export function createEngine(deps: EngineDeps): Engine {
     state.status = 'scribe_notes';
     state.phaseEnteredAt = ctx.now.toISOString();
     emit(ctx, 'phase.entered', { status: 'scribe_notes' });
-    await flush(ctx);
+    const fp = await flush(ctx);
+    if (!fp.ok) return { kind: 'error', error: fp.error };
     return advanceResult('progress', state.status, `independent review closed: ${admittedFindings.length} findings file(s) admitted, ${rejected.length} seat(s) failed`);
   };
 
@@ -1547,6 +2113,14 @@ export function createEngine(deps: EngineDeps): Engine {
     for (const s of applied.skipped) {
       emit(ctx, 'artifact.rejected', { kind: 'response', refId: s.refId, reason: s.reason }, { round });
     }
+    for (const rej of applied.evidenceRejections) {
+      emit(ctx, 'artifact.rejected', {
+        kind: 'response-evidence',
+        refId: rej.refId,
+        participantId: rej.participantId,
+        reason: rej.reason,
+      }, { round: rej.round ?? round });
+    }
     emit(ctx, 'claim.updated', { kind: 'responses', round, applied: applied.applied, skipped: applied.skipped.length }, { round });
     return null;
   };
@@ -1557,15 +2131,32 @@ export function createEngine(deps: EngineDeps): Engine {
     if (ledger === null) return { kind: 'error', error: err('invalid_transition', 'claims.json missing at response stage') };
 
     const admittedChallenges = await admittedFiles<ChallengesFile>(state, 'challenge', round);
+    let snapshot = ctx.snapshot;
+    if (snapshot === undefined) {
+      const snapR = await store.readSnapshot();
+      if (!snapR.ok) return { kind: 'error', error: snapR.error };
+      snapshot = snapR.value;
+    }
     const applied = applyChallengesToLedger(
       ledger,
       admittedChallenges.map((a) => ({ participantId: a.participantId, file: a.file })),
+      sourceAccess(state, snapshot),
       ctx.now,
     );
     const w = await writeLedger(ctx, ledger);
     if (!w.ok) return { kind: 'error', error: w.error };
     for (const s of applied.skipped) {
       emit(ctx, 'artifact.rejected', { kind: 'challenge', refId: s.refId, reason: s.reason });
+    }
+    // Challenger evidence the ledger could not admit is journaled with the
+    // qualified challenge id — never silently dropped from the record.
+    for (const rej of applied.evidenceRejections) {
+      emit(ctx, 'artifact.rejected', {
+        kind: 'challenge-evidence',
+        refId: rej.refId,
+        participantId: rej.participantId,
+        reason: rej.reason,
+      }, { round: rej.round ?? round });
     }
 
     const challengeIndex = indexAdmittedChallenges(
@@ -1750,7 +2341,8 @@ export function createEngine(deps: EngineDeps): Engine {
     // but the drift is journaled and marked visibly in the emitted report.
     const runnerLims = await runnerLimitations(ctx);
     let driftBlocksFullCoverage = false;
-    const drift = await store.verifySourceSnapshot();
+    if (ctx.driftResult === undefined) ctx.driftResult = await store.verifySourceSnapshot();
+    const drift = ctx.driftResult;
     if (!drift.ok) {
       emit(ctx, 'snapshot.drift', {
         scope: 'pre-report',
@@ -1786,13 +2378,25 @@ export function createEngine(deps: EngineDeps): Engine {
       }
     }
 
-    // Scribe narrative only — its claims/coverage are never trusted.
+    // Scribe narrative only — its claims/coverage are never trusted. Prefer
+    // the narrative SynthesisFile contract; fall back to a legacy full
+    // ReportFile artifact (both carry summary + limitations).
     let scribe: ScribeNarrative | undefined;
     const rawReport = await readJson(paths.scribeReportJson);
     if (rawReport.ok) {
-      const parsed = parseReportFile(rawReport.value, { runId: state.runId });
-      if (parsed.ok) {
-        scribe = { summary: parsed.value.summary, limitations: parsed.value.limitations };
+      const synParse = (validationNs as {
+        parseSynthesisFile?: (
+          v: unknown,
+          o: { runId: string; participantId?: string },
+        ) => { ok: true; value: { summary: string; limitations: string[] } } | { ok: false; issues?: unknown[] };
+      }).parseSynthesisFile?.(rawReport.value, { runId: state.runId });
+      if (synParse !== undefined && synParse.ok) {
+        scribe = { summary: synParse.value.summary, limitations: synParse.value.limitations };
+      } else {
+        const parsed = parseReportFile(rawReport.value, { runId: state.runId });
+        if (parsed.ok) {
+          scribe = { summary: parsed.value.summary, limitations: parsed.value.limitations };
+        }
       }
     }
     const report = buildCouncilReport({
@@ -1809,6 +2413,15 @@ export function createEngine(deps: EngineDeps): Engine {
     // Drift detected after approval means the emitted report cannot claim
     // full coverage of the reviewed corpus — mark it visibly partial.
     if (driftBlocksFullCoverage) report.coverage.partial = true;
+    // Quorum counts seats with an ADMITTED independent-review artifact —
+    // never process success. Below quorum the report is an explicitly
+    // partial diagnostic, not a full-coverage claim (clm_0007).
+    const admittedSeats = reviewers(state).filter((p) =>
+      attemptsFor(p, 'independent_review').some((a) => a.artifacts.length > 0),
+    ).length;
+    const quorum = Math.ceil(state.config.quorumRatio * Math.max(1, reviewers(state).length));
+    const belowQuorum = admittedSeats < quorum;
+    if (belowQuorum) report.coverage.partial = true;
     const writes: [string, string][] = [
       [paths.reportJson, JSON.stringify(report, null, 2)],
       [paths.reportMd, renderReportMarkdown(report)],
@@ -1821,11 +2434,20 @@ export function createEngine(deps: EngineDeps): Engine {
       ctx.artifacts.push(rel);
     }
     state.status = 'reported';
-    emit(ctx, 'run.finished', { outcome: 'succeeded', partial: report.coverage.partial });
+    emit(ctx, 'run.finished', {
+      outcome: 'succeeded',
+      partial: report.coverage.partial,
+      ...(belowQuorum ? { belowQuorum: true, admittedSeats, quorum } : {}),
+    });
     await releaseRetainedWorkers(ctx);
     const f = await flush(ctx);
     if (!f.ok) return { kind: 'error', error: f.error };
-    return advanceResult('finished', state.status, report.coverage.partial ? 'run complete (PARTIAL coverage)' : 'run complete', {
+    const finishNote = belowQuorum
+      ? `run complete (PARTIAL coverage — ${admittedSeats}/${quorum} quorum; diagnostic report only)`
+      : report.coverage.partial
+        ? 'run complete (PARTIAL coverage)'
+        : 'run complete';
+    return advanceResult('finished', state.status, finishNote, {
       outcome: 'succeeded',
       reportPaths: writes.map(([rel]) => rel),
     });
@@ -1864,6 +2486,52 @@ export function createEngine(deps: EngineDeps): Engine {
     }
   };
 
+  /**
+   * Runner-originated mail with the advertised per-recipient budget actually
+   * enforced (clm_0003): every recipient target may receive at most
+   * config.maxMailPerParticipant runner sends, counted from the journal so a
+   * restart cannot reset the budget. 'unknown' outcomes charge the budget —
+   * the mail may have landed. Refusals are journaled, never silent.
+   */
+  const sendBoundedMail = async (
+    ctx: StepCtx,
+    input: {
+      to: string;
+      subject: string;
+      body: string;
+      taskId?: string;
+      dispatchId?: string;
+    },
+    kind: string,
+  ): Promise<void> => {
+    const cap = ctx.state.config.maxMailPerParticipant;
+    const sent = ctx.mailSentByTarget.get(input.to) ?? 0;
+    if (sent >= cap) {
+      emit(ctx, 'mail.sent', {
+        to: input.to,
+        kind,
+        outcome: 'budget_refused',
+        sent,
+        cap,
+        subject: input.subject,
+      });
+      return;
+    }
+    const note = await host.sendNotification(input);
+    emit(ctx, 'mail.sent', {
+      to: input.to,
+      outcome: note.ok ? note.value.outcome : 'error',
+      ...(note.ok && note.value.requestId !== undefined ? { requestId: note.value.requestId } : {}),
+      ...(note.ok && note.value.messageId !== undefined ? { messageId: note.value.messageId } : {}),
+      ...(note.ok ? {} : { error: note.error.message }),
+      kind,
+    });
+    if (note.ok && (note.value.outcome === 'sent' || note.value.outcome === 'unknown')) {
+      ctx.mailSentByTarget.set(input.to, sent + 1);
+      if (note.value.outcome === 'sent') ctx.state.consumption.mailSent += 1;
+    }
+  };
+
   // ── Advance dispatch ───────────────────────────────────────────────────────
 
   const buildCtx = async (state: CouncilState): Promise<StepCtx> => {
@@ -1874,26 +2542,142 @@ export function createEngine(deps: EngineDeps): Engine {
       artifacts: [],
       rejectedAttempts: new Set(),
       taskCreateFailed: new Set(),
+      workerLaunchFailures: new Map(),
+      repairByAttempt: new Map(),
+      repairedKeys: new Set(),
+      mailSentByTarget: new Map(),
       runCreateUnresolved: false,
       stopRequestedAttempts: new Set(),
+      taskCreateStage: new Map(),
+      workerLaunchStage: new Map(),
+      intentProtocol: new Map(),
     };
     const journal = await store.readJournal();
     if (journal.ok) {
       let runOk = false;
+      const attemptOverlay = new Map<AttemptId, {
+        journaledStatus?: AttemptStatus;
+        taskId?: string;
+        dispatchId?: string;
+        terminalHandle?: string;
+        requestId?: string;
+      }>();
       for (const e of journal.value) {
         if (e.type === 'launch.intent' && e.payload?.scope === 'run') ctx.runCreateUnresolved = true;
         if (e.type === 'task.created' && e.payload?.scope === 'run') runOk = true;
         if (e.type === 'artifact.rejected' && typeof e.payload?.attemptId === 'string') {
           ctx.rejectedAttempts.add(e.payload.attemptId);
+          // A repair tuple is consumed when the corrective attempt is created —
+          // journaled on the rejected event so a restart cannot mint another.
+          if (typeof e.payload?.repairTuple === 'string') ctx.repairedKeys.add(e.payload.repairTuple);
+          const repair = e.payload?.repair as { repairOf?: unknown; contract?: unknown; diagnostics?: unknown; previousArtifactPath?: unknown } | undefined;
+          if (
+            typeof e.payload?.repairAttemptId === 'string' &&
+            repair !== undefined &&
+            typeof repair === 'object' &&
+            typeof repair.repairOf === 'string' &&
+            typeof repair.contract === 'string' &&
+            Array.isArray(repair.diagnostics)
+          ) {
+            ctx.repairByAttempt.set(e.payload.repairAttemptId, {
+              repairOf: repair.repairOf,
+              contract: repair.contract,
+              diagnostics: repair.diagnostics.filter((d): d is string => typeof d === 'string'),
+              ...(typeof repair.previousArtifactPath === 'string' ? { previousArtifactPath: repair.previousArtifactPath } : {}),
+            });
+          }
+        }
+        if (e.type === 'launch.intent' && typeof e.payload?.repairTuple === 'string') {
+          ctx.repairedKeys.add(e.payload.repairTuple);
+        }
+        if (e.type === 'launch.intent' && typeof e.payload?.attemptId === 'string') {
+          const aid = e.payload.attemptId;
+          if (e.payload?.stage === 'task-create') {
+            ctx.taskCreateStage.set(aid, 'issued'); // chronological last-wins
+          } else if (e.payload?.stage === 'worker-launch') {
+            ctx.workerLaunchStage.set(aid, 'issued');
+          } else {
+            const v = typeof e.payload?.v === 'number' ? e.payload.v : 1;
+            ctx.intentProtocol.set(aid, Math.max(ctx.intentProtocol.get(aid) ?? 1, v));
+          }
         }
         if (e.type === 'error' && e.payload?.op === 'task-create' && typeof e.payload?.attemptId === 'string') {
           ctx.taskCreateFailed.add(e.payload.attemptId);
+          ctx.taskCreateStage.set(e.payload.attemptId, 'refused');
+        }
+        if (e.type === 'error' && e.payload?.op === 'worker-launch' && typeof e.payload?.attemptId === 'string') {
+          const id = e.payload.attemptId;
+          ctx.workerLaunchFailures.set(id, (ctx.workerLaunchFailures.get(id) ?? 0) + 1);
+          ctx.workerLaunchStage.set(id, 'refused');
+        }
+        if (
+          e.type === 'mail.sent' &&
+          typeof e.payload?.to === 'string' &&
+          (e.payload?.outcome === 'sent' || e.payload?.outcome === 'unknown')
+        ) {
+          const to = e.payload.to as string;
+          ctx.mailSentByTarget.set(to, (ctx.mailSentByTarget.get(to) ?? 0) + 1);
         }
         if (e.type === 'worker.stop_requested' && typeof e.payload?.attemptId === 'string') {
           ctx.stopRequestedAttempts.add(e.payload.attemptId);
         }
+        // Durable attempt facts — the journal leads state.json (journal
+        // appends fsync before saveState), so a stale state is repaired by
+        // projecting journaled effect markers over it. The journal is NEVER
+        // ahead by less than the state it protects.
+        if (typeof e.payload?.attemptId === 'string') {
+          const aid = e.payload.attemptId;
+          let ov = attemptOverlay.get(aid);
+          if (ov === undefined) { ov = {}; attemptOverlay.set(aid, ov); }
+          switch (e.type) {
+            case 'launch.intent':
+              ov.journaledStatus = 'intent_recorded';
+              break;
+            case 'task.created':
+              if (typeof e.payload?.taskId === 'string' && e.payload.taskId.length > 0) ov.taskId = e.payload.taskId;
+              break;
+            case 'worker.started':
+              ov.journaledStatus = 'dispatched';
+              if (typeof e.payload?.dispatchId === 'string') ov.dispatchId = e.payload.dispatchId;
+              if (typeof e.payload?.terminalHandle === 'string') ov.terminalHandle = e.payload.terminalHandle;
+              break;
+            case 'worker.unknown':
+              ov.journaledStatus = 'unknown';
+              if (typeof e.payload?.dispatchId === 'string') ov.dispatchId = e.payload.dispatchId;
+              if (typeof e.payload?.terminalHandle === 'string') ov.terminalHandle = e.payload.terminalHandle;
+              if (typeof e.payload?.requestId === 'string') ov.requestId = e.payload.requestId;
+              break;
+            case 'worker.settled':
+              ov.journaledStatus = e.payload?.outcome === 'failed' ? 'settled_failed' : 'settled_ok';
+              break;
+            case 'worker.timed_out': ov.journaledStatus = 'timed_out'; break;
+            case 'worker.stopped': ov.journaledStatus = 'stopped'; break;
+            default: break;
+          }
+        }
       }
       if (runOk) ctx.runCreateUnresolved = false;
+      // Project durable journal facts over possibly-stale state: a crash
+      // between appendJournal and saveState leaves state.json behind, and
+      // without this overlay the engine would re-issue a journaled mutation.
+      const STATUS_RANK: Record<string, number> = {
+        planned: 0, intent_recorded: 1, dispatched: 2, working: 2, unknown: 3,
+        timed_out: 4, stopped: 4, settled_failed: 5, settled_ok: 5,
+      };
+      for (const p of ctx.state.participants) {
+        for (const a of p.attempts) {
+          const ov = attemptOverlay.get(a.attemptId);
+          if (ov === undefined) continue;
+          if (a.taskId === null && ov.taskId !== undefined) a.taskId = ov.taskId;
+          if (a.dispatchId === null && ov.dispatchId !== undefined) a.dispatchId = ov.dispatchId;
+          if (a.terminalHandle === null && ov.terminalHandle !== undefined) a.terminalHandle = ov.terminalHandle;
+          if (a.requestId === undefined && ov.requestId !== undefined) a.requestId = ov.requestId;
+          const js = ov.journaledStatus;
+          if (js !== undefined && (STATUS_RANK[js] ?? 0) > (STATUS_RANK[a.status] ?? 0)) {
+            a.status = js;
+          }
+        }
+      }
     }
     const snap = await store.readSnapshot();
     if (snap.ok) ctx.snapshot = snap.value;
@@ -1930,7 +2714,14 @@ export function createEngine(deps: EngineDeps): Engine {
             break;
           }
         }
-        if (step.kind === 'error') return failRes(step.error);
+        if (step.kind === 'error') {
+          // Journaled evidence (artifact.rejected, error, mail.observed)
+          // accumulated during the failed step must still be persisted —
+          // silently discarding it can drop the record of a landed mutation.
+          const fe = await flush(ctx);
+          if (!fe.ok) return fe;
+          return failRes(step.error);
+        }
         if (step.result.artifacts === undefined && ctx.artifacts.length > 0) {
           step.result.artifacts = ctx.artifacts;
         }
@@ -1952,7 +2743,7 @@ export function createEngine(deps: EngineDeps): Engine {
     if (existing.length === 0) return true;
     if (existing.length !== roster.seats.length) return false;
     const norm = (s: { seatId: string; perspectiveId: string; participantId: string; agent: AgentChoice }) =>
-      JSON.stringify([s.seatId, s.perspectiveId, s.participantId, s.agent.agent, s.agent.model, s.agent.effort ?? null, s.agent.permissionMode]);
+      JSON.stringify([s.seatId, s.perspectiveId, s.participantId, s.agent.agent, s.agent.model, s.agent.effort ?? null, s.agent.permissionMode ?? null, s.agent.profile ?? null]);
     const want = new Set(roster.seats.map(norm));
     return existing.every((p) =>
       want.has(norm({ seatId: p.seatId!, perspectiveId: p.perspectiveId!, participantId: p.participantId, agent: p.agent })),
@@ -2015,7 +2806,7 @@ export function createEngine(deps: EngineDeps): Engine {
         }
         const snapR = await store.readSnapshot();
         if (!snapR.ok) return failRes(snapR.error);
-        const binding = buildBinding(state, roster, proposedR.value, snapR.value);
+        const binding = buildApprovalBinding(state, roster, proposedR.value, snapR.value);
         const hash = canonicalApprovalHash(binding);
         const record: ApprovalRecord = {
           schemaVersion: SCHEMA_VERSION,
@@ -2030,7 +2821,7 @@ export function createEngine(deps: EngineDeps): Engine {
         const wa = await store.writeApproval(record, binding);
         if (!wa.ok) return wa;
         state.approvalHash = hash;
-        emit(ctx, 'approval.granted', { hash, approver: input.approver, seats: roster.seats.length, reApproval: reapproval });
+        emit(ctx, 'approval.granted', { hash, approvalId: record.approvalId, approver: input.approver, seats: roster.seats.length, reApproval: reapproval });
         if (fresh) {
           for (const seat of roster.seats) {
             const p = makeParticipant(seat.participantId, 'reviewer', seat.agent, seat.seatId, seat.perspectiveId);
@@ -2045,33 +2836,24 @@ export function createEngine(deps: EngineDeps): Engine {
         if (!f.ok) return f;
 
         // Explicit wake: writing approval files alone does not wake Orca.
+        // The send respects the per-recipient mail budget (journaled counts).
         const to = state.orcaRunId !== null
           ? `run:${state.orcaRunId}`
           : state.supervisor?.terminalHandle;
         if (to !== undefined) {
-          const note = await host.sendNotification({
+          await sendBoundedMail(ctx, {
             to,
             subject: `council ${state.runId}: approval granted`,
             body: `Approval ${record.approvalId} bound (hash ${hash.slice(0, 16)}…). Advance the run.`,
             ...(state.supervisor?.dispatchId !== null && state.supervisor?.dispatchId !== undefined
               ? { dispatchId: state.supervisor.dispatchId }
               : {}),
-          });
-          const mailCtx = await buildCtx(state);
-          emit(mailCtx, 'mail.sent', {
-            to,
-            outcome: note.ok ? note.value.outcome : 'error',
-            ...(note.ok && note.value.requestId !== undefined ? { requestId: note.value.requestId } : {}),
-            ...(note.ok ? {} : { error: note.error.message }),
-            kind: 'approval-wake',
-          });
-          if (note.ok && note.value.outcome === 'sent') state.consumption.mailSent += 1;
-          await flush(mailCtx);
+          }, 'approval-wake');
         } else {
-          const mailCtx = await buildCtx(state);
-          emit(mailCtx, 'mail.sent', { kind: 'approval-wake', outcome: 'skipped', reason: 'no supervisor identity or run bound' });
-          await flush(mailCtx);
+          emit(ctx, 'mail.sent', { kind: 'approval-wake', outcome: 'skipped', reason: 'no supervisor identity or run bound' });
         }
+        const f2 = await flush(ctx);
+        if (!f2.ok) return f2;
         return ok({ approvalId: record.approvalId, hash });
       });
     } catch (e) {
