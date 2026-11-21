@@ -1588,6 +1588,31 @@ describe('OrcaAdapter.observeWorker/sendNotification/stop/release', () => {
     assert.ok(argv.includes('--subject=envelope ready'));
   });
 
+  it('keeps the host error code and a bounded message on an uncertain send', async () => {
+    // Live shape (2026-11-21 scratch repro): `send --to run:<A> --dispatch-id
+    // <dispatch in Run B>` refuses before recording a receipt.
+    const message =
+      'Dispatch ctx_sup belongs to Run run_parent, not run_child. Orchestration mutation request ID: b27732af-d092-41d2-b184-7abb4d0214e9.';
+    const { adapter } = makeAdapter(() =>
+      failEnv('dispatch_run_mismatch', message, { orchestrationRequestId: 'b27732af-d092-41d2-b184-7abb4d0214e9' }),
+    );
+    const res = await adapter.sendNotification({ to: 'run:run_child', subject: 's', body: 'b', dispatchId: 'ctx_sup' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown', 'an unproven refusal stays unknown custody');
+    assert.equal(res.value.requestId, 'b27732af-d092-41d2-b184-7abb4d0214e9');
+    assert.equal(res.value.errorCode, 'dispatch_run_mismatch');
+    assert.equal(res.value.error, message);
+
+    const { adapter: big } = makeAdapter(() => failEnv('runtime_unavailable', 'é'.repeat(2000)));
+    const long = await big.sendNotification({ to: 'dispatch:ctx_1', subject: 's', body: 'b' });
+    assert.ok(long.ok);
+    if (!long.ok) return;
+    assert.equal(long.value.errorCode, 'runtime_unavailable');
+    assert.ok(Buffer.byteLength(long.value.error ?? '', 'utf8') <= 512, 'message bounded');
+    assert.ok((long.value.error ?? '').length > 0 && !(long.value.error ?? '').includes('\uFFFD'), 'never splits a UTF-8 sequence');
+  });
+
   it('refuses oversized bodies and malformed targets without spawning', async () => {
     const { adapter, calls } = makeAdapter(() => okEnv({}));
     const big = await adapter.sendNotification({ to: 'dispatch:ctx_1', subject: 's', body: 'x'.repeat(9000) });

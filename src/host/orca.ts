@@ -407,6 +407,7 @@ export interface OrcaHostOptions {
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_NOTIFICATION_BYTES = 8192;
+const MAIL_ERROR_MAX_BYTES = 512;
 
 export type WorkerLaunchLane =
   | { kind: 'agent'; agent: string; model?: string; effort?: string }
@@ -2607,7 +2608,13 @@ export class OrcaAdapter implements HostAdapter {
     taskId?: TaskId;
     dispatchId?: DispatchId;
   }): Promise<
-    Result<{ outcome: 'sent' | 'unknown'; requestId?: string; messageId?: MessageId }>
+    Result<{
+      outcome: 'sent' | 'unknown';
+      requestId?: string;
+      messageId?: MessageId;
+      errorCode?: string;
+      error?: string;
+    }>
   > {
     try {
       parseMailTarget(input.to);
@@ -2638,6 +2645,8 @@ export class OrcaAdapter implements HostAdapter {
             value: {
               outcome: 'unknown',
               ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+              errorCode: res.error.code,
+              error: boundedUtf8(res.error.message, MAIL_ERROR_MAX_BYTES),
             },
           };
         }

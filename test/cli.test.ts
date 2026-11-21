@@ -893,6 +893,113 @@ test('approve refuses while the run is not awaiting approval, approves at the ga
   assert.equal(appr.matchesStateHash, true);
 });
 
+/** A run at the approval gate with a bound child Run and a recorded supervisor. */
+async function approvalGateRun(): Promise<InitFixture & { rosterPath: string }> {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  const store = createStore({ runDir: f.runDir });
+  assert.ok((await store.writeProposedRoster(proposedRoster(f.runId, 10))).ok);
+  const rosterPath = path.join(f.target, 'roster.approved.json');
+  writeFileSync(rosterPath, JSON.stringify(approvedRoster(f.runId, 2)));
+  const locked = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    st.value.status = 'awaiting_approval';
+    st.value.orcaRunId = 'run_child';
+    st.value.supervisor = { terminalHandle: 'term_sup', dispatchId: 'ctx_sup' };
+    return store.saveState(st.value);
+  });
+  assert.ok(locked.ok);
+  return { ...f, rosterPath };
+}
+
+const approvalSends = (log: string) =>
+  orcaCalls(log).filter((a) => a[1] === 'send' && a.some((t) => /approval granted/.test(t)));
+
+test('approve: the supervisor wake goes to dispatch:<id> without --dispatch-id; a clean receipt has no error fields', async () => {
+  const f = await approvalGateRun();
+  const { env, log } = fakeOrca(tmp('approve-wake-ok'), {
+    'orchestration send': [{ ok: true, result: { message: { id: 'msg_w1' }, mutation: { requestId: 'req_w1', replayed: false } } }],
+  }, 'term_primary');
+  const r = await cliJson(['approve', '--run', f.runDir, '--roster', f.rosterPath, '--json'], { ...f.env, ...env });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const sends = approvalSends(log);
+  assert.equal(sends.length, 1, JSON.stringify(orcaCalls(log)));
+  const argv = sends[0];
+  assert.equal(argv[argv.indexOf('--to') + 1], 'dispatch:ctx_sup');
+  assert.ok(!argv.includes('--dispatch-id'), `no --dispatch-id payload: ${argv.join(' ')}`);
+  assert.equal(argv[argv.indexOf('--from') + 1], 'term_primary');
+  assert.deepEqual(r.body.supervisorWake, { to: 'dispatch:ctx_sup', outcome: 'sent', requestId: 'req_w1' });
+});
+
+test('approve: an uncertain supervisor wake shows the journaled host errorCode in JSON and human output', async () => {
+  const f = await approvalGateRun();
+  const message = 'Dispatch ctx_sup belongs to Run run_parent, not run_child. Orchestration mutation request ID: req_w2.';
+  const scenario = {
+    'orchestration send': [{
+      ok: false,
+      error: { code: 'dispatch_run_mismatch', message, data: { orchestrationRequestId: 'req_w2' } },
+    }],
+  };
+  const { env, log } = fakeOrca(tmp('approve-wake-unknown'), scenario, 'term_primary');
+  const r = await cliJson(['approve', '--run', f.runDir, '--roster', f.rosterPath, '--json'], { ...f.env, ...env });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(approvalSends(log).length, 1, 'one send — no automatic retry');
+  assert.deepEqual(r.body.supervisorWake, {
+    to: 'dispatch:ctx_sup',
+    outcome: 'unknown',
+    errorCode: 'dispatch_run_mismatch',
+    error: message,
+    requestId: 'req_w2',
+  });
+  const receipt = readFileSync(path.join(f.runDir, 'events.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { type: string; payload?: Record<string, unknown> })
+    .filter((e) => e.type === 'mail.sent' && e.payload?.kind === 'approval-wake' && e.payload.outcome !== 'intent');
+  assert.equal(receipt.length, 1);
+  assert.equal(receipt[0].payload?.errorCode, 'dispatch_run_mismatch', 'journaled, not just printed');
+  assert.match(r.body.wakeCommand as string, /--to dispatch:ctx_sup/);
+
+  // Human output carries the code.
+  const g = await approvalGateRun();
+  const g2 = fakeOrca(tmp('approve-wake-human'), scenario, 'term_primary');
+  const human = await cli(['approve', '--run', g.runDir, '--roster', g.rosterPath], { ...g.env, ...g2.env });
+  assert.equal(human.code, 0, human.stdout + human.stderr);
+  assert.match(human.stdout, /supervisor wake: unknown → dispatch:ctx_sup \[dispatch_run_mismatch\] — Dispatch ctx_sup belongs/);
+});
+
+test('approve/verify/status accept a legacy approval-wake receipt without errorCode/error', async () => {
+  const f = await approvalGateRun();
+  // No supervisor Dispatch and no child Run → the engine journals 'skipped'
+  // and approve prints without error fields; then append a legacy-shaped
+  // receipt (journals written before errorCode existed) and read it back.
+  const store = createStore({ runDir: f.runDir });
+  const locked = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    st.value.supervisor = null;
+    st.value.orcaRunId = null;
+    return store.saveState(st.value);
+  });
+  assert.ok(locked.ok);
+  const r = await cliJson(['approve', '--run', f.runDir, '--roster', f.rosterPath, '--json'], f.env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal((r.body.supervisorWake as { outcome: string }).outcome, 'skipped');
+  const appended = await store.withLock(() =>
+    store.appendJournal([{
+      ts: new Date().toISOString(),
+      type: 'mail.sent',
+      actor: 'engine',
+      payload: { to: 'run:run_child', outcome: 'unknown', mailIntentId: 'mi_legacy', requestId: 'req_legacy', kind: 'approval-wake' },
+    }]),
+  );
+  assert.ok(appended.ok, JSON.stringify(appended));
+  const v = await cliJson(['verify', '--run', f.runDir, '--json'], f.env);
+  assert.equal(v.code, 0, 'a legacy receipt parses');
+  const st = await cliJson(['status', '--run', f.runDir, '--json'], f.env);
+  assert.equal(st.code, 0, st.stdout + st.stderr);
+});
+
 // ─── supervise ───────────────────────────────────────────────────────────────
 
 test('supervise requires --advance and reports a bounded step', async () => {

@@ -1690,10 +1690,11 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
 
   // The engine already attempted the bounded supervisor wake inside
   // approve — a journaled `mail.sent` (kind 'approval-wake') addressed to
-  // the bound council child Run (run:<id>) or the recorded supervisor
-  // terminal. Read its journaled outcome — that durable record, not this
-  // print, is the evidence of what was attempted. A file write alone is
-  // never an Orca wake, but this send already happened.
+  // the recorded supervisor Dispatch (dispatch:<id>), else the bound council
+  // child Run (run:<id>) or the recorded supervisor terminal. Read its
+  // journaled outcome (and host errorCode/error, when present) — that
+  // durable record, not this print, is the evidence of what was attempted.
+  // A file write alone is never an Orca wake, but this send already happened.
   const journal = unwrap(await store.readJournal());
   const wakeEvents = journal.filter(
     (e) => e.type === 'mail.sent' && e.payload?.kind === 'approval-wake' && e.payload.outcome !== 'intent',
@@ -1706,6 +1707,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
           to: lastWake.payload?.to,
           outcome: lastWake.payload?.outcome ?? 'unknown',
           ...(typeof lastWake.payload?.reason === 'string' ? { reason: lastWake.payload.reason } : {}),
+          ...(typeof lastWake.payload?.errorCode === 'string' ? { errorCode: lastWake.payload.errorCode } : {}),
           ...(typeof lastWake.payload?.error === 'string' ? { error: lastWake.payload.error } : {}),
           ...(typeof lastWake.payload?.requestId === 'string' ? { requestId: lastWake.payload.requestId } : {}),
         };
@@ -1722,7 +1724,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
         ? `skipped (${supervisorWake.reason})`
         : supervisorWake.outcome === 'none'
           ? 'none journaled'
-          : `${supervisorWake.outcome}${supervisorWake.to !== undefined ? ` → ${supervisorWake.to}` : ''}${supervisorWake.reason !== undefined ? ` (${supervisorWake.reason})` : ''}${supervisorWake.error !== undefined ? ` — ${supervisorWake.error}` : ''} — verify delivery before relying on it`;
+          : `${supervisorWake.outcome}${supervisorWake.to !== undefined ? ` → ${supervisorWake.to}` : ''}${supervisorWake.reason !== undefined ? ` (${supervisorWake.reason})` : ''}${supervisorWake.errorCode !== undefined ? ` [${supervisorWake.errorCode}]` : ''}${supervisorWake.error !== undefined ? ` — ${supervisorWake.error}` : ''} — verify delivery before relying on it`;
   return {
     payload: {
       approvalId: res.approvalId,
@@ -1735,7 +1737,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
       wakeCommand,
       note:
         'the engine already attempted the supervisor wake (see supervisorWake — the journaled outcome of ' +
-        'its approval-wake mail to the bound council Run / recorded supervisor terminal; a file write ' +
+        'its approval-wake mail to the recorded supervisor Dispatch, else the bound council Run / supervisor terminal; a file write ' +
         'alone is never an Orca wake, but this send was attempted). wakeCommand is the manual fallback — ' +
         'send it ONLY if the recorded ACTIVE supervisor has not resumed; historical/journaled notices are ' +
         'not fresh approvals. approvalWake is the separate notice to the initiating orchestrator. When you ' +

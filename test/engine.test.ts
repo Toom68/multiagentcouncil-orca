@@ -659,9 +659,9 @@ test('full 15-seat lifecycle: organiser → gate → independent → scribe → 
   assert.ok(/^[0-9a-f]{64}$/.test(ap.value.hash));
   // The approval binds charters: hash covers proposedRosterHash.
   assert.equal(env.db.approval!.binding.proposedRosterHash, canonicalRosterHash(env.db.proposed!));
-  // Explicit wake was sent to the supervisor (prefer run:<orcaRunId>).
+  // Explicit wake was sent to the supervisor (prefer its recorded Dispatch).
   assert.equal(env.host.notifications.length, 1);
-  assert.equal(env.host.notifications[0].to, 'run:orca_run_1');
+  assert.equal(env.host.notifications[0].to, 'dispatch:disp_sup');
 
   const r = await drive(env);
   assert.equal(r.action, 'finished', JSON.stringify(r));
@@ -2108,9 +2108,9 @@ test('saveState failure after journal append is recovered by the journal overlay
 test('per-recipient mail budget is journaled-counted and enforced (clm_0003)', async () => {
   const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, maxMailPerParticipant: 2 }));
   await driveToApproval(env);
-  // Two sends to the run address already journaled (e.g. earlier wake retries);
-  // a send to a DIFFERENT recipient must not count against this one.
-  for (const [to, outcome] of [['run:orca_run_1', 'sent'], ['run:orca_run_1', 'unknown'], ['term_other', 'sent']] as const) {
+  // Two sends to the supervisor Dispatch already journaled (e.g. earlier wake
+  // retries); a send to a DIFFERENT recipient must not count against this one.
+  for (const [to, outcome] of [['dispatch:disp_sup', 'sent'], ['dispatch:disp_sup', 'unknown'], ['term_other', 'sent']] as const) {
     env.db.journal.push({
       seq: env.db.journal.length + 1,
       ts: new Date().toISOString(),
@@ -2121,10 +2121,15 @@ test('per-recipient mail budget is journaled-counted and enforced (clm_0003)', a
   }
   const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
   assert.ok(ap.ok);
-  assert.equal(env.host.notifications.filter((n) => n.to === 'run:orca_run_1').length, 0, 'budget exhausted → wake refused');
+  assert.equal(env.host.notifications.filter((n) => n.to === 'dispatch:disp_sup').length, 0, 'budget exhausted → wake refused');
   const refused = env.db.journal.find((e) => e.type === 'mail.sent' && e.payload?.outcome === 'budget_refused');
   assert.ok(refused !== undefined, 'refusal journaled visibly, never silent');
-  assert.equal(refused.payload?.to, 'run:orca_run_1');
+  assert.equal(refused.payload?.to, 'dispatch:disp_sup');
+  assert.equal(
+    env.host.notifications.filter((n) => /approval granted/.test(n.subject)).length,
+    0,
+    'no fallback to another address when the budget refuses',
+  );
 });
 
 test('below-quorum report is an explicit partial diagnostic (clm_0007)', async () => {
@@ -2535,12 +2540,95 @@ test('RA-008: mail intent+outcome pair charges the cap once, not twice', async (
   await driveToApproval(env);
   // Pre-seed a completed send pair to the same target the wake mail uses.
   jour(env, [
-    { type: 'mail.sent', payload: { to: 'run:orca_run_1', mailIntentId: 'mi_a', outcome: 'intent' } },
-    { type: 'mail.sent', payload: { to: 'run:orca_run_1', mailIntentId: 'mi_a', outcome: 'sent' } },
+    { type: 'mail.sent', payload: { to: 'dispatch:disp_sup', mailIntentId: 'mi_a', outcome: 'intent' } },
+    { type: 'mail.sent', payload: { to: 'dispatch:disp_sup', mailIntentId: 'mi_a', outcome: 'sent' } },
   ]);
   await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
   assert.equal(env.host.notifications.length, 1, 'pair deduped — wake send fits under cap 2');
   assert.equal(env.db.state.consumption.mailSent, 2, 'seeded sent + wake sent');
+});
+
+// ─── Approval wake addressing + host diagnostics ────────────────────────────
+
+const approvalWakes = (env: Env) => env.host.notifications.filter((n) => /approval granted/.test(n.subject));
+const wakeReceipts = (env: Env) =>
+  env.db.journal.filter((e) => e.type === 'mail.sent' && e.payload?.kind === 'approval-wake');
+
+test('approval wake addresses the recorded supervisor Dispatch, never run:<child> + --dispatch-id', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  assert.equal(env.db.state.orcaRunId, 'orca_run_1', 'a council child Run is bound');
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(ap.ok);
+  const wakes = approvalWakes(env);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].to, 'dispatch:disp_sup');
+  assert.equal(
+    (wakes[0] as Record<string, unknown>).dispatchId,
+    undefined,
+    'no --dispatch-id payload: the target already names the Dispatch',
+  );
+  const [intent, receipt] = wakeReceipts(env);
+  assert.equal(intent.payload?.outcome, 'intent', 'intent journaled before the outcome (RA-008)');
+  assert.equal(receipt.payload?.outcome, 'sent');
+  assert.equal(receipt.payload?.to, 'dispatch:disp_sup');
+  assert.equal(receipt.payload?.mailIntentId, intent.payload?.mailIntentId);
+  assert.equal(receipt.payload?.errorCode, undefined, 'a clean send carries no host error');
+});
+
+test('approval wake falls back to run:<orcaRunId>, then the supervisor terminal, only without a Dispatch', async () => {
+  const runEnv = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  runEnv.db.state.supervisor = { terminalHandle: 'term_supervisor', dispatchId: null };
+  await driveToApproval(runEnv);
+  assert.ok((await runEnv.engine.approve({ roster: mkApprovedRoster(runEnv, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+  assert.deepEqual(approvalWakes(runEnv).map((n) => n.to), ['run:orca_run_1']);
+  assert.equal((approvalWakes(runEnv)[0] as Record<string, unknown>).dispatchId, undefined);
+
+  const termEnv = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  termEnv.db.state.supervisor = { terminalHandle: 'term_supervisor', dispatchId: null };
+  await driveToApproval(termEnv);
+  // No child Run bound: clear it from state and from the run receipt that
+  // RA-002 would otherwise restore it from.
+  termEnv.db.state.orcaRunId = null;
+  for (const e of termEnv.db.journal) {
+    if (e.type === 'task.created' && e.payload?.scope === 'run') delete e.payload.orcaRunId;
+  }
+  assert.ok((await termEnv.engine.approve({ roster: mkApprovedRoster(termEnv, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+  assert.deepEqual(approvalWakes(termEnv).map((n) => n.to), ['term_supervisor']);
+});
+
+test('an uncertain approval wake journals the host error code and is never resent', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  const message = 'Dispatch disp_sup belongs to Run run_parent, not orca_run_1. Orchestration mutation request ID: req_x.';
+  env.host.notificationResults.push(
+    ok({ outcome: 'unknown' as const, requestId: 'req_x', errorCode: 'dispatch_run_mismatch', error: message }),
+  );
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(ap.ok, 'approval stays durable when the wake is uncertain');
+  const receipt = wakeReceipts(env).at(-1)!;
+  assert.equal(receipt.payload?.outcome, 'unknown');
+  assert.equal(receipt.payload?.requestId, 'req_x');
+  assert.equal(receipt.payload?.errorCode, 'dispatch_run_mismatch');
+  assert.equal(receipt.payload?.error, message);
+  assert.equal(env.db.state.consumption.mailSent, 0, 'unknown is not counted as delivered');
+  // Advancing never re-issues the wake blind; resume derives the charge.
+  await env.engine.advance();
+  await resume(env).advance();
+  assert.equal(approvalWakes(env).length, 1, 'unknown outcome is never resent automatically');
+});
+
+test('a failed approval wake journals the adapter code and a bounded message', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  env.host.notificationResults.push(
+    failRes(err('adapter_error', 'x'.repeat(2000), { details: { adapterCode: 'bad_mail_target', uncertain: false } })),
+  );
+  assert.ok((await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+  const receipt = wakeReceipts(env).at(-1)!;
+  assert.equal(receipt.payload?.outcome, 'error');
+  assert.equal(receipt.payload?.errorCode, 'bad_mail_target');
+  assert.equal((receipt.payload?.error as string).length, 512, 'message bounded');
 });
 
 test('lifecycle wakes reach the persisted recipient at stage, approval and completion — deduped, budget-free', async () => {

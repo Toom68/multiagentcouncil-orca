@@ -3220,13 +3220,19 @@ export function createEngine(deps: EngineDeps): Engine {
     }
     ctx.mailSentByTarget.set(input.to, sent + 1); // intent persisted ⇒ possibly-landed ⇒ charged
     const note = await host.sendNotification(input);
+    // Host diagnostics: an uncertain send carries the Orca error code and a
+    // bounded message on its 'unknown' receipt; a failure carries them on the error.
+    const diag: { outcome?: string; errorCode?: unknown; error?: unknown } = note.ok
+      ? note.value
+      : { errorCode: note.error.details?.adapterCode ?? note.error.code, error: note.error.message };
     emit(ctx, 'mail.sent', {
       to: input.to,
       outcome: note.ok ? note.value.outcome : 'error',
       mailIntentId,
       ...(note.ok && note.value.requestId !== undefined ? { requestId: note.value.requestId } : {}),
       ...(note.ok && note.value.messageId !== undefined ? { messageId: note.value.messageId } : {}),
-      ...(note.ok ? {} : { error: note.error.message }),
+      ...(typeof diag.errorCode === 'string' ? { errorCode: diag.errorCode.slice(0, 128) } : {}),
+      ...(typeof diag.error === 'string' ? { error: diag.error.slice(0, 512) } : {}),
       kind,
     });
     if (note.ok && note.value.outcome === 'sent') ctx.state.consumption.mailSent += 1;
@@ -4136,17 +4142,21 @@ export function createEngine(deps: EngineDeps): Engine {
 
         // Explicit wake: writing approval files alone does not wake Orca.
         // The send respects the per-recipient mail budget (journaled counts).
-        const to = state.orcaRunId !== null
-          ? `run:${state.orcaRunId}`
-          : state.supervisor?.terminalHandle;
+        // Address the supervisor Dispatch when recorded: it lives in the
+        // caller's Run, so Orca refuses `run:<child>` + `--dispatch-id` with
+        // dispatch_run_mismatch, and redirects dispatch mail to the mailbox
+        // the supervisor terminal reads.
+        const supDispatch = state.supervisor?.dispatchId ?? null;
+        const to = supDispatch !== null
+          ? `dispatch:${supDispatch}`
+          : state.orcaRunId !== null
+            ? `run:${state.orcaRunId}`
+            : state.supervisor?.terminalHandle;
         if (to !== undefined) {
           await sendBoundedMail(ctx, {
             to,
             subject: `council ${state.runId}: approval granted`,
             body: `Approval ${record.approvalId} bound (hash ${hash.slice(0, 16)}…). Advance the run.`,
-            ...(state.supervisor?.dispatchId !== null && state.supervisor?.dispatchId !== undefined
-              ? { dispatchId: state.supervisor.dispatchId }
-              : {}),
           }, 'approval-wake');
         } else {
           emit(ctx, 'mail.sent', { kind: 'approval-wake', outcome: 'skipped', reason: 'no supervisor identity or run bound' });
