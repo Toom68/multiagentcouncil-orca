@@ -3730,3 +3730,139 @@ test('terminal lifecycle: legacy hosts (no terminal-create receipts) keep the ol
   assert.equal(closeEvents(env).length, 0, 'nothing journaled as created → nothing closed');
   assert.ok(env.host.released.length > 0, 'worker-release still issued as before');
 });
+
+// ─── Follow-up: cancelled-run supervisor notice + idle supervisor cleanup ────
+
+const cancelNotices = (env: Env) => env.db.journal.filter((e) => e.type === 'mail.sent' && e.payload?.kind === 'cancel-notice');
+
+test('cancel: one bounded notice to a live/idle supervisor Dispatch, journaled like the approval wake', async () => {
+  for (const liveness of ['idle', 'working'] as const) {
+    const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+    await driveToApproval(env);
+    env.host.liveness.set('disp_sup', { liveness });
+    const sentBefore = env.host.notifications.length;
+    assert.ok((await env.engine.cancel({ reason: 'operator stop' })).ok);
+    const sent = env.host.notifications.slice(sentBefore);
+    assert.equal(sent.length, 1, liveness);
+    assert.equal(sent[0]!.to, 'dispatch:disp_sup');
+    assert.match(sent[0]!.subject, /run cancelled/);
+    assert.match(sent[0]!.body, /--advance --as-supervisor/);
+    assert.match(sent[0]!.body, /worker_done/);
+    assert.deepEqual(cancelNotices(env).map((e) => e.payload?.outcome), ['intent', 'sent'], 'intent journaled before the send');
+    assert.equal(env.db.state.status, 'cancelled');
+  }
+});
+
+test('cancel: no notice to a settled, unobservable or unrecorded supervisor Dispatch', async () => {
+  const settled = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(settled);
+  settled.host.settle('disp_sup');
+  const n0 = settled.host.notifications.length;
+  assert.ok((await settled.engine.cancel({ reason: 't' })).ok);
+  assert.equal(settled.host.notifications.length, n0, 'mail to a settled Dispatch would reopen it as new work');
+  assert.match(String(cancelNotices(settled)[0]?.payload?.reason), /already settled/);
+
+  const unverifiable = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(unverifiable);
+  unverifiable.host.liveness.set('disp_sup', { liveness: 'unverifiable' });
+  const n1 = unverifiable.host.notifications.length;
+  assert.ok((await unverifiable.engine.cancel({ reason: 't' })).ok);
+  assert.equal(unverifiable.host.notifications.length, n1);
+  assert.equal(cancelNotices(unverifiable)[0]?.payload?.outcome, 'skipped');
+
+  const none = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  none.db.state.supervisor = { terminalHandle: 'term_supervisor', dispatchId: null };
+  await driveToApproval(none);
+  const n2 = none.host.notifications.length;
+  assert.ok((await none.engine.cancel({ reason: 't' })).ok);
+  assert.equal(none.host.notifications.length, n2);
+  assert.match(String(cancelNotices(none)[0]?.payload?.reason), /no supervisor dispatch/);
+});
+
+test('cleanup: an idle supervisor without worker_done on a terminal run is closed with the reason journaled; working/waiting/unknown are refused', async () => {
+  const sup = { terminalHandle: 'term_supervisor', dispatchId: 'disp_sup', startupStatus: 'attached' };
+  for (const liveness of ['working', 'waiting_human', 'unverifiable'] as const) {
+    const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+    await driveToApproval(env);
+    assert.ok((await env.engine.cancel({ reason: 't' })).ok);
+    env.host.liveness.set('disp_sup', { liveness });
+    const c = await env.engine.cleanup!({ supervisor: sup, callerHandle: 'term_primary' });
+    assert.ok(c.ok);
+    assert.equal(c.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped', liveness);
+    assert.ok(!env.host.closed.includes('term_supervisor'), liveness);
+  }
+  const failing = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(failing);
+  assert.ok((await failing.engine.cancel({ reason: 't' })).ok);
+  failing.host.observeImpl = () => failRes(err('adapter_error', 'orca unreachable'));
+  const cf = await failing.engine.cleanup!({ supervisor: sup, callerHandle: 'term_primary' });
+  assert.ok(cf.ok);
+  assert.equal(cf.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped', 'unobservable');
+
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  assert.ok((await env.engine.cancel({ reason: 't' })).ok);
+  env.host.liveness.set('disp_sup', { liveness: 'idle' });
+  // Never the caller, even when idle.
+  const self = await env.engine.cleanup!({ supervisor: sup, callerHandle: 'term_supervisor' });
+  assert.ok(self.ok);
+  assert.equal(self.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped');
+  const releasesBefore = env.host.released.length;
+  const c = await env.engine.cleanup!({ supervisor: sup, callerHandle: 'term_primary' });
+  assert.ok(c.ok);
+  const entry = c.value.terminals.find((t) => t.owner === 'supervisor')!;
+  assert.equal(entry.outcome, 'closed');
+  assert.equal(entry.reason, 'terminal run; supervisor idle without worker_done');
+  assert.ok(env.host.closed.includes('term_supervisor'));
+  assert.equal(env.host.released.length, releasesBefore, 'an unsettled dispatch is not released — only its terminal closed');
+  const intent = closeEvents(env).find((e) => e.payload?.terminalHandle === 'term_supervisor' && e.payload?.stage === 'intent')!;
+  assert.match(String(intent.payload?.reason), /supervisor idle without worker_done/);
+  assert.equal(env.db.state.status, 'cancelled');
+});
+
+test('superseded markers: pre-dispatch and fresh-session fallback failures record their relaunch and survive state round-trips', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['predispatch', 'ok']);
+  assert.ok((await env.engine.advance()).ok);
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const [failed, retry] = rev1.attempts.filter((a) => a.phase === 'independent_review');
+  assert.equal(failed!.supersededBy, retry!.attemptId);
+  assert.equal(failed!.supersededReason, 'pre_dispatch');
+  const { parseCouncilState } = await import('../src/validation.js');
+  const parsed = parseCouncilState(env.db.state);
+  assert.ok(parsed.ok);
+  const back = parsed.value.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!;
+  assert.equal(back.supersededBy, retry!.attemptId);
+  assert.equal(back.supersededReason, 'pre_dispatch');
+  // Lost state: the journal restores the marker.
+  delete env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!.supersededBy;
+  delete env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!.supersededReason;
+  assert.ok((await restartEngine(env).advance()).ok);
+  assert.equal(env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts[0]!.supersededBy, retry!.attemptId);
+});
+
+test('superseded markers: a stale retained terminal falls back fresh, and the recovered challenge seat reports completed', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  let staleOnce = true;
+  env.host.launchImpl = (spec) => {
+    env.host.seq += 1;
+    if (spec.reuseTerminal !== undefined && spec.phase === 'challenge' && spec.participantId === 'rev_1' && staleOnce) {
+      staleOnce = false;
+      return ok({ outcome: 'failed', detail: 'launch failed stage=readiness terminal_handle_stale' });
+    }
+    return ok({ outcome: 'started', dispatchId: `disp_${env.host.seq}`, terminalHandle: spec.reuseTerminal ?? `term_${env.host.seq}`, requestId: `req_${env.host.seq}` });
+  };
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const ch = rev1.attempts.filter((a) => a.phase === 'challenge');
+  assert.equal(ch.length, 2);
+  assert.equal(ch[0]!.status, 'settled_failed');
+  assert.equal(ch[0]!.supersededReason, 'fresh_fallback');
+  assert.equal(ch[0]!.supersededBy, ch[1]!.attemptId);
+  const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
+  const seat = report.coverage.seats.find((s) => s.participantId === 'rev_1')!;
+  assert.equal(seat.outcome, 'completed', JSON.stringify(seat));
+});

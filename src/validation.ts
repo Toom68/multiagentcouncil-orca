@@ -2034,6 +2034,13 @@ export function parsePhaseAttempt(raw: unknown): ParseResult<PhaseAttempt> {
   };
   if (requestId !== undefined) out.requestId = requestId;
   if (settledAt !== undefined) out.settledAt = settledAt;
+  if (o.supersededBy !== undefined) {
+    const by = reqId(o.supersededBy, 'attempt.supersededBy', issues);
+    const why = reqEnum(o.supersededReason, ['pre_dispatch', 'fresh_fallback'] as const, 'attempt.supersededReason', issues);
+    if (by === null || why === null) return parseFail(issues);
+    out.supersededBy = by;
+    out.supersededReason = why;
+  }
   return ok(out);
 }
 

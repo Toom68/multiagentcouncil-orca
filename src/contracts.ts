@@ -943,6 +943,13 @@ export interface PhaseAttempt {
   settledAt?: string;
   /** Artifact paths the attempt produced (validated before admission). */
   artifacts: string[];
+  /**
+   * Set when this failed attempt was replaced by an engine relaunch of the
+   * same phase/round: a proven pre-dispatch failure, or a retained-terminal
+   * launch failure that fell back to a fresh session. Absent on legacy runs.
+   */
+  supersededBy?: AttemptId;
+  supersededReason?: 'pre_dispatch' | 'fresh_fallback';
 }
 
 export type ParticipantStatus =

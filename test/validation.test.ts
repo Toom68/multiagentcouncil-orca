@@ -1148,6 +1148,30 @@ test('parseTerminalCreateReceipt: additive dispatchMarker promise round-trips; l
   assert.ok(hasCode(parseTerminalCreateReceipt({ ...base, dispatchMarker: 'yes' }), 'type'));
 });
 
+test('parseCouncilState: additive supersededBy/supersededReason on attempts; legacy attempts unchanged', async () => {
+  const { parseCouncilState } = await import('../src/validation.js');
+  const attempt = {
+    attemptId: 'att_rev0_challenge_r1_0', participantId: 'rev0', phase: 'challenge', round: 1,
+    taskId: null, dispatchId: null, terminalHandle: 'term_1', launchIntentId: 'li_1',
+    status: 'settled_failed', createdAt: '2026-11-21T00:00:00Z', artifacts: [],
+  };
+  const state = (a: Record<string, unknown>) => ({
+    schemaVersion: 1, runId: RUN, orcaRunId: null, status: 'discussing', targetRoot: '/t', objective: 'o',
+    config: DEFAULT_CONFIG, snapshotId: null, approvalHash: null,
+    participants: [{ participantId: 'rev0', role: 'reviewer', seatId: 's0', perspectiveId: 'p0', agent: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' }, retainedTerminal: null, attempts: [a], status: 'active' }],
+    discussion: null, supervisor: null, consumption: { launches: 0, mailSent: 0 },
+    phaseEnteredAt: '2026-11-21T00:00:00Z', createdAt: '2026-11-21T00:00:00Z',
+  });
+  const legacy = parseCouncilState(state(attempt));
+  assert.ok(legacy.ok, issues(legacy));
+  assert.equal(legacy.value.participants[0]!.attempts[0]!.supersededBy, undefined);
+  const marked = parseCouncilState(state({ ...attempt, supersededBy: 'att_rev0_challenge_r1_1', supersededReason: 'pre_dispatch' }));
+  assert.ok(marked.ok, issues(marked));
+  assert.equal(marked.value.participants[0]!.attempts[0]!.supersededReason, 'pre_dispatch');
+  assert.ok(!parseCouncilState(state({ ...attempt, supersededBy: 'att_x' })).ok, 'reason required with the marker');
+  assert.ok(!parseCouncilState(state({ ...attempt, supersededBy: 'att_x', supersededReason: 'guess' })).ok);
+});
+
 test('parseJournalEvent accepts the additive terminal-close and pre-dispatch events', () => {
   const at = { seq: 9, ts: '2026-11-21T00:00:00Z', actor: 'engine' };
   for (const [type, payload] of [

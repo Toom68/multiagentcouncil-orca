@@ -104,6 +104,24 @@ function attemptWasAdmitted(p: Participant, phase: PhaseKind): boolean {
   return p.attempts.some((a) => a.phase === phase && a.artifacts.length > 0);
 }
 
+/**
+ * A failed attempt the engine explicitly superseded (proven pre-dispatch
+ * failure, or a retained-terminal launch failure that fell back to a fresh
+ * session) whose phase/round was then admitted from a later attempt. Such a
+ * phase did not fail. Legacy attempts carry no `supersededBy` and never match.
+ */
+function recoveredBySuccessor(p: Participant, a: Participant['attempts'][number]): boolean {
+  if (a.status !== 'settled_failed' || a.supersededBy === undefined) return false;
+  return p.attempts.some(
+    (b) =>
+      b.attemptId !== a.attemptId &&
+      b.phase === a.phase &&
+      b.round === a.round &&
+      b.status === 'settled_ok' &&
+      b.artifacts.length > 0,
+  );
+}
+
 function lastAttempt(p: Participant, phase: PhaseKind) {
   const list = p.attempts.filter((a) => a.phase === phase);
   return list.length === 0 ? undefined : list[list.length - 1];
@@ -151,7 +169,10 @@ export function seatOutcomeOf(p: Participant): SeatOutcome {
       a.status === 'intent_recorded',
   );
   const laterFailed = p.attempts.some(
-    (a) => a.phase !== 'independent_review' && (a.status === 'settled_failed' || a.status === 'timed_out'),
+    (a) =>
+      a.phase !== 'independent_review' &&
+      (a.status === 'settled_failed' || a.status === 'timed_out') &&
+      !recoveredBySuccessor(p, a),
   );
   if (unresolved) {
     return { ...base, outcome: 'partial', detail: 'admitted findings but left unresolved attempts' };

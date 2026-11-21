@@ -543,3 +543,71 @@ test('buildCouncilReport: dedupeKey and rejectedEvidence provenance render on cl
   assert.match(md, /- dedupe key: `defect\|timeout missing`/);
   assert.match(md, /- rejected evidence items: 2/);
 });
+
+// ─── Superseded relaunches (pre-dispatch / fresh-session fallback) ───────────
+
+function withAttempts(i: number, extra: Partial<Participant['attempts'][number]>[]): Participant {
+  const p = mkParticipant(i, 'completed');
+  p.attempts.push(
+    ...extra.map((x, n) => ({
+      attemptId: `att${i}_c${n}`,
+      participantId: `rev${i}`,
+      phase: 'challenge' as const,
+      round: 1,
+      taskId: null,
+      dispatchId: null,
+      terminalHandle: null,
+      launchIntentId: `li${i}_c${n}`,
+      status: 'settled_ok' as const,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      artifacts: [] as string[],
+      ...x,
+    })),
+  );
+  return p;
+}
+
+const outcomeOf = (p: Participant) =>
+  buildCouncilReport(mkInput([mkClaim('c1')], [p, mkParticipant(1, 'completed')])).coverage.seats.find((s) => s.participantId === p.participantId)!;
+
+test('seat outcome: a superseded pre-dispatch or fallback failure followed by an admitted relaunch is not partial', () => {
+  for (const reason of ['pre_dispatch', 'fresh_fallback'] as const) {
+    const p = withAttempts(0, [
+      { status: 'settled_failed', supersededBy: 'att0_c1', supersededReason: reason },
+      { status: 'settled_ok', artifacts: ['rounds/1/challenges/rev0.json'] },
+    ]);
+    const s = outcomeOf(p);
+    assert.equal(s.outcome, 'completed', reason);
+    assert.ok(s.phasesCompleted.includes('challenge'));
+  }
+});
+
+test('seat outcome: genuinely failed later phases stay partial; legacy runs report exactly as before', () => {
+  // Superseded, but the relaunch never produced admitted output.
+  const unrecovered = withAttempts(0, [
+    { status: 'settled_failed', supersededBy: 'att0_c1', supersededReason: 'pre_dispatch' },
+    { status: 'settled_failed' },
+  ]);
+  assert.equal(outcomeOf(unrecovered).outcome, 'partial');
+  // Superseded in a DIFFERENT round than the success: still partial.
+  const otherRound = withAttempts(0, [
+    { status: 'settled_failed', supersededBy: 'att0_c1', supersededReason: 'pre_dispatch' },
+    { status: 'settled_ok', round: 2, artifacts: ['rounds/2/challenges/rev0.json'] },
+  ]);
+  assert.equal(outcomeOf(otherRound).outcome, 'partial');
+  // Legacy shape: a failed attempt with no supersededBy marker, even when a
+  // later attempt succeeded, is partial exactly as before.
+  const legacy = withAttempts(0, [
+    { status: 'settled_failed' },
+    { status: 'settled_ok', artifacts: ['rounds/1/challenges/rev0.json'] },
+  ]);
+  const s = outcomeOf(legacy);
+  assert.equal(s.outcome, 'partial');
+  assert.equal(s.detail, 'admitted findings; a later phase failed');
+  // A timed-out attempt is never excused, superseded or not.
+  const timedOut = withAttempts(0, [
+    { status: 'timed_out', supersededBy: 'att0_c1', supersededReason: 'fresh_fallback' },
+    { status: 'settled_ok', artifacts: ['rounds/1/challenges/rev0.json'] },
+  ]);
+  assert.equal(outcomeOf(timedOut).outcome, 'partial');
+});

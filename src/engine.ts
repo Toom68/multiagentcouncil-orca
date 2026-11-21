@@ -1486,6 +1486,10 @@ export function createEngine(deps: EngineDeps): Engine {
     ctx.preDispatchOrphans.add(info.handle);
     ctx.preDispatchFailures.set(tuple, new Set([...prior, attempt.attemptId]));
     const retry = retryAllowed ? addPlannedAttempt(p, attempt.phase, attempt.round) : undefined;
+    if (retry !== undefined) {
+      attempt.supersededBy = retry.attemptId;
+      attempt.supersededReason = 'pre_dispatch';
+    }
     const repairSpec = ctx.repairByAttempt.get(attempt.attemptId);
     if (retry !== undefined && repairSpec !== undefined) ctx.repairByAttempt.set(retry.attemptId, repairSpec);
     if (retry === undefined) p.status = 'failed';
@@ -1498,7 +1502,7 @@ export function createEngine(deps: EngineDeps): Engine {
       terminalHandle: info.handle,
       tuple,
       relaunch: retry !== undefined ? 'allowed' : 'exhausted',
-      ...(retry !== undefined ? { retryAttemptId: retry.attemptId } : {}),
+      ...(retry !== undefined ? { retryAttemptId: retry.attemptId, supersededReason: 'pre_dispatch' } : {}),
       ...(retry !== undefined && repairSpec !== undefined ? { repair: { ...repairSpec } } : {}),
       detail: (retry !== undefined
         ? `terminal failed before dispatch (${info.detail}); orphan terminal closed, one fresh relaunch allowed`
@@ -1890,12 +1894,16 @@ export function createEngine(deps: EngineDeps): Engine {
       // explicitly journalled and charged like any launch.
       attempt.status = 'settled_failed';
       attempt.settledAt = ctx.now.toISOString();
+      const fallback = addPlannedAttempt(p, attempt.phase, attempt.round);
+      attempt.supersededBy = fallback.attemptId;
+      attempt.supersededReason = 'fresh_fallback';
       emit(ctx, 'worker.settled', {
         attemptId: attempt.attemptId,
         outcome: 'failed',
+        retryAttemptId: fallback.attemptId,
+        supersededReason: 'fresh_fallback',
         detail: `retained-terminal launch failed (${res.detail ?? 'no detail'}); falling back to a fresh session`,
       }, { participantId: p.participantId, phase: attempt.phase });
-      const fallback = addPlannedAttempt(p, attempt.phase, attempt.round);
       const retry = await launchAttempt(ctx, p, fallback, { isFreshFallback: true });
       return retry;
     }
@@ -3647,6 +3655,20 @@ export function createEngine(deps: EngineDeps): Engine {
     if (sup.startupStatus === 'attached') {
       if (dispatchId === null) return skipClose(ctx, t, 'attached supervisor has no recorded dispatch — custody unproven', 'cleanup');
       const obs = await host.observeWorker({ dispatchId });
+      // Settled (worker_done / fenced) → release, then close. Idle without a
+      // verdict on a TERMINAL run → nothing is left for it to drive (a
+      // cancelled run never prompts worker_done, and Orca cannot stop an
+      // external terminal): close it, journaling exactly why. Working,
+      // waiting on a human, unverifiable or unobservable → keep refusing.
+      if (obs.ok && obs.value.liveness === 'idle' && TERMINAL_STATUS.has(ctx.state.status)) {
+        const entry = await closeTerminalWithCustody(ctx, {
+          ...t,
+          reason: `terminal run (${ctx.state.status}); supervisor idle without worker_done — dispatch ${dispatchId} unsettled, nothing left to drive`,
+        }, 'cleanup');
+        return entry.outcome === 'closed' || entry.outcome === 'already_gone'
+          ? { ...entry, reason: 'terminal run; supervisor idle without worker_done' }
+          : entry;
+      }
       if (!obs.ok || obs.value.liveness !== 'finished') {
         return skipClose(ctx, t, `supervisor dispatch ${dispatchId} is not proven settled (${obs.ok ? obs.value.liveness : `observe failed: ${obs.error.code}`})`, 'cleanup');
       }
@@ -4038,6 +4060,8 @@ export function createEngine(deps: EngineDeps): Engine {
       dispatchId?: string;
       terminalHandle?: string;
       requestId?: string;
+      supersededBy?: string;
+      supersededReason?: 'pre_dispatch' | 'fresh_fallback';
     }>();
     // State-side mints journaled as events but possibly lost to a
     // saveState failure: attempt ids referenced by journaled events, phase
@@ -4300,6 +4324,13 @@ export function createEngine(deps: EngineDeps): Engine {
             break;
           case 'worker.settled':
             ov.journaledStatus = e.payload?.outcome === 'failed' ? 'settled_failed' : 'settled_ok';
+            if (
+              typeof e.payload?.retryAttemptId === 'string' &&
+              (e.payload?.supersededReason === 'pre_dispatch' || e.payload?.supersededReason === 'fresh_fallback')
+            ) {
+              ov.supersededBy = e.payload.retryAttemptId;
+              ov.supersededReason = e.payload.supersededReason;
+            }
             break;
           case 'worker.timed_out': ov.journaledStatus = 'timed_out'; break;
           case 'worker.stopped': ov.journaledStatus = 'stopped'; break;
@@ -4483,6 +4514,10 @@ export function createEngine(deps: EngineDeps): Engine {
         // live retained session.
         if (a.terminalHandle !== null && !retiredTerminal(ctx, a.terminalHandle)) p.retainedTerminal = a.terminalHandle;
         if (a.requestId === undefined && ov.requestId !== undefined) a.requestId = ov.requestId;
+        if (a.supersededBy === undefined && ov.supersededBy !== undefined && ov.supersededReason !== undefined) {
+          a.supersededBy = ov.supersededBy;
+          a.supersededReason = ov.supersededReason;
+        }
         const js = ov.journaledStatus;
         if (js !== undefined && (STATUS_RANK[js] ?? 0) > (STATUS_RANK[a.status] ?? 0)) {
           a.status = js;
@@ -4888,6 +4923,7 @@ export function createEngine(deps: EngineDeps): Engine {
         state.status = 'cancelled';
         emit(ctx, 'run.finished', { outcome: 'cancelled', reason: input.reason });
         await finalizeRunTerminals(ctx, 'engine');
+        await noticeSupervisorCancelled(ctx, input.reason);
         const f = await flush(ctx);
         if (!f.ok) return f;
         // Terminal call: drain the full pending catch-up — there is no later
@@ -4900,6 +4936,44 @@ export function createEngine(deps: EngineDeps): Engine {
     } catch (e) {
       return failRes(err('io_error', `cancel crashed: ${e instanceof Error ? e.message : String(e)}`));
     }
+  };
+
+  /**
+   * After `cancel`: one bounded notice to the recorded supervisor Dispatch
+   * so it advances once (seeing `finished/cancelled`) and sends worker_done —
+   * otherwise nothing ever tells it the run ended and its terminal can never
+   * be released. Same bounded-mail custody as the approval wake (journaled
+   * intent, per-recipient cap, never resent blind). Sent ONLY when the
+   * dispatch is observed live/idle: mail to a settled Dispatch would reopen
+   * it as new work, and an unobservable one is not guessed at.
+   */
+  const noticeSupervisorCancelled = async (ctx: StepCtx, reason: string): Promise<void> => {
+    const dispatchId = ctx.state.supervisor?.dispatchId ?? null;
+    if (dispatchId === null) {
+      emit(ctx, 'mail.sent', { kind: 'cancel-notice', outcome: 'skipped', reason: 'no supervisor dispatch recorded' });
+      return;
+    }
+    const obs = await host.observeWorker({ dispatchId });
+    const liveness = obs.ok ? obs.value.liveness : undefined;
+    if (liveness !== 'idle' && liveness !== 'working' && liveness !== 'waiting_human') {
+      emit(ctx, 'mail.sent', {
+        kind: 'cancel-notice',
+        outcome: 'skipped',
+        dispatchId,
+        reason: liveness === 'finished'
+          ? 'supervisor dispatch already settled — a notice would reopen it as new work'
+          : `supervisor dispatch state unproven (${obs.ok ? liveness : `observe failed: ${obs.error.code}`}) — not notified`,
+      });
+      return;
+    }
+    await sendBoundedMail(ctx, {
+      to: `dispatch:${dispatchId}`,
+      subject: `council ${ctx.state.runId}: run cancelled`,
+      body:
+        `The council run ${ctx.state.runId} was cancelled (${reason.slice(0, 200)}). ` +
+        `Run \`council supervise --run ${store.runDir} --advance --as-supervisor\` once — it reports finished/cancelled — ` +
+        `then send worker_done reporting that printed outcome. Start no other work.`,
+    }, 'cancel-notice');
   };
 
   /**
