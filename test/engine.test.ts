@@ -2244,7 +2244,7 @@ test('admitted scribe notes reach the synthesis spec as explicit input (clm_0021
   const synthCalls = env.prompts.calls.scribeSynthesis;
   assert.equal(synthCalls.length, 1);
   const notesPath = (synthCalls[0]!.input as { notesPath?: string }).notesPath;
-  assert.ok(typeof notesPath === 'string' && notesPath.endsWith('scribe/notes.json'), `notesPath present: ${notesPath}`);
+  assert.equal(notesPath, join(env.store.runDir, 'scribe', 'notes.json'), `notesPath present: ${notesPath}`);
 });
 
 /* ================= recovery-audit RA-002..RA-008 regression ====================

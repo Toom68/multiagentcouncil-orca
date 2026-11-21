@@ -14,9 +14,9 @@ and is covered by `test/cli.test.ts` / `test/acceptance.test.ts`.
 ## Requirements
 
 - Node.js ≥ 22 and npm. The supported CI matrix is Node **22.x and 24.x** on
-  Linux (`.github/workflows/ci.yml`); development validation ran on Windows
-  against Node 26.7.0 — check the repository's Actions page for current CI
-  status rather than assuming green.
+  Linux and Windows (`.github/workflows/ci.yml`); development validation ran
+  on Windows against Node 26.7.0 — check the repository's Actions page for
+  current CI status rather than assuming green.
 - A running Orca (the council is Orca-first; the core protocol is host-agnostic
   behind `src/host/` for later adapters). The adapter surface in
   `docs/ORCA-COMPATIBILITY.md` was verified against Orca **1.4.261** on Windows.
@@ -664,10 +664,14 @@ outcome recovery.
 
 ## Validation status — honest ledger
 
-- `npm test` passed **725/725** locally on macOS Node 26.8.1 (fake-host
-  suite — no live provider claims). Historical Windows validation and the
-  Linux Node 22.x/24.x CI matrix are recorded separately; local tests do
-  not establish current CI status.
+- `npm test` passed **732/732** on the integrated `4370a1d` snapshot —
+  recorded in [NEXT-RELEASE-VERIFICATION.md](NEXT-RELEASE-VERIFICATION.md)
+  stage 4 (fake-host suite — no live provider claims). On Windows Node
+  26.7.0 the same suite first exposed one POSIX-only path assertion; after
+  that test fix it runs **732 tests, 729 pass, 0 fail, 3 skipped** (file
+  symlinks need extra Windows privileges). The Linux/Windows Node
+  22.x/24.x CI matrix is recorded separately; local tests do not establish
+  current CI status.
 - A **15-seat live Orca council completed the full protocol** on the
   Fieldnotes fixture using Devin `swe-2-max`: organiser, exact roster
   approval, 15/15 admitted independent files, separate scribe notes,
