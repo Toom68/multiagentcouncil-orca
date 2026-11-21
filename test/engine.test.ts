@@ -3333,3 +3333,400 @@ test('submission check: only fresh first-turn launches are probed — retained-t
   const probed = new Set(rig.probes.map((p) => p.dispatchId));
   for (const l of reused) assert.ok(!probed.has(l.result.dispatchId), `reused launch ${l.result.dispatchId} was probed`);
 });
+
+// ─── Terminal lifecycle: close council-created terminals; pre-dispatch recovery ─
+//
+// CustodyHost drives the REAL custody hooks the Orca adapter calls: every
+// fresh launch journals a terminal-create intent + receipt (with the
+// dispatch-marker promise) and, unless scripted otherwise, the worker-start
+// marker before "dispatching". Scripted modes simulate the live failures:
+//   predispatch    — readiness failed after create; worker-start never issued
+//   uncertain      — worker-start went out, outcome unknown
+//   crash-before   — process dies after the create receipt, before the marker
+//   crash-after    — process dies after the marker, before any receipt
+// Simulated host evidence only — no real terminals.
+
+type LaunchMode = 'ok' | 'predispatch' | 'uncertain' | 'crash-before' | 'crash-after';
+
+class CustodyHost extends FakeHost {
+  script: LaunchMode[] = [];
+  /** Per-participant scripted modes (consumed before `script`). */
+  scriptFor = new Map<string, LaunchMode[]>();
+  termSeq = 0;
+  createdTerminals: string[] = [];
+  closed: string[] = [];
+  closeImpl?: (h: string) => Result<{ outcome: 'closed' | 'already_gone' | 'failed'; code?: string; detail?: string }>;
+  /** Ordered host mutations for release-before-close assertions. */
+  ops: string[] = [];
+  async launchWorker(spec: WorkerLaunchSpec) {
+    this.launchCalls += 1;
+    if (spec.reuseTerminal !== undefined) {
+      this.seq += 1;
+      const res: LaunchResult = { outcome: 'started', dispatchId: `disp_${this.seq}`, terminalHandle: spec.reuseTerminal, requestId: `req_${this.seq}` };
+      this.launches.push({ spec, result: res });
+      this.landedWorkers.push({ dispatchId: res.dispatchId!, taskId: spec.taskId, terminalHandle: res.terminalHandle });
+      return ok(res);
+    }
+    const mode = this.scriptFor.get(spec.participantId)?.shift() ?? this.script.shift() ?? 'ok';
+    const handle = `tc_term_${++this.termSeq}`;
+    const intentId = `li_${spec.taskId}:terminal-create`;
+    const c = spec.custody!;
+    const pi = await c.beforeTerminalCreate({ intentId, participantId: spec.participantId, taskId: spec.taskId, runId: spec.runId, worktree: spec.worktree, title: spec.taskTitle, command: 'devin --model swe-2-max --permission-mode dangerous' });
+    assert.ok(pi.ok);
+    this.createdTerminals.push(handle);
+    const pr = await c.afterTerminalCreate({ intentId, taskId: spec.taskId, outcome: 'created', terminalHandle: handle, requestId: `tc_rcpt_${this.termSeq}`, dispatchMarker: true });
+    assert.ok(pr.ok);
+    if (mode === 'crash-before') throw new Error('simulated crash after terminal create, before the worker-start marker');
+    if (mode === 'predispatch') {
+      return ok<LaunchResult>({
+        outcome: 'unknown', taskId: spec.taskId, terminalHandle: handle, requestId: `tc_rcpt_${this.termSeq}`,
+        workerStartIssued: false, terminalCreated: true, failedStage: 'readiness_wait',
+        detail: 'launch uncertain stage=readiness_wait readiness_wait_failed: terminal wait did not prove the agent idle',
+      });
+    }
+    const pm = await c.beforeWorkerStart!({ intentId: `li_${spec.taskId}:worker-start`, taskId: spec.taskId, terminalHandle: handle });
+    assert.ok(pm.ok);
+    if (mode === 'crash-after') throw new Error('simulated crash after the worker-start marker, before its receipt');
+    if (mode === 'uncertain') {
+      return ok<LaunchResult>({ outcome: 'unknown', taskId: spec.taskId, terminalHandle: handle, requestId: 'ws_req_lost', terminalCreated: true, detail: 'launch uncertain local_timeout' });
+    }
+    this.seq += 1;
+    const res: LaunchResult = { outcome: 'started', dispatchId: `disp_${this.seq}`, terminalHandle: handle, requestId: `req_${this.seq}` };
+    this.launches.push({ spec, result: res });
+    this.landedWorkers.push({ dispatchId: res.dispatchId!, taskId: spec.taskId, terminalHandle: handle });
+    return ok(res);
+  }
+  async releaseWorker(input: { dispatchId: string }) {
+    this.released.push(input.dispatchId);
+    this.ops.push(`release:${input.dispatchId}`);
+    // Observed 1.4.261 for argv-lane (pre-existing) terminals: retained, no process action.
+    return ok({ released: false, state: 'retained' });
+  }
+  async closeTerminal(input: { terminalHandle: string }) {
+    this.closed.push(input.terminalHandle);
+    this.ops.push(`close:${input.terminalHandle}`);
+    return this.closeImpl?.(input.terminalHandle) ?? ok({ outcome: 'closed' as const });
+  }
+}
+
+function makeCustodyEnv(config: CouncilConfig): Env & { host: CustodyHost } {
+  const base = makeEnv(config);
+  const host = new CustodyHost();
+  const engine = createEngine({ store: base.store, host, prompts: base.prompts, now: () => new Date(base.clock.t) });
+  return { ...base, host, engine };
+}
+
+const closeEvents = (env: Env) => env.db.journal.filter((e) => e.type === 'terminal.close');
+const closeReceipts = (env: Env) => closeEvents(env).filter((e) => e.payload?.stage === 'receipt');
+const preDispatchEvents = (env: Env) => env.db.journal.filter((e) => e.type === 'worker.settled' && e.payload?.preDispatch === true);
+const restartEngine = (env: Env) => createEngine({ store: env.store, host: env.host, prompts: env.prompts, now: () => new Date(env.clock.t) });
+
+async function approveTwo(env: Env): Promise<void> {
+  await driveToApproval(env);
+  assert.ok((await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+}
+test('terminal lifecycle: a finished run releases (retained) then closes exactly the terminals it created', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  // Organiser early close: roster admitted → its terminal is released and
+  // closed before any reviewer launches (no later phase reuses it).
+  assert.deepEqual(env.host.closed, ['tc_term_1'], 'organiser terminal closed at roster admission');
+  assert.deepEqual(env.host.ops.slice(0, 2), ['release:disp_1', 'close:tc_term_1'], 'release precedes close');
+  assert.ok((await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  assert.equal(env.db.state.status, 'reported');
+  // Discussion phases REUSED the retained reviewer terminals (still working).
+  assert.ok(env.host.launches.some((l) => l.spec.reuseTerminal !== undefined), 'retained-terminal reuse exercised');
+  const reusedBeforeFinish = env.host.launches.filter((l) => l.spec.reuseTerminal !== undefined).map((l) => l.spec.reuseTerminal!);
+  assert.ok(reusedBeforeFinish.every((h) => env.host.createdTerminals.includes(h)));
+  // Every created terminal is closed exactly once; nothing else is touched.
+  assert.deepEqual([...env.host.closed].sort(), [...env.host.createdTerminals].sort());
+  assert.equal(new Set(env.host.closed).size, env.host.closed.length, 'no double close');
+  assert.ok(!env.host.closed.includes('term_supervisor'), 'supervisor terminal is not engine custody');
+  for (const h of env.host.createdTerminals) {
+    const evs = closeEvents(env).filter((e) => e.payload?.terminalHandle === h);
+    assert.deepEqual(evs.map((e) => e.payload?.stage), ['intent', 'receipt'], h);
+    assert.ok(evs[0]!.seq < evs[1]!.seq, 'intent journaled before the receipt');
+    assert.equal(evs[1]!.payload?.outcome, 'closed');
+  }
+  // Reviewer terminals are closed only AFTER the run finished (never mid-run).
+  const finishedSeq = env.db.journal.find((e) => e.type === 'run.finished')!.seq;
+  for (const h of reusedBeforeFinish) {
+    const intent = closeEvents(env).find((e) => e.payload?.terminalHandle === h && e.payload?.stage === 'intent')!;
+    assert.ok(intent.seq > finishedSeq, `${h} closed after run.finished`);
+    const relAt = env.host.ops.findIndex((o) => o.startsWith('release:') && env.host.ops.indexOf(`close:${h}`) > env.host.ops.indexOf(o));
+    assert.ok(relAt >= 0, `${h}: a release preceded the close`);
+  }
+  const rel = env.db.journal.filter((e) => e.type === 'worker.released' && e.payload?.outcome === 'refused');
+  assert.ok(rel.length > 0 && rel.every((e) => e.payload?.hostState === 'retained'), 'retained release receipts journaled');
+  // Idempotent re-run: advancing the finished run never closes again.
+  const before = env.host.closed.length;
+  const again = await env.engine.advance();
+  assert.ok(again.ok && again.value.action === 'finished');
+  assert.equal(env.host.closed.length, before);
+  const again2 = await restartEngine(env).advance();
+  assert.ok(again2.ok);
+  assert.equal(env.host.closed.length, before, 'a restarted engine reads the receipts and does nothing');
+});
+
+test('terminal lifecycle: a failed close is journaled, never changes the outcome, and only council cleanup retries it', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  env.host.closeImpl = (h) => (h === 'tc_term_2' ? ok({ outcome: 'failed' as const, code: 'runtime_unavailable', detail: 'daemon busy' }) : ok({ outcome: 'closed' as const }));
+  await approveTwo(env);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal((r as { outcome?: string }).outcome, 'succeeded', 'close failure never changes the run outcome');
+  assert.equal(env.db.state.status, 'reported');
+  const failed = closeReceipts(env).find((e) => e.payload?.terminalHandle === 'tc_term_2')!;
+  assert.equal(failed.payload?.outcome, 'failed');
+  assert.equal(failed.payload?.code, 'runtime_unavailable');
+  const n = env.host.closed.length;
+  for (let i = 0; i < 2; i++) assert.ok((await env.engine.advance()).ok);
+  assert.equal(env.host.closed.length, n, 'a failed receipt means done for the engine');
+  env.host.closeImpl = undefined;
+  const c = await env.engine.cleanup!();
+  assert.ok(c.ok, JSON.stringify(c));
+  assert.equal(c.value.terminals.find((t) => t.terminalHandle === 'tc_term_2')?.outcome, 'closed');
+  assert.equal(env.host.closed.filter((h) => h === 'tc_term_2').length, 2);
+  for (const t of c.value.terminals.filter((x) => x.terminalHandle !== 'tc_term_2')) {
+    assert.equal(t.outcome, 'skipped', `${t.terminalHandle} already closed`);
+  }
+  assert.equal(env.host.closed.length, n + 1, 'already-closed terminals are not closed again');
+});
+
+test('terminal lifecycle: cancel closes settled terminals and skips one whose worker may still run', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  assert.ok((await env.engine.advance()).ok);
+  const indep = env.host.launches.filter((l) => l.spec.phase === 'independent_review');
+  assert.equal(indep.length, 2);
+  const live = indep.find((l) => l.spec.participantId === 'rev_2')!;
+  env.host.stopImpl = (d) => (d === live.result.dispatchId ? ok({ outcome: 'refused' as const }) : ok({ outcome: 'stopped' as const }));
+  assert.ok((await env.engine.cancel({ reason: 'test' })).ok);
+  assert.equal(env.db.state.status, 'cancelled');
+  const liveHandle = live.result.terminalHandle!;
+  assert.ok(!env.host.closed.includes(liveHandle), 'a possibly-live worker keeps its terminal');
+  const stoppedHandle = indep.find((l) => l.spec.participantId === 'rev_1')!.result.terminalHandle!;
+  assert.ok(env.host.closed.includes(stoppedHandle), 'the confirmed-stopped worker terminal is closed');
+  const skip = closeEvents(env).find((e) => e.payload?.stage === 'skipped' && e.payload?.terminalHandle === liveHandle);
+  assert.ok(skip !== undefined && /may still be live/.test(String(skip.payload?.reason)));
+  // cleanup observes the dispatch: still working → skipped; settled → released + closed.
+  const c1 = await env.engine.cleanup!();
+  assert.ok(c1.ok);
+  assert.equal(c1.value.terminals.find((t) => t.terminalHandle === liveHandle)?.outcome, 'skipped');
+  assert.ok(!env.host.closed.includes(liveHandle));
+  env.host.settle(live.result.dispatchId!, true);
+  const c2 = await env.engine.cleanup!();
+  assert.ok(c2.ok);
+  assert.equal(c2.value.terminals.find((t) => t.terminalHandle === liveHandle)?.outcome, 'closed');
+  assert.ok(env.host.ops.indexOf(`release:${live.result.dispatchId}`) < env.host.ops.indexOf(`close:${liveHandle}`), 'release precedes the cleanup close');
+  assert.equal(env.db.state.status, 'cancelled', 'cleanup never changes run state');
+});
+
+test('terminal lifecycle: a close intent without a receipt is retried after a crash and reported', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  let crashOnce = true;
+  env.host.closeImpl = (h) => {
+    if (h === 'tc_term_1' && crashOnce) {
+      crashOnce = false;
+      throw new Error('simulated crash between close intent and receipt');
+    }
+    return ok({ outcome: 'closed' as const });
+  };
+  // Organiser output lands; its admission-time close crashes mid-flight.
+  for (let i = 0; i < 6 && closeEvents(env).length === 0; i++) {
+    for (const l of env.host.launches) {
+      if (l.result.dispatchId === undefined) continue;
+      await env.store.writeArtifact(outputPathFor(l.spec), JSON.stringify(mkProposal(env.db.state.config.requestedPerspectives)));
+      env.host.settle(l.result.dispatchId);
+    }
+    await env.engine.advance();
+  }
+  const evs = closeEvents(env).filter((e) => e.payload?.terminalHandle === 'tc_term_1');
+  assert.deepEqual(evs.map((e) => e.payload?.stage), ['intent'], 'intent durable, no receipt');
+  env.engine = restartEngine(env);
+  await driveToApproval(env);
+  assert.ok((await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' })).ok);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  const after = closeEvents(env).filter((e) => e.payload?.terminalHandle === 'tc_term_1');
+  assert.deepEqual(after.map((e) => e.payload?.stage), ['intent', 'intent', 'receipt']);
+  assert.equal(after[1]!.payload?.retriedIntent, true, 'the retry is reported');
+  assert.equal(after[2]!.payload?.outcome, 'closed');
+});
+test('pre-dispatch failure: readiness failure → orphan closed → exactly one fresh relaunch → success', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['predispatch', 'ok']);
+  const launchesBefore = env.db.state.consumption.launches;
+  const step = await env.engine.advance();
+  assert.ok(step.ok);
+  assert.notEqual(step.value.action, 'blocked', `never launch_unknown: ${JSON.stringify(step.value)}`);
+  const pd = preDispatchEvents(env);
+  assert.equal(pd.length, 1);
+  assert.equal(pd[0]!.payload?.relaunch, 'allowed');
+  assert.equal(pd[0]!.payload?.workerStartIssued, false);
+  assert.equal(pd[0]!.payload?.stage, 'readiness_wait');
+  const orphan = pd[0]!.payload?.terminalHandle as string;
+  assert.ok(env.host.closed.includes(orphan), 'orphan terminal closed');
+  const orphanClose = closeReceipts(env).find((e) => e.payload?.terminalHandle === orphan)!;
+  assert.ok(orphanClose.seq > pd[0]!.seq, 'failure journaled before the orphan close');
+  assert.equal(orphanClose.payload?.outcome, 'closed');
+  assert.equal(env.db.journal.filter((e) => e.type === 'worker.unknown').length, 0, 'no worker.unknown');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  const ind = rev1.attempts.filter((a) => a.phase === 'independent_review');
+  assert.deepEqual(ind.map((a) => a.status), ['settled_failed', 'dispatched']);
+  assert.equal(ind[1]!.attemptId, pd[0]!.payload?.retryAttemptId);
+  assert.notEqual(rev1.retainedTerminal, orphan, 'the orphan is never a retained session');
+  // Only real dispatches are charged against maxLaunches: one per reviewer.
+  assert.equal(env.db.state.consumption.launches, launchesBefore + 2);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  assert.ok(
+    env.db.journal.some((e) => e.type === 'artifact.admitted' && e.participantId === 'rev_1' && e.phase === 'independent_review'),
+    'the relaunched seat contributed',
+  );
+  assert.equal(env.host.closed.filter((h) => h === orphan).length, 1, 'orphan closed once, never again at finish');
+  // The relaunch's terminal, not the orphan, served the later phases.
+  assert.ok(!env.host.launches.some((l) => l.spec.reuseTerminal === orphan));
+});
+
+test('pre-dispatch failure twice: the seat fails, no third launch, the run continues', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10, quorumRatio: 0.5 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['predispatch', 'predispatch', 'ok', 'ok']);
+  const step = await env.engine.advance();
+  assert.ok(step.ok && step.value.action !== 'blocked', JSON.stringify(step));
+  const pd = preDispatchEvents(env);
+  assert.deepEqual(pd.map((e) => e.payload?.relaunch), ['allowed', 'exhausted']);
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.status, 'failed');
+  assert.equal(rev1.attempts.filter((a) => a.phase === 'independent_review').length, 2, 'no third attempt');
+  for (const e of pd) assert.ok(env.host.closed.includes(e.payload?.terminalHandle as string), 'both orphans closed');
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  assert.equal(env.host.scriptFor.get('rev_1')!.length, 2, 'rev_1 never launched again in any phase');
+});
+
+test('pre-dispatch classification never applies when worker-start may have been issued — still blocks', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['uncertain', 'ok']);
+  const step = await env.engine.advance();
+  assert.ok(step.ok);
+  assert.equal(step.value.action, 'blocked');
+  assert.match(step.value.note ?? '', /never relaunch/);
+  assert.equal(preDispatchEvents(env).length, 0);
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.attempts.length, 1);
+  assert.equal(rev1.attempts[0]!.status, 'unknown');
+  const h = rev1.attempts[0]!.terminalHandle!;
+  assert.ok(!env.host.closed.includes(h), 'an uncertain dispatch keeps its terminal');
+  assert.equal(env.host.scriptFor.get('rev_1')!.length, 1, 'never relaunched');
+  // Cancelling still preserves it (the worker may be live).
+  assert.ok((await env.engine.cancel({ reason: 't' })).ok);
+  assert.ok(!env.host.closed.includes(h));
+});
+
+test('crash after the worker-start marker, before any receipt → uncertain, blocks, never relaunched', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['crash-after', 'ok']);
+  const crashed = await env.engine.advance();
+  assert.equal(crashed.ok, false, 'simulated crash');
+  assert.ok(env.db.journal.some((e) => e.type === 'launch.intent' && e.payload?.stage === 'worker-start' && e.payload?.attemptId === 'att_rev_1_independent_review_r0_0'));
+  const r = await restartEngine(env).advance();
+  assert.ok(r.ok);
+  assert.equal(r.value.action, 'blocked', JSON.stringify(r.value));
+  assert.equal(preDispatchEvents(env).length, 0);
+  assert.equal(env.host.scriptFor.get('rev_1')!.length, 1, 'never relaunched');
+  const att = env.db.state.participants.find((p) => p.participantId === 'rev_1')!.attempts;
+  assert.equal(att.length, 1);
+  assert.equal(att[0]!.status, 'unknown');
+  assert.ok(!env.host.closed.includes(att[0]!.terminalHandle!), 'terminal kept — a worker may be attached');
+});
+
+test('crash before the worker-start marker → provably not dispatched: one relaunch, then the seat fails — never blind', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10, quorumRatio: 0.5 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['crash-before', 'crash-before', 'ok']);
+  assert.equal((await env.engine.advance()).ok, false, 'first crash');
+  // Resume #1: create receipt journaled, no marker → pre-dispatch proven →
+  // orphan closed → exactly one relaunch (which crashes before its marker too).
+  assert.equal((await restartEngine(env).advance()).ok, false, 'relaunch crashed');
+  let pd = preDispatchEvents(env);
+  assert.equal(pd.length, 1);
+  assert.equal(pd[0]!.payload?.stage, 'resume-no-dispatch-marker');
+  assert.ok(env.db.journal.some((e) => e.type === 'launch.resume' && e.payload?.resolution === 'pre-dispatch-proven'));
+  assert.ok(env.host.closed.includes(pd[0]!.payload?.terminalHandle as string));
+  // Resume #2: the relaunch was also never dispatched → allowance spent → seat failed.
+  const r = await restartEngine(env).advance();
+  assert.ok(r.ok, JSON.stringify(r));
+  pd = preDispatchEvents(env);
+  assert.deepEqual(pd.map((e) => e.payload?.relaunch), ['allowed', 'exhausted']);
+  assert.equal(env.host.scriptFor.get('rev_1')!.length, 1, 'no launch beyond the single allowed retry');
+  const rev1 = env.db.state.participants.find((p) => p.participantId === 'rev_1')!;
+  assert.equal(rev1.status, 'failed');
+  for (const e of pd) assert.ok(env.host.closed.includes(e.payload?.terminalHandle as string));
+});
+
+test('legacy terminal receipts without the dispatch-marker promise stay blocking on resume', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  env.host.scriptFor.set('rev_1', ['crash-before', 'ok']);
+  assert.equal((await env.engine.advance()).ok, false);
+  // Strip the promise: a pre-change journal cannot prove the marker scheme.
+  for (const e of env.db.journal) {
+    if (e.type === 'task.created' && e.payload?.scope === 'terminal' && e.payload?.attemptId === 'att_rev_1_independent_review_r0_0') delete e.payload.dispatchMarker;
+  }
+  const r = await restartEngine(env).advance();
+  assert.ok(r.ok);
+  assert.equal(r.value.action, 'blocked');
+  assert.equal(preDispatchEvents(env).length, 0);
+  assert.equal(env.host.scriptFor.get('rev_1')!.length, 1, 'never relaunched');
+});
+
+test('cleanup: refuses a non-terminal run; closes a settled supervisor; never its own or unrecorded terminals', async () => {
+  const env = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env);
+  const refused = await env.engine.cleanup!();
+  assert.ok(!refused.ok && refused.error.code === 'invalid_transition');
+  assert.ok((await env.engine.cancel({ reason: 't' })).ok);
+  const sup = { terminalHandle: 'term_supervisor', dispatchId: 'disp_sup', startupStatus: 'attached' };
+  const self = await env.engine.cleanup!({ supervisor: sup, callerHandle: 'term_supervisor' });
+  assert.ok(self.ok);
+  assert.equal(self.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped', 'never closes the calling terminal');
+  const working = await env.engine.cleanup!({ supervisor: sup });
+  assert.ok(working.ok);
+  assert.equal(working.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped', 'unsettled supervisor dispatch');
+  assert.ok(!env.host.closed.includes('term_supervisor'));
+  const issued = await env.engine.cleanup!({ supervisor: { ...sup, startupStatus: 'start_issued' } });
+  assert.ok(issued.ok);
+  assert.equal(issued.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'skipped', 'start_issued may own a worker');
+  env.host.settle('disp_sup');
+  const done = await env.engine.cleanup!({ supervisor: sup, callerHandle: 'term_primary' });
+  assert.ok(done.ok);
+  assert.equal(done.value.terminals.find((t) => t.owner === 'supervisor')?.outcome, 'closed');
+  assert.ok(env.host.ops.indexOf('release:disp_sup') >= 0 && env.host.ops.indexOf('release:disp_sup') < env.host.ops.indexOf('close:term_supervisor'));
+  assert.equal(env.db.state.status, 'cancelled');
+  // Without startup-record custody the supervisor is never touched; only
+  // journaled engine-created terminals are ever closed.
+  const env2 = makeCustodyEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await driveToApproval(env2);
+  assert.ok((await env2.engine.cancel({ reason: 't' })).ok);
+  const c = await env2.engine.cleanup!();
+  assert.ok(c.ok);
+  assert.ok(c.value.terminals.every((t) => t.owner === 'participant' && env2.host.createdTerminals.includes(t.terminalHandle)));
+  assert.deepEqual([...new Set(env2.host.closed)].sort(), [...env2.host.createdTerminals].sort());
+  assert.ok(!env2.host.closed.includes('term_supervisor'));
+});
+
+test('terminal lifecycle: legacy hosts (no terminal-create receipts) keep the old release-only behavior', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  await approveTwo(env);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  assert.equal(closeEvents(env).length, 0, 'nothing journaled as created → nothing closed');
+  assert.ok(env.host.released.length > 0, 'worker-release still issued as before');
+});

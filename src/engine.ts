@@ -57,7 +57,10 @@ import {
   type SnapshotDrift,
   type SourceSnapshot,
   type Store,
+  type SupervisorCleanupCustody,
   type TaskListRow,
+  type TerminalCleanupEntry,
+  type TerminalCleanupReport,
   type TerminalCreateIntent,
   type TerminalCreateReceipt,
   type WorkerListRow,
@@ -232,8 +235,29 @@ interface StepCtx {
    * 'refused' ⇒ a definitive no-effect refusal was receipted.
    */
   terminalCreateStage: Map<AttemptId, 'issued' | 'refused'>;
-  /** Journaled terminal identities retained per attempt (pre-attach custody). */
-  terminalCustody: Map<AttemptId, { handle: string; requestId?: string }>;
+  /**
+   * Journaled terminal identities retained per attempt (pre-attach custody).
+   * `dispatchMarker` records the adapter's promise to journal a worker-start
+   * marker before any worker-start onto that terminal.
+   */
+  terminalCustody: Map<AttemptId, { handle: string; requestId?: string; dispatchMarker?: boolean }>;
+  /** Attempts whose worker-start marker is journaled (dispatch may have been issued). */
+  workerStartMarkers: Set<AttemptId>;
+  /**
+   * Journaled pre-dispatch failures per "pid|phase|round" tuple (attempt
+   * ids). The first earns exactly one fresh relaunch; the second fails the seat.
+   */
+  preDispatchFailures: Map<string, Set<AttemptId>>;
+  /** Terminals orphaned by a pre-dispatch failure — never reused. */
+  preDispatchOrphans: Set<string>;
+  /**
+   * Journaled terminal-close custody per handle: an intent without an
+   * outcome may be retried (closing a closed terminal is harmless); an
+   * outcome means the engine is done with it.
+   */
+  terminalCloses: Map<string, { outcome?: 'closed' | 'already_gone' | 'failed' }>;
+  /** "handle|reason" close skips already journaled (dedupe). */
+  terminalCloseSkips: Set<string>;
   /**
    * Attempts with a journaled first-turn bare-Enter nudge intent (durable).
    * At most one nudge per attempt: an intent — receipted or not — forbids
@@ -289,6 +313,17 @@ interface StepCtx {
    * their ORIGINAL dedupe identity, never guessed state.
    */
   lifecycleJournal: JournalEvent[];
+}
+
+/**
+ * A terminal that can never again host a retained session: orphaned by a
+ * pre-dispatch failure, or carrying a journaled close (closed, already gone,
+ * or an intent whose outcome is unproven — it may be closed).
+ */
+function retiredTerminal(ctx: StepCtx, handle: string): boolean {
+  if (ctx.preDispatchOrphans.has(handle)) return true;
+  const c = ctx.terminalCloses.get(handle);
+  return c !== undefined && c.outcome !== 'failed';
 }
 
 /** Corrective-attempt context handed to the spec builders (RepairContext). */
@@ -1137,7 +1172,7 @@ export function createEngine(deps: EngineDeps): Engine {
     ctx: StepCtx,
     p: Participant,
     attempt: PhaseAttempt,
-  ): Promise<{ kind: 'proceed' } | { kind: 'adopted' } | { kind: 'blocked'; outcome: LaunchOutcome }> => {
+  ): Promise<{ kind: 'proceed' } | { kind: 'adopted' } | { kind: 'predispatch'; handle: string } | { kind: 'blocked'; outcome: LaunchOutcome }> => {
     const block = (reason: string, detail: Record<string, unknown>): { kind: 'blocked'; outcome: LaunchOutcome } => {
       attempt.status = 'unknown';
       emit(ctx, 'worker.unknown', {
@@ -1259,6 +1294,21 @@ export function createEngine(deps: EngineDeps): Engine {
         });
       }
       const custody = ctx.terminalCustody.get(attempt.attemptId);
+      // Dispatch-marker refinement: the journaled terminal-create receipt
+      // carries the adapter's promise to journal a worker-start marker
+      // BEFORE any worker-start onto that terminal. Receipt present + no
+      // marker ⇒ worker-start was provably never issued (crash between
+      // create and dispatch) — a definitive pre-dispatch failure, never a
+      // blind relaunch. A marker without a receipt stays uncertain below.
+      if (custody !== undefined && custody.dispatchMarker === true && !ctx.workerStartMarkers.has(attempt.attemptId)) {
+        emit(ctx, 'launch.resume', {
+          attemptId: attempt.attemptId,
+          resolution: 'pre-dispatch-proven',
+          terminalHandle: custody.handle,
+          detail: 'terminal-create receipt journaled with a dispatch-marker promise and no worker-start marker — worker-start was never issued',
+        }, { participantId: p.participantId, phase: attempt.phase });
+        return { kind: 'predispatch', handle: custody.handle };
+      }
       if (custody !== undefined && attempt.terminalHandle === null) {
         attempt.terminalHandle = custody.handle;
         if (p.retainedTerminal === null) p.retainedTerminal = custody.handle;
@@ -1410,6 +1460,66 @@ export function createEngine(deps: EngineDeps): Engine {
   };
 
   /**
+   * Definitive pre-dispatch failure (worker-start provably never issued onto
+   * a terminal this attempt created and journaled). The attempt is settled
+   * failed with the orphan handle journaled, the orphan is closed under the
+   * same journaled custody as terminal-state cleanup, and the seat earns
+   * exactly ONE fresh relaunch per phase tuple — charged against maxLaunches
+   * and bounded by the phase deadline like any launch. A second pre-dispatch
+   * failure fails the seat; the run continues under its quorum rules.
+   */
+  const handlePreDispatchFailure = async (
+    ctx: StepCtx,
+    p: Participant,
+    attempt: PhaseAttempt,
+    info: { handle: string; stage: string; detail: string },
+  ): Promise<LaunchOutcome> => {
+    const where = { participantId: p.participantId, phase: attempt.phase };
+    const tuple = repairKey(p.participantId, attempt.phase, attempt.round);
+    const prior = new Set(ctx.preDispatchFailures.get(tuple) ?? []);
+    prior.delete(attempt.attemptId);
+    const retryAllowed = prior.size === 0;
+    attempt.status = 'settled_failed';
+    attempt.settledAt = ctx.now.toISOString();
+    attempt.terminalHandle = info.handle;
+    if (p.retainedTerminal === info.handle) p.retainedTerminal = null;
+    ctx.preDispatchOrphans.add(info.handle);
+    ctx.preDispatchFailures.set(tuple, new Set([...prior, attempt.attemptId]));
+    const retry = retryAllowed ? addPlannedAttempt(p, attempt.phase, attempt.round) : undefined;
+    const repairSpec = ctx.repairByAttempt.get(attempt.attemptId);
+    if (retry !== undefined && repairSpec !== undefined) ctx.repairByAttempt.set(retry.attemptId, repairSpec);
+    if (retry === undefined) p.status = 'failed';
+    emit(ctx, 'worker.settled', {
+      attemptId: attempt.attemptId,
+      outcome: 'failed',
+      preDispatch: true,
+      workerStartIssued: false,
+      stage: info.stage,
+      terminalHandle: info.handle,
+      tuple,
+      relaunch: retry !== undefined ? 'allowed' : 'exhausted',
+      ...(retry !== undefined ? { retryAttemptId: retry.attemptId } : {}),
+      ...(retry !== undefined && repairSpec !== undefined ? { repair: { ...repairSpec } } : {}),
+      detail: (retry !== undefined
+        ? `terminal failed before dispatch (${info.detail}); orphan terminal closed, one fresh relaunch allowed`
+        : `terminal failed before dispatch again (${info.detail}); relaunch allowance spent — participant marked failed`).slice(0, 1000),
+    }, where);
+    const f = await flush(ctx);
+    if (!f.ok) return { kind: 'task_error', error: f.error };
+    await closeTerminalWithCustody(ctx, {
+      handle: info.handle,
+      owner: 'participant',
+      participantId: p.participantId,
+      attemptId: attempt.attemptId,
+      reason: 'pre_dispatch_orphan',
+    }, 'engine');
+    const fc = await flush(ctx);
+    if (!fc.ok) return { kind: 'task_error', error: fc.error };
+    if (retry === undefined) return { kind: 'failed' };
+    return launchAttempt(ctx, p, retry, { isFreshFallback: true });
+  };
+
+  /**
    * Persist intent → write spec → createTask (resumed when taskId already
    * exists) → launchWorker. Fresh Task per phase; reuseTerminal only when the
    * participant's previous dispatch is proven settled. An 'intent_recorded'
@@ -1482,6 +1592,13 @@ export function createEngine(deps: EngineDeps): Engine {
       const resolved = await resolveRecordedIntent(ctx, p, attempt);
       if (resolved.kind === 'blocked') return resolved.outcome;
       if (resolved.kind === 'adopted') return { kind: 'launched' };
+      if (resolved.kind === 'predispatch') {
+        return handlePreDispatchFailure(ctx, p, attempt, {
+          handle: resolved.handle,
+          stage: 'resume-no-dispatch-marker',
+          detail: 'resumed after a crash between terminal create and worker-start; no worker-start marker is journaled',
+        });
+      }
       // 'proceed': host confirmed nothing landed (or records were adopted).
     }
     const reuseAllowed =
@@ -1632,6 +1749,7 @@ export function createEngine(deps: EngineDeps): Engine {
             ctx.terminalCustody.set(attempt.attemptId, {
               handle: receipt.terminalHandle,
               ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+              ...(receipt.dispatchMarker === true ? { dispatchMarker: true } : {}),
             });
             attempt.terminalHandle = receipt.terminalHandle;
             if (p.retainedTerminal === null) p.retainedTerminal = receipt.terminalHandle;
@@ -1642,6 +1760,7 @@ export function createEngine(deps: EngineDeps): Engine {
               intentId: receipt.intentId,
               taskId: receipt.taskId,
               ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+              ...(receipt.dispatchMarker === true ? { dispatchMarker: true } : {}),
             }, { participantId: p.participantId, phase: attempt.phase });
           } else {
             const uncertain = receipt.outcome !== 'refused';
@@ -1664,6 +1783,20 @@ export function createEngine(deps: EngineDeps): Engine {
               ...(receipt.terminalHandle !== undefined ? { terminalHandle: receipt.terminalHandle } : {}),
             }, { participantId: p.participantId, phase: attempt.phase });
           }
+          return await flush(ctx);
+        },
+        // Dispatch marker, flushed immediately BEFORE worker-start onto the
+        // terminal this launch created: on resume, a created terminal with
+        // no marker provably has no worker; a marker without a receipt
+        // stays uncertain and blocks as before.
+        beforeWorkerStart: async (marker) => {
+          emit(ctx, 'launch.intent', {
+            attemptId: attempt.attemptId,
+            stage: 'worker-start',
+            intentId: marker.intentId,
+            terminalHandle: marker.terminalHandle,
+          }, { participantId: p.participantId, phase: attempt.phase });
+          ctx.workerStartMarkers.add(attempt.attemptId);
           return await flush(ctx);
         },
       },
@@ -1704,6 +1837,25 @@ export function createEngine(deps: EngineDeps): Engine {
       if (!f2.ok) return { kind: 'task_error', error: f2.error };
       if (reuse === undefined) await checkFirstTurnSubmission(ctx, p, attempt, res);
       return { kind: 'launched' };
+    }
+    // Definitive pre-dispatch failure: the adapter proves worker-start was
+    // never issued onto a terminal THIS attempt created and journaled. No
+    // worker can exist, so this is not launch_unknown — the orphan terminal
+    // is closed and the seat earns one fresh relaunch. Anything less proven
+    // (no explicit flag, reuse path, unjournaled handle) falls through to
+    // the existing conservative handling.
+    if (
+      res.workerStartIssued === false &&
+      res.terminalCreated === true &&
+      reuse === undefined &&
+      res.terminalHandle !== undefined &&
+      ctx.terminalCustody.get(attempt.attemptId)?.handle === res.terminalHandle
+    ) {
+      return handlePreDispatchFailure(ctx, p, attempt, {
+        handle: res.terminalHandle,
+        stage: res.failedStage ?? 'pre-dispatch',
+        detail: res.detail ?? `launch ${res.outcome} before worker-start`,
+      });
     }
     if (res.outcome === 'unknown') {
       attempt.status = 'unknown';
@@ -2401,6 +2553,12 @@ export function createEngine(deps: EngineDeps): Engine {
     if (!adm.ok) return { kind: 'error', error: adm.error };
     const statusAfter: RunStatus = ctx.state.status;
     if (statusAfter === 'awaiting_approval') {
+      // The organiser's roster is admitted and no later phase reuses its
+      // session: release-then-close its engine-created terminal now
+      // instead of leaving an idle agent through the whole run.
+      for (const rec of recordedParticipantTerminals(ctx)) {
+        if (rec.p.participantId === ORGANISER_PID) await cleanupParticipantTerminal(ctx, rec, 'organiser_roster_admitted', 'engine');
+      }
       return advanceResult('needs_approval', statusAfter, 'roster proposed — approve the exact seats/agents/config to launch reviewers');
     }
     // Re-derive AFTER admission (clm_0020): a rejection this pass may have
@@ -2475,7 +2633,9 @@ export function createEngine(deps: EngineDeps): Engine {
     const launched = deadlineExpired ? { launched: 0 } : await launchDue(ctx, due);
     if ('error' in launched) return launched.error;
 
-    const all = due.map((d) => d.attempt);
+    // Re-derived AFTER launching: a fallback/pre-dispatch relaunch minted
+    // during launchDue must hold the barrier open too.
+    const all = reviewers(state).flatMap((p) => attemptsFor(p, 'independent_review', null));
     const done = all.every((a) => isBarrierDone(a, deadlineExpired));
     if (!done) {
       return advanceResult(
@@ -2718,7 +2878,8 @@ export function createEngine(deps: EngineDeps): Engine {
     const launched = deadlineExpired ? { launched: 0 } : await launchDue(ctx, due);
     if ('error' in launched) return launched.error;
 
-    const all = due.map((d) => d.attempt);
+    // Re-derived AFTER launching (relaunches minted during launchDue count).
+    const all = reviewers(state).flatMap((p) => attemptsFor(p, phase, cursor.round));
     const done = all.every((a) => isBarrierDone(a, deadlineExpired));
     if (!done) {
       return advanceResult(
@@ -3230,31 +3391,276 @@ export function createEngine(deps: EngineDeps): Engine {
         });
         continue;
       }
-      ctx.releaseRequested.add(last.dispatchId!);
-      emit(ctx, 'worker.released', {
-        participantId: p.participantId,
-        dispatchId: last.dispatchId,
-        released: false,
-        outcome: 'intent',
-      });
-      const fi = await flush(ctx);
-      if (!fi.ok) {
-        emit(ctx, 'error', {
-          op: 'worker-release',
-          dispatchId: last.dispatchId,
-          detail: `release intent could not be journaled (${fi.error.message}); not issuing releaseWorker without custody`,
-        });
-        continue;
-      }
-      const r = await host.releaseWorker({ dispatchId: last.dispatchId! });
-      emit(ctx, 'worker.released', {
-        participantId: p.participantId,
-        dispatchId: last.dispatchId,
-        released: r.ok ? r.value.released : false,
-        outcome: r.ok ? (r.value.released ? 'released' : 'refused') : 'error',
-        ...(r.ok ? {} : { error: r.error.message }),
-      });
+      await releaseDispatch(ctx, p.participantId, last.dispatchId!);
     }
+  };
+
+  /**
+   * One journaled worker-release (intent → host call → receipt). Callers
+   * check `releaseRequested` first: a journaled release is never re-issued.
+   * The receipt echoes the host state (e.g. 'retained' — Orca keeps
+   * pre-existing terminals, which is why close follows release).
+   */
+  const releaseDispatch = async (
+    ctx: StepCtx,
+    participantId: string,
+    dispatchId: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> => {
+    ctx.releaseRequested.add(dispatchId);
+    emit(ctx, 'worker.released', {
+      participantId,
+      dispatchId,
+      released: false,
+      outcome: 'intent',
+      ...extra,
+    });
+    const fi = await flush(ctx);
+    if (!fi.ok) {
+      emit(ctx, 'error', {
+        op: 'worker-release',
+        dispatchId,
+        detail: `release intent could not be journaled (${fi.error.message}); not issuing releaseWorker without custody`,
+      });
+      return;
+    }
+    const r = await host.releaseWorker({ dispatchId });
+    emit(ctx, 'worker.released', {
+      participantId,
+      dispatchId,
+      released: r.ok ? r.value.released : false,
+      outcome: r.ok ? (r.value.released ? 'released' : 'refused') : 'error',
+      ...(r.ok && r.value.state !== undefined ? { hostState: r.value.state } : {}),
+      ...(r.ok ? {} : { error: r.error.message }),
+      ...extra,
+    });
+  };
+
+  // ── Terminal custody cleanup ──────────────────────────────────────────────
+  //
+  // Custody rule: only a terminal this run CREATED and JOURNALED is ever
+  // closed — an argv-lane terminal-create receipt for one of its attempts, or
+  // the supervisor startup record handed in by the CLI. Retained terminals
+  // adopted from host listings, reused terminals of other runs, and anything
+  // unrecorded are never touched. Closing uses only the documented
+  // `terminal show` / `terminal close` surface through the adapter.
+
+  /** Attempt statuses that prove no worker can still be running. */
+  const CLOSE_SETTLED = new Set<AttemptStatus>(['settled_ok', 'settled_failed', 'stopped']);
+
+  /** Journal a close skip once per (handle, reason). */
+  const skipClose = (
+    ctx: StepCtx,
+    t: { handle: string; owner: 'participant' | 'supervisor'; participantId?: string },
+    reason: string,
+    source: 'engine' | 'cleanup',
+  ): TerminalCleanupEntry => {
+    const key = `${t.handle}|${reason}`;
+    if (!ctx.terminalCloseSkips.has(key)) {
+      ctx.terminalCloseSkips.add(key);
+      emit(ctx, 'terminal.close', { stage: 'skipped', terminalHandle: t.handle, owner: t.owner, reason, source },
+        t.participantId !== undefined ? { participantId: t.participantId } : undefined);
+    }
+    return {
+      terminalHandle: t.handle,
+      owner: t.owner,
+      ...(t.participantId !== undefined ? { participantId: t.participantId } : {}),
+      outcome: 'skipped',
+      reason,
+    };
+  };
+
+  /**
+   * Journaled close of one custody-proven terminal: intent flushed BEFORE the
+   * host call, receipt after. A receipt means done for the engine (a failed
+   * close is retried only by `council cleanup`); an intent without a receipt
+   * may be retried — closing an already-closed terminal is harmless — and is
+   * reported as such. Failures are journaled and never change run state.
+   */
+  const closeTerminalWithCustody = async (
+    ctx: StepCtx,
+    t: { handle: string; owner: 'participant' | 'supervisor'; participantId?: string; attemptId?: string; reason: string },
+    source: 'engine' | 'cleanup',
+  ): Promise<TerminalCleanupEntry> => {
+    const base = {
+      terminalHandle: t.handle,
+      owner: t.owner,
+      ...(t.participantId !== undefined ? { participantId: t.participantId } : {}),
+    };
+    const where = t.participantId !== undefined ? { participantId: t.participantId } : undefined;
+    const prior = ctx.terminalCloses.get(t.handle);
+    if (prior?.outcome === 'closed' || prior?.outcome === 'already_gone') {
+      return { ...base, outcome: 'skipped', reason: `already ${prior.outcome === 'closed' ? 'closed' : 'gone'} (journaled receipt)` };
+    }
+    if (prior?.outcome === 'failed' && source === 'engine') {
+      return { ...base, outcome: 'skipped', reason: 'an earlier close failed (journaled receipt) — retry with council cleanup' };
+    }
+    if (typeof host.closeTerminal !== 'function') {
+      return skipClose(ctx, t, 'host adapter cannot close terminals', source);
+    }
+    const retriedIntent = prior !== undefined && prior.outcome === undefined;
+    const closeId = `tc_${crypto.randomUUID().slice(0, 12)}`;
+    emit(ctx, 'terminal.close', {
+      stage: 'intent',
+      closeId,
+      terminalHandle: t.handle,
+      owner: t.owner,
+      ...(t.attemptId !== undefined ? { attemptId: t.attemptId } : {}),
+      reason: t.reason,
+      source,
+      ...(retriedIntent ? { retriedIntent: true } : {}),
+    }, where);
+    ctx.terminalCloses.set(t.handle, {});
+    const fi = await flush(ctx);
+    if (!fi.ok) {
+      emit(ctx, 'error', {
+        op: 'terminal-close',
+        terminalHandle: t.handle,
+        detail: `close intent could not be journaled (${fi.error.message}); not closing without custody`,
+      });
+      return { ...base, outcome: 'failed', code: 'custody_journal_failed', reason: 'close intent could not be journaled' };
+    }
+    const r = await host.closeTerminal({ terminalHandle: t.handle });
+    const outcome = r.ok ? r.value.outcome : 'failed';
+    const code = r.ok ? r.value.code : r.error.code;
+    const detail = r.ok ? r.value.detail : r.error.message;
+    emit(ctx, 'terminal.close', {
+      stage: 'receipt',
+      closeId,
+      terminalHandle: t.handle,
+      owner: t.owner,
+      ...(t.attemptId !== undefined ? { attemptId: t.attemptId } : {}),
+      outcome,
+      ...(code !== undefined ? { code } : {}),
+      ...(detail !== undefined ? { detail: detail.slice(0, 512) } : {}),
+      ...(r.ok && r.value.requestId !== undefined ? { requestId: r.value.requestId } : {}),
+      source,
+    }, where);
+    ctx.terminalCloses.set(t.handle, { outcome });
+    return {
+      ...base,
+      outcome,
+      ...(code !== undefined ? { code } : {}),
+      ...(outcome === 'failed' && detail !== undefined ? { reason: detail.slice(0, 256) } : {}),
+      ...(retriedIntent ? { retriedIntent: true } : {}),
+    };
+  };
+
+  /** Engine-created participant terminals: one entry per journaled handle. */
+  const recordedParticipantTerminals = (ctx: StepCtx): { handle: string; p: Participant; creator: AttemptId; dispatchMarker: boolean }[] => {
+    const out = new Map<string, { handle: string; p: Participant; creator: AttemptId; dispatchMarker: boolean }>();
+    for (const [aid, c] of ctx.terminalCustody) {
+      if (out.has(c.handle)) continue;
+      const p = ctx.state.participants.find((pp) => pp.attempts.some((a) => a.attemptId === aid));
+      if (p === undefined) continue; // unattributable custody — never touched
+      out.set(c.handle, { handle: c.handle, p, creator: aid, dispatchMarker: c.dispatchMarker === true });
+    }
+    return [...out.values()];
+  };
+
+  /**
+   * Release-then-close one participant terminal when every attempt that ran
+   * on it is proven finished. Engine mode trusts persisted attempt status
+   * only; cleanup mode may additionally OBSERVE an unsettled dispatch and
+   * treat a host verdict (settled/fenced/lost) as finished.
+   */
+  const cleanupParticipantTerminal = async (
+    ctx: StepCtx,
+    rec: { handle: string; p: Participant; creator: AttemptId; dispatchMarker: boolean },
+    reason: string,
+    source: 'engine' | 'cleanup',
+  ): Promise<TerminalCleanupEntry> => {
+    const { handle, p } = rec;
+    const t = { handle, owner: 'participant' as const, participantId: p.participantId };
+    const prior = ctx.terminalCloses.get(handle);
+    if (prior?.outcome === 'closed' || prior?.outcome === 'already_gone') {
+      return { terminalHandle: handle, owner: 'participant', participantId: p.participantId, outcome: 'skipped', reason: `already ${prior.outcome === 'closed' ? 'closed' : 'gone'} (journaled receipt)` };
+    }
+    const users = p.attempts.filter((a) => a.terminalHandle === handle || a.attemptId === rec.creator);
+    for (const a of users) {
+      if (CLOSE_SETTLED.has(a.status)) continue;
+      // Never dispatched: terminal-create receipt promised a marker and no
+      // worker-start marker exists — no worker can be on this terminal.
+      if (
+        a.dispatchId === null && a.attemptId === rec.creator && rec.dispatchMarker &&
+        !ctx.workerStartMarkers.has(a.attemptId)
+      ) continue;
+      if (source === 'cleanup' && a.dispatchId !== null) {
+        const obs = await host.observeWorker({ dispatchId: a.dispatchId });
+        if (obs.ok && obs.value.liveness === 'finished') continue;
+        return skipClose(ctx, t, `dispatch ${a.dispatchId} (${a.attemptId}) is not proven settled (${obs.ok ? obs.value.liveness : `observe failed: ${obs.error.code}`})`, source);
+      }
+      return skipClose(ctx, t, `attempt ${a.attemptId} is ${a.status} — its worker may still be live or reuse this terminal`, source);
+    }
+    const last = users.filter((a) => a.dispatchId !== null).at(-1);
+    if (last !== undefined && !ctx.releaseRequested.has(last.dispatchId!)) {
+      await releaseDispatch(ctx, p.participantId, last.dispatchId!, { terminalHandle: handle });
+    }
+    const entry = await closeTerminalWithCustody(ctx, { ...t, attemptId: rec.creator, reason }, source);
+    if (p.retainedTerminal === handle && entry.outcome !== 'failed') p.retainedTerminal = null;
+    return entry;
+  };
+
+  /**
+   * Terminal-state cleanup (reported / failed / cancelled): every
+   * engine-created participant terminal whose dispatches are settled,
+   * fenced or never issued is released (worker-release, as before) and then
+   * closed — Orca reports these argv-lane terminals 'retained' and would
+   * otherwise leave them as idle agent sessions. Idempotent: journaled
+   * receipts mean done; skips are journaled once. Never changes run state.
+   */
+  const finalizeRunTerminals = async (
+    ctx: StepCtx,
+    source: 'engine' | 'cleanup',
+    callerHandle?: string,
+  ): Promise<TerminalCleanupEntry[]> => {
+    const out: TerminalCleanupEntry[] = [];
+    for (const rec of recordedParticipantTerminals(ctx)) {
+      out.push(
+        callerHandle !== undefined && rec.handle === callerHandle
+          ? skipClose(ctx, { handle: rec.handle, owner: 'participant', participantId: rec.p.participantId }, 'this is the calling terminal — a terminal never closes itself', source)
+          : await cleanupParticipantTerminal(ctx, rec, `run_${ctx.state.status}`, source),
+      );
+    }
+    return out;
+  };
+
+  /** Supervisor terminal (cleanup only): custody comes from its startup record. */
+  const cleanupSupervisorTerminal = async (
+    ctx: StepCtx,
+    sup: SupervisorCleanupCustody,
+    callerHandle: string | undefined,
+  ): Promise<TerminalCleanupEntry> => {
+    const t = { handle: sup.terminalHandle, owner: 'supervisor' as const };
+    const prior = ctx.terminalCloses.get(sup.terminalHandle);
+    if (prior?.outcome === 'closed' || prior?.outcome === 'already_gone') {
+      return { terminalHandle: sup.terminalHandle, owner: 'supervisor', outcome: 'skipped', reason: `already ${prior.outcome === 'closed' ? 'closed' : 'gone'} (journaled receipt)` };
+    }
+    if (callerHandle !== undefined && callerHandle === sup.terminalHandle) {
+      return skipClose(ctx, t, 'this is the calling terminal — a terminal never closes itself; run cleanup from another terminal', 'cleanup');
+    }
+    const recorded = ctx.state.supervisor;
+    if (recorded !== null && recorded.terminalHandle !== sup.terminalHandle) {
+      return skipClose(ctx, t, `startup record terminal differs from the recorded supervisor ${recorded.terminalHandle} — custody unproven`, 'cleanup');
+    }
+    const dispatchId = sup.dispatchId ?? recorded?.dispatchId ?? null;
+    if (sup.startupStatus === 'attached') {
+      if (dispatchId === null) return skipClose(ctx, t, 'attached supervisor has no recorded dispatch — custody unproven', 'cleanup');
+      const obs = await host.observeWorker({ dispatchId });
+      if (!obs.ok || obs.value.liveness !== 'finished') {
+        return skipClose(ctx, t, `supervisor dispatch ${dispatchId} is not proven settled (${obs.ok ? obs.value.liveness : `observe failed: ${obs.error.code}`})`, 'cleanup');
+      }
+      if (!ctx.releaseRequested.has(dispatchId)) {
+        await releaseDispatch(ctx, 'supervisor', dispatchId, { scope: 'supervisor', terminalHandle: sup.terminalHandle });
+      }
+    } else if (sup.startupStatus !== 'terminal_created' && sup.startupStatus !== 'paused') {
+      // intent/task_created carry no terminal; start_issued may own a worker.
+      return skipClose(ctx, t, `supervisor startup is ${sup.startupStatus} — worker-start may have been issued; reconcile first`, 'cleanup');
+    } else if (sup.pausedCode === 'terminal_owned' || sup.pausedCode === 'custody_unproven') {
+      // A resume found (or could not rule out) a dispatch on this terminal.
+      return skipClose(ctx, t, `supervisor startup paused with ${sup.pausedCode} — a dispatch may own this terminal; reconcile first`, 'cleanup');
+    }
+    return closeTerminalWithCustody(ctx, { ...t, reason: 'supervisor_after_run' }, 'cleanup');
   };
 
   /**
@@ -3608,6 +4014,11 @@ export function createEngine(deps: EngineDeps): Engine {
       workerLaunchStage: new Map(),
       terminalCreateStage: new Map(),
       terminalCustody: new Map(),
+      workerStartMarkers: new Set(),
+      preDispatchFailures: new Map(),
+      preDispatchOrphans: new Set(),
+      terminalCloses: new Map(),
+      terminalCloseSkips: new Set(),
       submitNudgeIntents: new Set(),
       intentProtocol: new Map(),
       integrity: 'legacy',
@@ -3657,6 +4068,7 @@ export function createEngine(deps: EngineDeps): Engine {
       }
       noteAttempt(e.payload?.attemptId, e.ts);
       noteAttempt(e.payload?.repairAttemptId, e.ts);
+      noteAttempt(e.payload?.retryAttemptId, e.ts);
       // Envelope-linked attempts are minted right after envelope.built —
       // a lost saveState erases them while the journal proves they exist.
       if (
@@ -3743,6 +4155,8 @@ export function createEngine(deps: EngineDeps): Engine {
           ctx.workerLaunchStage.set(aid, 'issued');
         } else if (e.payload?.stage === 'terminal-create') {
           ctx.terminalCreateStage.set(aid, 'issued');
+        } else if (e.payload?.stage === 'worker-start') {
+          ctx.workerStartMarkers.add(aid);
         } else {
           const v = typeof e.payload?.v === 'number' ? e.payload.v : 1;
           ctx.intentProtocol.set(aid, Math.max(ctx.intentProtocol.get(aid) ?? 1, v));
@@ -3767,7 +4181,44 @@ export function createEngine(deps: EngineDeps): Engine {
           ctx.terminalCustody.set(e.payload.attemptId, {
             handle: h,
             ...(typeof e.payload?.requestId === 'string' ? { requestId: e.payload.requestId } : {}),
+            ...(e.payload?.dispatchMarker === true ? { dispatchMarker: true } : {}),
           });
+        }
+      }
+      // Pre-dispatch failures (worker-start provably never issued): the
+      // tuple's single relaunch allowance and the orphaned terminal.
+      if (e.type === 'worker.settled' && e.payload?.preDispatch === true && typeof e.payload?.attemptId === 'string') {
+        const tuple = typeof e.payload?.tuple === 'string' ? e.payload.tuple : undefined;
+        if (tuple !== undefined) {
+          const set = ctx.preDispatchFailures.get(tuple) ?? new Set<AttemptId>();
+          set.add(e.payload.attemptId);
+          ctx.preDispatchFailures.set(tuple, set);
+        }
+        if (typeof e.payload?.terminalHandle === 'string') ctx.preDispatchOrphans.add(e.payload.terminalHandle);
+        const repair = e.payload?.repair as { repairOf?: unknown; contract?: unknown; diagnostics?: unknown; previousArtifactPath?: unknown; diagnosticsRef?: unknown } | undefined;
+        if (
+          typeof e.payload?.retryAttemptId === 'string' &&
+          repair !== undefined && typeof repair === 'object' &&
+          typeof repair.repairOf === 'string' && typeof repair.contract === 'string' && Array.isArray(repair.diagnostics)
+        ) {
+          ctx.repairByAttempt.set(e.payload.retryAttemptId, {
+            repairOf: repair.repairOf,
+            contract: repair.contract,
+            diagnostics: repair.diagnostics.filter((d): d is string => typeof d === 'string'),
+            ...(typeof repair.previousArtifactPath === 'string' ? { previousArtifactPath: repair.previousArtifactPath } : {}),
+            ...(typeof repair.diagnosticsRef === 'string' ? { diagnosticsRef: repair.diagnosticsRef } : {}),
+          });
+        }
+      }
+      if (e.type === 'terminal.close' && typeof e.payload?.terminalHandle === 'string') {
+        const h = e.payload.terminalHandle;
+        if (e.payload?.stage === 'intent') {
+          ctx.terminalCloses.set(h, {}); // chronological last-wins: a newer intent reopens custody
+        } else if (e.payload?.stage === 'receipt') {
+          const o = e.payload?.outcome;
+          if (o === 'closed' || o === 'already_gone' || o === 'failed') ctx.terminalCloses.set(h, { outcome: o });
+        } else if (e.payload?.stage === 'skipped' && typeof e.payload?.reason === 'string') {
+          ctx.terminalCloseSkips.add(`${h}|${e.payload.reason}`);
         }
       }
       // RA-006: an error carrying `uncertain:true` is an issued mutation
@@ -4028,13 +4479,16 @@ export function createEngine(deps: EngineDeps): Engine {
         // Retained-session custody is journal-derived: the NEWEST journaled
         // handle is the live session (a later fresh-fallback attempt on a
         // different terminal supersedes an earlier one, never vice versa).
-        if (a.terminalHandle !== null) p.retainedTerminal = a.terminalHandle;
+        // A pre-dispatch orphan or a journaled-closed terminal is never a
+        // live retained session.
+        if (a.terminalHandle !== null && !retiredTerminal(ctx, a.terminalHandle)) p.retainedTerminal = a.terminalHandle;
         if (a.requestId === undefined && ov.requestId !== undefined) a.requestId = ov.requestId;
         const js = ov.journaledStatus;
         if (js !== undefined && (STATUS_RANK[js] ?? 0) > (STATUS_RANK[a.status] ?? 0)) {
           a.status = js;
         }
       }
+      if (p.retainedTerminal !== null && retiredTerminal(ctx, p.retainedTerminal)) p.retainedTerminal = null;
     }
     // RA-004: journal-derived consumption — never refund a charge that made
     // it to disk; keep the in-memory count when it is ahead (pending events).
@@ -4110,6 +4564,10 @@ export function createEngine(deps: EngineDeps): Engine {
         if (step.result.artifacts === undefined && ctx.artifacts.length > 0) {
           step.result.artifacts = ctx.artifacts;
         }
+        // Terminal run: release-then-close every engine-created participant
+        // terminal (idempotent; also completes a crash-interrupted pass on
+        // a later advance). Never changes the run's terminal state.
+        if (TERMINAL_STATUS.has(ctx.state.status)) await finalizeRunTerminals(ctx, 'engine');
         // Durable first: the blocked reason is journaled before the flush so
         // P-D4 catch-up can replay it; the wake plan is computed in-lock
         // from persisted records and DRAINED after the lock releases.
@@ -4429,6 +4887,7 @@ export function createEngine(deps: EngineDeps): Engine {
         await releaseRetainedWorkers(ctx);
         state.status = 'cancelled';
         emit(ctx, 'run.finished', { outcome: 'cancelled', reason: input.reason });
+        await finalizeRunTerminals(ctx, 'engine');
         const f = await flush(ctx);
         if (!f.ok) return f;
         // Terminal call: drain the full pending catch-up — there is no later
@@ -4443,5 +4902,41 @@ export function createEngine(deps: EngineDeps): Engine {
     }
   };
 
-  return { advance, approve, status, cancel };
+  /**
+   * `council cleanup`: on a terminal run only, release-then-close every
+   * terminal this run recorded (engine-created participant terminals plus
+   * the supervisor proven by its startup record) whose dispatch is settled,
+   * fenced, lost or never issued. Unsettled attempts are OBSERVED (read
+   * only) — a host verdict counts as settled. Earlier failed closes and
+   * receipt-less intents are retried; closed/already-gone receipts are not.
+   * Unrecorded terminals are never touched; the run state never changes.
+   */
+  const cleanup = async (input: {
+    supervisor?: SupervisorCleanupCustody;
+    callerHandle?: string;
+  } = {}): Promise<Result<TerminalCleanupReport>> => {
+    try {
+      return await store.withLock(async () => {
+        const st = await store.loadState();
+        if (!st.ok) return st;
+        if (!TERMINAL_STATUS.has(st.value.status)) {
+          return failRes(err('invalid_transition', `cleanup refuses a non-terminal run (status ${st.value.status}) — terminals may still be in use; finish or cancel the run first`));
+        }
+        const bc = await buildCtx(st.value);
+        if (!bc.ok) return bc;
+        const ctx = bc.value;
+        const terminals = await finalizeRunTerminals(ctx, 'cleanup', input.callerHandle);
+        if (input.supervisor !== undefined && !terminals.some((t) => t.terminalHandle === input.supervisor!.terminalHandle)) {
+          terminals.push(await cleanupSupervisorTerminal(ctx, input.supervisor, input.callerHandle));
+        }
+        const f = await flush(ctx);
+        if (!f.ok) return f;
+        return ok({ status: ctx.state.status, terminals });
+      });
+    } catch (e) {
+      return failRes(err('io_error', `cleanup crashed: ${e instanceof Error ? e.message : String(e)}`));
+    }
+  };
+
+  return { advance, approve, status, cancel, cleanup };
 }

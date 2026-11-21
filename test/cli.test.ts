@@ -3521,3 +3521,128 @@ test('start-supervisor: a journaled supervisor nudge intent forbids another nudg
   assert.equal(sub.warning, 'nudge_already_attempted');
   assert.equal(hasCall(log, 'terminal send'), false, 'at most one nudge per terminal, even across runs of the command');
 });
+
+// ─── council cleanup ─────────────────────────────────────────────────────────
+
+/**
+ * A terminal (cancelled) run whose journal records ONE engine-created
+ * reviewer terminal (term_c1), a supervisor startup record (term_sup), and a
+ * second reviewer terminal that was never journaled as created (term_unrec).
+ */
+async function cleanupRun(): Promise<InitFixture> {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  const store = createStore({ runDir: f.runDir });
+  const attempt = (pid: string, handle: string, dispatchId: string) => ({
+    attemptId: `att_${pid}_independent_review_r0_0`,
+    participantId: pid,
+    phase: 'independent_review' as const,
+    round: null,
+    taskId: `task_${pid}`,
+    dispatchId,
+    terminalHandle: handle,
+    launchIntentId: `li_${pid}`,
+    status: 'settled_ok' as const,
+    createdAt: new Date().toISOString(),
+    settledAt: new Date().toISOString(),
+    artifacts: [],
+  });
+  const w = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    const s = st.value;
+    s.status = 'cancelled';
+    s.orcaRunId = 'run_child';
+    s.supervisor = { terminalHandle: 'term_sup', dispatchId: 'ctx_sup' };
+    s.participants = [
+      { participantId: 'rev-1', role: 'reviewer', seatId: 'seat-1', perspectiveId: 'p1', agent: { ...DEVIN }, retainedTerminal: 'term_c1', status: 'settled', attempts: [attempt('rev-1', 'term_c1', 'ctx_r1')] },
+      { participantId: 'rev-2', role: 'reviewer', seatId: 'seat-2', perspectiveId: 'p2', agent: { ...DEVIN }, retainedTerminal: 'term_unrec', status: 'settled', attempts: [attempt('rev-2', 'term_unrec', 'ctx_r2')] },
+    ];
+    const ws = await store.saveState(s);
+    if (!ws.ok) return ws;
+    return store.appendJournal([
+      { ts: new Date().toISOString(), type: 'run.initialized', actor: 'engine', payload: { runId: f.runId, integrity: 'receipts-v1', snapshotId: f.snapshotId } },
+      { ts: new Date().toISOString(), type: 'task.created', actor: 'engine', participantId: 'rev-1', payload: { attemptId: 'att_rev-1_independent_review_r0_0', scope: 'terminal', terminalHandle: 'term_c1', intentId: 'li_rev-1:terminal-create', taskId: 'task_rev-1', dispatchMarker: true } },
+      { ts: new Date().toISOString(), type: 'run.finished', actor: 'engine', payload: { outcome: 'cancelled', reason: 'test' } },
+    ]);
+  });
+  assert.ok(w.ok, JSON.stringify(w));
+  assert.ok((await store.writeArtifact('supervisor/startup.json', JSON.stringify({
+    schemaVersion: 1, runId: f.runId, specSha256: 'x', status: 'attached', terminalHandle: 'term_sup', dispatchId: 'ctx_sup', taskId: 'task_sup', requestIds: {},
+  }))).ok);
+  return f;
+}
+
+test('cleanup refuses a non-terminal run before any host call', async () => {
+  const f = await initRun();
+  const { env, log } = fakeOrca(tmp('cleanup-live'), {}, 'term_primary');
+  const r = await cliJson(['cleanup', '--run', f.runDir, '--json'], env);
+  assert.equal(r.code, 4, r.stdout + r.stderr); // invalid_transition
+  assert.match((r.body.error as Record<string, unknown>).message as string, /terminal run/);
+  assert.equal(orcaCalls(log).length, 0);
+});
+
+test('cleanup closes recorded participant + supervisor terminals (release first), never an unrecorded one; status points at it', async () => {
+  const f = await cleanupRun();
+  const settled = { ok: true, result: { dispatchId: 'ctx_sup', state: 'succeeded', outcome: 'succeeded' } };
+  const retained = { ok: true, result: { state: 'retained', reason: 'user_requested', processAction: 'none' } };
+  const { env, log } = fakeOrca(
+    tmp('cleanup-term'),
+    {
+      'orchestration worker-show': [settled, settled, settled, settled],
+      'orchestration worker-release': [retained, retained],
+      'terminal close': [
+        { ok: true, result: { close: { handle: 'term_c1', ptyKilled: true } } },
+        { ok: true, result: { close: { handle: 'term_sup', ptyKilled: true } } },
+      ],
+    },
+    'term_primary',
+  );
+  const before = await cliJson(['status', '--run', f.runDir, '--json'], env);
+  assert.equal(before.code, 0, before.stdout + before.stderr);
+  const pending = (before.body.pendingActions as { kind: string; command?: string; detail: string }[]).find((a) => a.kind === 'cleanup');
+  assert.ok(pending !== undefined, JSON.stringify(before.body.pendingActions));
+  assert.match(pending.command ?? '', /^council cleanup --run /);
+  assert.match(pending.detail, /term_c1/);
+  assert.doesNotMatch(pending.detail, /term_unrec/);
+
+  const r = await cliJson(['cleanup', '--run', f.runDir, '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const terms = r.body.terminals as { terminalHandle: string; owner: string; outcome: string }[];
+  assert.deepEqual(terms.map((t) => [t.terminalHandle, t.owner, t.outcome]), [
+    ['term_c1', 'participant', 'closed'],
+    ['term_sup', 'supervisor', 'closed'],
+  ]);
+  assert.deepEqual(r.body.summary, { closed: 2, alreadyGone: 0, skipped: 0, failed: 0 });
+  const calls = orcaCalls(log).map((a) => a.join(' '));
+  assert.ok(calls.every((c) => !c.includes('term_unrec') && !c.includes('ctx_r2')), 'the unrecorded terminal and its dispatch are never touched');
+  const idx = (s: string) => calls.findIndex((c) => c.includes(s));
+  assert.ok(idx('worker-release --dispatch ctx_r1') >= 0 && idx('worker-release --dispatch ctx_r1') < idx('terminal close --terminal term_c1'));
+  assert.ok(idx('worker-release --dispatch ctx_sup') >= 0 && idx('worker-release --dispatch ctx_sup') < idx('terminal close --terminal term_sup'));
+  assert.ok(calls.every((c) => !/taskkill|kill/.test(c)));
+  const closes = journalAll(f.runDir).filter((e) => e.type === 'terminal.close');
+  assert.deepEqual(closes.map((e) => [e.payload?.terminalHandle, e.payload?.stage, e.payload?.outcome ?? null]), [
+    ['term_c1', 'intent', null], ['term_c1', 'receipt', 'closed'],
+    ['term_sup', 'intent', null], ['term_sup', 'receipt', 'closed'],
+  ]);
+  assert.equal(readState(f.runDir).status, 'cancelled', 'cleanup never changes run state');
+
+  // Idempotent: a second pass closes nothing and status no longer asks for cleanup.
+  const again = await cliJson(['cleanup', '--run', f.runDir, '--json'], env);
+  assert.equal(again.code, 0);
+  assert.deepEqual((again.body.terminals as { outcome: string }[]).map((t) => t.outcome), ['skipped', 'skipped']);
+  assert.equal(orcaCalls(log).filter((a) => a.slice(0, 2).join(' ') === 'terminal close').length, 2);
+  const after = await cliJson(['status', '--run', f.runDir, '--json'], env);
+  assert.ok(!(after.body.pendingActions as { kind: string }[]).some((a) => a.kind === 'cleanup'));
+});
+
+test('cleanup run from the supervisor terminal never closes itself', async () => {
+  const f = await cleanupRun();
+  const settled = { ok: true, result: { dispatchId: 'ctx_sup', state: 'succeeded', outcome: 'succeeded' } };
+  const { env, log } = fakeOrca(tmp('cleanup-self'), { 'orchestration worker-show': [settled, settled] }, 'term_sup');
+  const r = await cliJson(['cleanup', '--run', f.runDir, '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const sup = (r.body.terminals as { owner: string; outcome: string; reason?: string }[]).find((t) => t.owner === 'supervisor')!;
+  assert.equal(sup.outcome, 'skipped');
+  assert.match(sup.reason ?? '', /calling terminal/);
+  assert.ok(!orcaCalls(log).some((a) => a.join(' ') === 'terminal close --terminal term_sup --json'));
+});

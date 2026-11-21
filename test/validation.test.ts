@@ -1136,3 +1136,28 @@ test('parseTerminalCreateIntent/Receipt: adapter-confirmed shape validates and r
   assert.equal(rr.value.outcome, 'uncertain');
   assert.ok(!parseTerminalCreateReceipt({ ...receipt, outcome: 'unknown' }).ok, 'legacy vocabulary rejected');
 });
+
+test('parseTerminalCreateReceipt: additive dispatchMarker promise round-trips; legacy receipts still parse', () => {
+  const base = { intentId: 'tci_1', taskId: 'task_1', outcome: 'created', terminalHandle: 'term_1' };
+  const legacy = parseTerminalCreateReceipt(base);
+  assert.ok(legacy.ok, issues(legacy));
+  assert.equal(legacy.value.dispatchMarker, undefined);
+  const marked = parseTerminalCreateReceipt({ ...base, dispatchMarker: true });
+  assert.ok(marked.ok, issues(marked));
+  assert.equal(marked.value.dispatchMarker, true);
+  assert.ok(hasCode(parseTerminalCreateReceipt({ ...base, dispatchMarker: 'yes' }), 'type'));
+});
+
+test('parseJournalEvent accepts the additive terminal-close and pre-dispatch events', () => {
+  const at = { seq: 9, ts: '2026-11-21T00:00:00Z', actor: 'engine' };
+  for (const [type, payload] of [
+    ['terminal.close', { stage: 'intent', closeId: 'tc_1', terminalHandle: 'term_1', owner: 'participant', reason: 'run_reported', source: 'engine' }],
+    ['terminal.close', { stage: 'receipt', closeId: 'tc_1', terminalHandle: 'term_1', owner: 'participant', outcome: 'already_gone', code: 'terminal_handle_stale', source: 'cleanup' }],
+    ['terminal.close', { stage: 'skipped', terminalHandle: 'term_2', owner: 'supervisor', reason: 'calling terminal', source: 'cleanup' }],
+    ['launch.intent', { attemptId: 'att_rev0_independent_review_r0_0', stage: 'worker-start', intentId: 'li_x:worker-start', terminalHandle: 'term_1' }],
+    ['worker.settled', { attemptId: 'att_rev0_independent_review_r0_0', outcome: 'failed', preDispatch: true, workerStartIssued: false, terminalHandle: 'term_1', tuple: 'rev0|independent_review|null', relaunch: 'allowed' }],
+  ] as const) {
+    const r = parseJournalEvent({ ...at, type, payload });
+    assert.ok(r.ok, `${type}: ${issues(r)}`);
+  }
+});

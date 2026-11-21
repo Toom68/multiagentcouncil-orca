@@ -336,6 +336,7 @@ const JOURNAL_EVENT_TYPES = [
   'artifact.rejected', 'envelope.built', 'deadline.hit', 'snapshot.drift',
   'claim.updated', 'report.written', 'supervisor.retired', 'error', 'run.finished',
   'launch.submit_check', 'launch.submit_nudge', 'launch.submit_unconfirmed',
+  'terminal.close',
 ] as const;
 
 // Compile-time exhaustiveness: fails to compile if EITHER the enum misses a
@@ -2169,12 +2170,16 @@ export function parseTerminalCreateReceipt(raw: unknown): ParseResult<TerminalCr
   const requestId = o.requestId === undefined || o.requestId === null ? undefined : (reqStr(o.requestId, 'receipt.requestId', issues, { max: 128 }) ?? undefined);
   const detail = optStr(o.detail, 'receipt.detail', issues, { max: 1000 });
   const observedAt = optStr(o.observedAt, 'receipt.observedAt', issues, { max: 40 });
+  if (o.dispatchMarker !== undefined && typeof o.dispatchMarker !== 'boolean') {
+    issues.push({ path: 'receipt.dispatchMarker', code: 'type', message: 'dispatchMarker must be a boolean' });
+  }
   if (issues.length || intentId === null || taskId === null || outcome === null) return parseFail(issues);
   const out: TerminalCreateReceipt = { intentId, taskId, outcome };
   if (terminalHandle !== undefined) out.terminalHandle = terminalHandle;
   if (requestId !== undefined) out.requestId = requestId;
   if (detail !== undefined) out.detail = detail;
   if (observedAt !== undefined) out.observedAt = observedAt;
+  if (o.dispatchMarker === true) out.dispatchMarker = true;
   return ok(out);
 }
 

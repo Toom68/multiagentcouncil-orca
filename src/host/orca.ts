@@ -34,6 +34,7 @@ import type {
   SubmitInputResult,
   TaskId,
   TerminalCreateIntent,
+  TerminalCloseResult,
   TerminalCreateReceipt,
   TerminalCustodyHooks,
   TerminalHandle,
@@ -726,6 +727,10 @@ export interface PhaseWorkerStart {
   requestId?: string;
   /** Turn-start evidence from the worker-start receipt (receiptTurnStart). */
   turnStart?: string;
+  /** False when this call returned before ever issuing worker-start. */
+  workerStartIssued?: boolean;
+  /** True when this call created (and received the handle of) the terminal. */
+  terminalCreated?: boolean;
   error?: OrcaCliErrorShape;
   /** Bounded copy of receipts for evidence; never trusted as proof alone. */
   receipts: Record<string, unknown>;
@@ -1043,8 +1048,22 @@ export class OrcaHost {
    * A retained terminal may receive a new phase Task only after its prior
    * dispatch is proven settled (worker-show first); overlapping active work on
    * one terminal is refused before mutation.
+   *
+   * Every result carries `workerStartIssued` (false = this call provably
+   * returned before issuing worker-start) and `terminalCreated` (true = this
+   * call created the returned terminal) so a pre-dispatch failure can be told
+   * apart from an uncertain dispatch.
    */
   async startPhaseWorker(input: StartPhaseWorkerInput): Promise<PhaseWorkerStart> {
+    const track = { workerStartIssued: false, terminalCreated: false };
+    const res = await this.startPhaseWorkerLanes(input, track);
+    return { ...res, workerStartIssued: track.workerStartIssued, terminalCreated: track.terminalCreated };
+  }
+
+  private async startPhaseWorkerLanes(
+    input: StartPhaseWorkerInput,
+    track: { workerStartIssued: boolean; terminalCreated: boolean },
+  ): Promise<PhaseWorkerStart> {
     const receipts: Record<string, unknown> = {};
     const runId = assertSafeValue('runId', input.runId);
     const taskId = assertSafeValue('taskId', input.taskId);
@@ -1201,6 +1220,8 @@ export class OrcaHost {
       // any later exception must still surface this handle/request evidence
       // in the outer catch — the terminal may be live and unjournaled.
       terminalHandle = createdHandle ?? terminalHandle;
+      if (createdHandle !== undefined) track.terminalCreated = true;
+      const dispatchMarker = input.custody?.beforeWorkerStart !== undefined;
       // Journal the resolved identity in EVERY direction — created handle,
       // definitive refusal, or ambiguous outcome — before anything else.
       // A persistence failure (non-ok OR a thrown hook) stops ALL further
@@ -1219,6 +1240,7 @@ export class OrcaHost {
           ...(created.requestId === undefined ? {} : { requestId: created.requestId }),
           ...(created.ok ? {} : { detail: `${created.error.code}: ${created.error.message}`.slice(0, 512) }),
           observedAt: new Date().toISOString(),
+          ...(createdHandle !== undefined && dispatchMarker ? { dispatchMarker: true } : {}),
         });
       } catch (e) {
         persistedReceipt = {
@@ -1293,6 +1315,7 @@ export class OrcaHost {
           runId,
           requestKey,
           outcome: 'uncertain',
+          failedStage: 'readiness_wait',
           terminalHandle,
           requestId: created.requestId,
           error: {
@@ -1371,7 +1394,46 @@ export class OrcaHost {
     }
     args.push('--json');
 
+    // Dispatch marker: journaled immediately BEFORE worker-start onto a
+    // terminal this call created, so a crash between here and the receipt
+    // reads "marker present → uncertain", and an absent marker proves no
+    // dispatch. A persistence failure aborts BEFORE worker-start.
+    if (track.terminalCreated && terminalHandle !== undefined && input.custody?.beforeWorkerStart !== undefined) {
+      let marked: Result<void>;
+      try {
+        marked = await input.custody.beforeWorkerStart({
+          intentId: `${requestKey}:worker-start`,
+          taskId,
+          terminalHandle,
+          observedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        marked = {
+          ok: false,
+          error: { code: 'adapter_error', message: `beforeWorkerStart hook threw: ${e instanceof Error ? e.message : String(e)}` },
+        };
+      }
+      if (!marked.ok) {
+        return {
+          taskId,
+          runId,
+          requestKey,
+          outcome: 'failed',
+          failedStage: 'custody_dispatch_marker',
+          terminalHandle,
+          ...(issuedRequestId === undefined ? {} : { requestId: issuedRequestId }),
+          error: {
+            code: 'custody_journal_failed',
+            message: `worker-start marker could not be journaled (${marked.error.message}) — worker-start was NOT issued; terminal ${terminalHandle} has no worker`,
+            data: { custodyError: marked.error },
+          },
+          receipts,
+        };
+      }
+    }
+
     effectPossible = true; // the worker-start may land from here on
+    track.workerStartIssued = true;
     const started = await this.run<Record<string, unknown>>(args, { mutation: true });
     receipts.workerStart = started.ok ? started.value : started.error;
     if (started.requestId !== undefined) issuedRequestId = started.requestId;
@@ -1865,6 +1927,25 @@ export class OrcaHost {
       assertSafeValue('dispatchId', dispatchId),
       '--json',
     ], { mutation: true });
+  }
+
+  /** Read-only terminal metadata (`terminal show`). */
+  async showTerminal(handle: string): Promise<OrcaCommandResult<Record<string, unknown>>> {
+    return this.run(['terminal', 'show', '--terminal', assertSafeValue('terminalHandle', handle), '--json']);
+  }
+
+  /**
+   * Close one exact terminal pane/session (`terminal close --terminal`).
+   * Bare argv like every `orca terminal` command (no --full, no retry).
+   * Verified 1.4.261: a live close returns `{close:{handle,tabId,ptyKilled:true}}`;
+   * repeating it on the same recorded handle returns the same ok envelope;
+   * an unknown handle fails `terminal_handle_stale`.
+   */
+  async closeTerminal(handle: string): Promise<OrcaCommandResult<Record<string, unknown>>> {
+    return this.run(
+      ['terminal', 'close', '--terminal', assertSafeValue('terminalHandle', handle), '--json'],
+      { mayMutate: true },
+    );
   }
 
   /** Keep a settled worker open for later phases (cancels auto-release). */
@@ -2799,6 +2880,11 @@ export class OrcaAdapter implements HostAdapter {
     if (started.outcome === 'failed' || started.outcome === 'uncertain') {
       base.outcome = started.outcome === 'failed' ? 'failed' : 'unknown';
       base.detail = describeLaunchFailure(started);
+      // Pre-dispatch evidence: only an explicit false proves worker-start was
+      // never issued; anything else stays "may have been issued".
+      if (started.workerStartIssued === false) base.workerStartIssued = false;
+      if (started.terminalCreated === true) base.terminalCreated = true;
+      if (started.failedStage !== undefined) base.failedStage = started.failedStage;
       return { ok: true, value: base };
     }
 
@@ -3046,7 +3132,7 @@ export class OrcaAdapter implements HostAdapter {
 
   async releaseWorker(input: {
     dispatchId: DispatchId;
-  }): Promise<Result<{ released: boolean }>> {
+  }): Promise<Result<{ released: boolean; state?: string }>> {
     try {
       const res = await this.host.releaseWorker(
         input.dispatchId,
@@ -3058,7 +3144,70 @@ export class OrcaAdapter implements HostAdapter {
       // released. Only an explicit released marker may claim released; a
       // retained/refused/release_pending/release_unknown or unrecognized
       // envelope reports released:false — custody stays with the terminal.
-      return { ok: true, value: { released: releaseConfirmed(res.value) } };
+      const v = asRecord(res.value);
+      const state = v === undefined ? undefined : firstString(v.state, v.status, v.terminalState, asRecord(v.terminal)?.state);
+      return {
+        ok: true,
+        value: { released: releaseConfirmed(res.value), ...(state === undefined ? {} : { state }) },
+      };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  /**
+   * Close one exact terminal. A documented `terminal show` runs first: the
+   * stale-handle code, or a disconnected record carrying an exit cause,
+   * proves the terminal is already gone (no close is issued). Otherwise
+   * `terminal close --terminal` runs; a stale-handle refusal there also
+   * reads as already gone. Any other failure is reported, never retried.
+   * Callers own custody — the adapter closes only the exact handle given.
+   */
+  async closeTerminal(input: { terminalHandle: TerminalHandle }): Promise<Result<TerminalCloseResult>> {
+    try {
+      const handle = assertSafeValue('terminalHandle', input.terminalHandle);
+      const shown = await this.host.showTerminal(handle);
+      if (!shown.ok && isStaleTerminalCode(shown.error.code)) {
+        return { ok: true, value: { outcome: 'already_gone', code: shown.error.code, detail: 'terminal show: handle is stale — nothing to close' } };
+      }
+      if (shown.ok) {
+        const t = asRecord(asRecord(shown.value)?.terminal ?? shown.value);
+        const exitCause = asRecord(t?.exitCause);
+        if (t !== undefined && firstString(t.handle) === handle && t.connected === false && (t.orphaned === true || exitCause !== undefined)) {
+          return {
+            ok: true,
+            value: {
+              outcome: 'already_gone',
+              code: 'exited',
+              detail: `terminal show: connected=false${exitCause !== undefined ? ` exitCause=${firstString(exitCause.kind) ?? 'unknown'}` : ''} — nothing to close`,
+            },
+          };
+        }
+      }
+      const closed = await this.host.closeTerminal(handle);
+      if (closed.ok) {
+        const c = asRecord(asRecord(closed.value)?.close ?? closed.value);
+        return {
+          ok: true,
+          value: {
+            outcome: 'closed',
+            ...(closed.requestId === undefined ? {} : { requestId: closed.requestId }),
+            ...(c !== undefined && typeof c.ptyKilled === 'boolean' ? { detail: `ptyKilled=${c.ptyKilled}` } : {}),
+          },
+        };
+      }
+      if (isStaleTerminalCode(closed.error.code)) {
+        return { ok: true, value: { outcome: 'already_gone', code: closed.error.code, detail: 'terminal close: handle is stale' } };
+      }
+      return {
+        ok: true,
+        value: {
+          outcome: 'failed',
+          code: closed.error.code,
+          detail: boundedUtf8(`${closed.uncertain ? 'outcome uncertain: ' : ''}${closed.error.message}`, MAIL_ERROR_MAX_BYTES),
+          ...(closed.requestId === undefined ? {} : { requestId: closed.requestId }),
+        },
+      };
     } catch (e) {
       return failure(tokenErr(e));
     }

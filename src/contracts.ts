@@ -1055,6 +1055,7 @@ export type JournalEventType =
   | 'launch.submit_check'
   | 'launch.submit_nudge'
   | 'launch.submit_unconfirmed'
+  | 'terminal.close'
   | 'error'
   | 'run.finished';
 
@@ -1112,6 +1113,24 @@ export interface TerminalCreateReceipt {
   detail?: string;
   /** Optional — the engine's journal ts is authoritative; adapter won't mint. */
   observedAt?: string;
+  /**
+   * True when the adapter promises to invoke `beforeWorkerStart` (and wait
+   * for it to persist) before any worker-start onto this terminal. Only then
+   * does a missing worker-start marker prove no dispatch was issued.
+   */
+  dispatchMarker?: boolean;
+}
+
+/**
+ * Marker the adapter hands to `beforeWorkerStart` immediately before it
+ * issues worker-start onto a terminal THIS launch created.
+ */
+export interface WorkerStartMarker {
+  /** Durable local id derived from the launch requestKey — never on argv. */
+  intentId: string;
+  taskId: TaskId;
+  terminalHandle: TerminalHandle;
+  observedAt?: string;
 }
 
 /**
@@ -1121,10 +1140,13 @@ export interface TerminalCreateReceipt {
  * BEFORE any mutation; `afterTerminalCreate` records the returned
  * identity/uncertainty — a non-ok result stops all further mutation with
  * outcome 'uncertain' rather than losing custody of a live terminal.
+ * `beforeWorkerStart` (optional) persists the dispatch marker — a non-ok
+ * result aborts BEFORE worker-start, so the terminal provably has no worker.
  */
 export interface TerminalCustodyHooks {
   beforeTerminalCreate(intent: TerminalCreateIntent): Promise<Result<void>>;
   afterTerminalCreate(receipt: TerminalCreateReceipt): Promise<Result<void>>;
+  beforeWorkerStart?(marker: WorkerStartMarker): Promise<Result<void>>;
 }
 
 /**
@@ -1179,6 +1201,52 @@ export interface LaunchResult {
    * (e.g. 'unsupported'). Absent when the receipt carries no such field.
    */
   turnStart?: string;
+  /**
+   * On a failed/unknown launch: false only when the adapter PROVES it never
+   * issued worker-start (it returned before that mutation). Absent means
+   * worker-start may have been issued.
+   */
+  workerStartIssued?: boolean;
+  /** True when THIS launch created the terminal it returns (argv lane). */
+  terminalCreated?: boolean;
+  /** Adapter stage that stopped a failed/unknown launch, when known. */
+  failedStage?: string;
+}
+
+/** Result of closing one exact terminal through the documented host CLI. */
+export interface TerminalCloseResult {
+  outcome: 'closed' | 'already_gone' | 'failed';
+  /** Host error/observation code (e.g. terminal_handle_stale). */
+  code?: string;
+  detail?: string;
+  requestId?: string;
+}
+
+/** One recorded terminal in a cleanup pass. */
+export interface TerminalCleanupEntry {
+  terminalHandle: TerminalHandle;
+  owner: 'participant' | 'supervisor';
+  participantId?: ParticipantId;
+  outcome: 'closed' | 'already_gone' | 'skipped' | 'failed';
+  reason?: string;
+  code?: string;
+  /** A prior close intent had no receipt; this pass retried it. */
+  retriedIntent?: boolean;
+}
+
+export interface TerminalCleanupReport {
+  status: RunStatus;
+  terminals: TerminalCleanupEntry[];
+}
+
+/** Supervisor custody proven by the CLI's startup record (start-supervisor). */
+export interface SupervisorCleanupCustody {
+  terminalHandle: TerminalHandle;
+  dispatchId: DispatchId | null;
+  /** startup.json status, e.g. 'attached' | 'paused' | 'terminal_created'. */
+  startupStatus: string;
+  /** startup.json paused.code when paused (e.g. 'agent_not_ready', 'terminal_owned'). */
+  pausedCode?: string;
 }
 
 /** Outcome of the bounded first-turn submission check. */
@@ -1287,8 +1355,16 @@ export interface HostAdapter {
   >;
   /** Guarded stop — only for explicit cancellation per the recovery reference. */
   requestStop(input: { dispatchId: DispatchId; reason: string }): Promise<Result<{ outcome: StopOutcome }>>;
-  /** Release a settled/reclaimable worker terminal (e.g. end of retained session). */
-  releaseWorker(input: { dispatchId: DispatchId }): Promise<Result<{ released: boolean }>>;
+  /**
+   * Release a settled/reclaimable worker terminal (e.g. end of retained
+   * session). `state` echoes the host's receipt state (e.g. 'retained').
+   */
+  releaseWorker(input: { dispatchId: DispatchId }): Promise<Result<{ released: boolean; state?: string }>>;
+  /**
+   * OPTIONAL: close one exact terminal (`terminal close --terminal`). The
+   * engine calls it only for terminals the run itself created and journaled.
+   */
+  closeTerminal?(input: { terminalHandle: TerminalHandle }): Promise<Result<TerminalCloseResult>>;
   /**
    * OPTIONAL crash-resume reconciliation: observe the state of a previously
    * recorded request id WITHOUT mutating anything. `absent` means the host
@@ -1575,6 +1651,16 @@ export interface Engine {
   status(): Promise<Result<EngineStatus>>;
   /** Explicit cancellation: guarded stop of live workers, then mark cancelled. */
   cancel(input: { reason: string }): Promise<Result<void>>;
+  /**
+   * Terminal-run cleanup: release-then-close every terminal this run created
+   * and journaled whose Dispatch is settled, fenced, lost or never issued.
+   * Refuses on a non-terminal run; never touches unrecorded terminals.
+   */
+  cleanup?(input?: {
+    supervisor?: SupervisorCleanupCustody;
+    /** Calling terminal — never closed by its own cleanup. */
+    callerHandle?: TerminalHandle;
+  }): Promise<Result<TerminalCleanupReport>>;
 }
 
 /**

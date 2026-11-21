@@ -292,6 +292,12 @@ function lazyHost(): HostAdapter {
     sendNotification: (i) => call((h) => h.sendNotification(i)),
     requestStop: (i) => call((h) => h.requestStop(i)),
     releaseWorker: (i) => call((h) => h.releaseWorker(i)),
+    closeTerminal: (i) =>
+      call((h) =>
+        h.closeTerminal !== undefined
+          ? h.closeTerminal(i)
+          : Promise.resolve({ ok: false, error: err('unsupported', 'host cannot close terminals') }),
+      ),
     probeSubmission: (i) =>
       call((h) =>
         h.probeSubmission !== undefined
@@ -1105,7 +1111,7 @@ const NEXT_HINT: Record<AdvanceResult['action'], string> = {
   wait: 'nothing to do — end the turn and wait for an Orca wake (mail or worker_done)',
   needs_approval:
     'review <runDir>/roster.proposed.json, write roster.approved.json, run `council approve --run <runDir> --roster <file>`, then nudge the supervisor via `orca orchestration send --to dispatch:<supervisorDispatchId>`',
-  finished: 'run is terminal — report the printed outcome (and reportPaths) to the coordinator',
+  finished: 'run is terminal — report the printed outcome (and reportPaths) to the coordinator; after this supervisor settles, the coordinator closes leftover council terminals with `council cleanup --run <runDir>`',
   blocked: 'unrecoverable condition — inspect <runDir>/events.jsonl and decide (fix the cause, `council reconcile` a persisted no-task intent, or `council cancel`)',
 };
 
@@ -2002,6 +2008,16 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
       command: `council start-supervisor --run ${cmdToken(runDir)} --replace`,
     });
   }
+  if (state.status === 'reported' || state.status === 'failed' || state.status === 'cancelled') {
+    const open = unclosedRecordedTerminals(journal, startupInfo);
+    if (open.length > 0) {
+      pendingActions.push({
+        kind: 'cleanup',
+        detail: `${open.length} terminal(s) this run created have no close receipt (${open.join(', ')}) — idle agent sessions keep host memory until closed`,
+        command: `council cleanup --run ${cmdToken(runDir)}`,
+      });
+    }
+  }
 
   // Per-participant attempt detail — dispatchIds exposed so manual fencing
   // (a wedged run) never needs a raw state.json read.
@@ -2082,6 +2098,105 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
       ),
       ...st.pendingDecisions.map((d) => `  pending:  ${d}`),
       ...pendingActions.map((a) => `  action:   [${a.kind}] ${a.detail}${a.command !== undefined ? `\n            → ${a.command}` : ''}`),
+    ].join('\n'),
+  };
+}
+
+/**
+ * Terminals this run recorded as created (journaled argv-lane terminal-create
+ * receipts + the supervisor startup record) without a closed/already-gone
+ * close receipt. Read-only, journal-derived.
+ */
+function unclosedRecordedTerminals(
+  journal: readonly JournalEvent[],
+  startupInfo: Record<string, unknown> | null,
+): string[] {
+  const recorded = new Set<string>();
+  const closed = new Set<string>();
+  for (const e of journal) {
+    const h = e.payload?.terminalHandle;
+    if (typeof h !== 'string' || h.length === 0) continue;
+    if (e.type === 'task.created' && e.payload?.scope === 'terminal') recorded.add(h);
+    if (e.type === 'error' && e.payload?.op === 'terminal-create') recorded.add(h);
+    if (e.type === 'terminal.close' && e.payload?.stage === 'intent') closed.delete(h);
+    if (e.type === 'terminal.close' && e.payload?.stage === 'receipt' && (e.payload?.outcome === 'closed' || e.payload?.outcome === 'already_gone')) {
+      closed.add(h);
+    }
+  }
+  const sup = startupInfo !== null && startupInfo.status !== 'retired' ? firstStr(startupInfo.terminalHandle) : undefined;
+  if (sup !== undefined) recorded.add(sup);
+  return [...recorded].filter((h) => !closed.has(h));
+}
+
+/** Supervisor custody for cleanup: only a startup record this run wrote. */
+async function supervisorCleanupCustody(
+  store: Store,
+  state: CouncilState,
+): Promise<{ terminalHandle: string; dispatchId: string | null; startupStatus: string; pausedCode?: string } | undefined> {
+  const raw = await store.readArtifact(SUPERVISOR_STARTUP_ARTIFACT);
+  if (!raw.ok) return undefined;
+  let rec: Record<string, unknown> | undefined;
+  try {
+    rec = asRec(JSON.parse(raw.value));
+  } catch {
+    return undefined;
+  }
+  const handle = firstStr(rec?.terminalHandle);
+  const status = firstStr(rec?.status);
+  if (rec === undefined || rec.runId !== state.runId || handle === undefined || status === undefined || status === 'retired') {
+    return undefined;
+  }
+  const pausedCode = firstStr(asRec(rec.paused)?.code);
+  return {
+    terminalHandle: handle,
+    dispatchId: firstStr(rec.dispatchId) ?? null,
+    startupStatus: status,
+    ...(pausedCode !== undefined ? { pausedCode } : {}),
+  };
+}
+
+// ─── council cleanup ─────────────────────────────────────────────────────────
+
+async function cmdCleanup(argv: readonly string[]): Promise<{ payload: Record<string, unknown>; human: string }> {
+  const v = parseFlags('cleanup', argv, { run: { type: 'string' } });
+  const runDir = reqStr(v, 'run', '--run <runDir>');
+  const { store, engine } = makeEngine(runDir);
+  const state = await loadRun(store);
+  if (state.status !== 'reported' && state.status !== 'failed' && state.status !== 'cancelled') {
+    fail(
+      'invalid_transition',
+      `council cleanup only runs on a terminal run (status ${state.status}) — its terminals may still be in use; finish or \`council cancel\` the run first`,
+    );
+  }
+  if (engine.cleanup === undefined) fail('unsupported', 'engine has no cleanup support');
+  const supervisor = await supervisorCleanupCustody(store, state);
+  const caller = process.env.ORCA_TERMINAL_HANDLE;
+  const report = unwrap(
+    await engine.cleanup({
+      ...(supervisor !== undefined ? { supervisor } : {}),
+      ...(caller !== undefined ? { callerHandle: caller } : {}),
+    }),
+  );
+  const count = (o: string) => report.terminals.filter((t) => t.outcome === o).length;
+  const summary = {
+    closed: count('closed'),
+    alreadyGone: count('already_gone'),
+    skipped: count('skipped'),
+    failed: count('failed'),
+  };
+  return {
+    payload: {
+      runId: state.runId,
+      status: report.status,
+      terminals: report.terminals,
+      summary,
+      note: 'only terminals this run created and journaled are considered; nothing else is ever closed',
+    },
+    human: [
+      `cleanup ${state.runId} (${report.status}): ${summary.closed} closed, ${summary.alreadyGone} already gone, ${summary.skipped} skipped, ${summary.failed} failed`,
+      ...report.terminals.map(
+        (t) => `  ${t.outcome.padEnd(12)} ${t.terminalHandle} (${t.owner}${t.participantId !== undefined ? ` ${t.participantId}` : ''})${t.reason !== undefined ? ` — ${t.reason}` : ''}${t.code !== undefined ? ` [${t.code}]` : ''}${t.retriedIntent === true ? ' (retried an unreceipted close intent)' : ''}`,
+      ),
     ].join('\n'),
   };
 }
@@ -3910,6 +4025,7 @@ const COMMANDS: Record<
   approve: cmdApprove,
   status: cmdStatus,
   cancel: cmdCancel,
+  cleanup: cmdCleanup,
   tail: cmdTail,
   verify: cmdVerify,
   'start-supervisor': cmdStartSupervisor,
@@ -3963,6 +4079,11 @@ commands:
                                     integrity (legacy runs report legacy/
                                     untracked, never a false verified)
   cancel    --run <runDir> [--reason <text>]   guarded stop of live workers
+  cleanup   --run <runDir>          terminal runs only: release-then-close the
+                                    terminals this run created and journaled
+                                    (participants + supervisor) whose dispatch
+                                    is settled/fenced/never issued; reports
+                                    closed / already gone / skipped / failed
   doctor    [--config <file> | --run <runDir>]
             host check (node/orca) + informational catalog-lane presence;
             with a selection, only the chosen staff's binaries gate readiness

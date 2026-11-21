@@ -2681,3 +2681,195 @@ describe('OrcaAdapter submission check + single bare Enter', () => {
   });
 });
 
+describe('pre-dispatch evidence and terminal close', () => {
+  const custody = () => {
+    const order: string[] = [];
+    const receipts: Record<string, unknown>[] = [];
+    return {
+      order,
+      receipts,
+      hooks: {
+        beforeTerminalCreate: async () => {
+          order.push('intent');
+          return { ok: true as const, value: undefined };
+        },
+        afterTerminalCreate: async (r: never) => {
+          order.push('receipt');
+          receipts.push(r as Record<string, unknown>);
+          return { ok: true as const, value: undefined };
+        },
+        beforeWorkerStart: async (m: never) => {
+          order.push(`marker:${(m as { terminalHandle: string }).terminalHandle}`);
+          return { ok: true as const, value: undefined };
+        },
+      },
+    };
+  };
+  const lane = (over: Record<string, (args: readonly string[]) => ProcessResult> = {}) => (args: readonly string[]): ProcessResult => {
+    const cmd = args[1]!;
+    if (over[cmd] !== undefined) return over[cmd]!(args);
+    if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } }, 'rcpt-tc-1');
+    if (cmd === 'wait') return okEnv({ wait: { satisfied: true } });
+    if (cmd === 'show') return okTerm(readyTerm('term_new1'));
+    if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1' }, 'req-ws-1');
+    if (cmd === 'worker-keep-open') return okMut({ kept: true }, 'req-ko-1');
+    return failEnv('unexpected_command', cmd);
+  };
+
+  it('readiness wait failure: unknown, but proven pre-dispatch (no worker-start ever issued)', async () => {
+    const c = custody();
+    const { adapter, calls } = makeAdapter(lane({ wait: () => failEnv('timeout', 'wait timed out') }));
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown', 'still not a definite failure on its own');
+    assert.equal(res.value.workerStartIssued, false);
+    assert.equal(res.value.terminalCreated, true);
+    assert.equal(res.value.failedStage, 'readiness_wait');
+    assert.equal(res.value.terminalHandle, 'term_new1');
+    assert.match(res.value.detail ?? '', /readiness_wait_failed/);
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+    assert.deepEqual(c.order, ['intent', 'receipt'], 'no marker: worker-start was never reached');
+  });
+
+  it('terminalReady refusal (agent not recognized) is also proven pre-dispatch', async () => {
+    const { adapter, calls } = makeAdapter(lane({ show: () => okTerm(readyTermWith('term_new1', { agentIdentity: null })) }));
+    const res = await adapter.launchWorker(launchSpec({ custody: custody().hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.workerStartIssued, false);
+    assert.equal(res.value.terminalCreated, true);
+    assert.equal(res.value.failedStage, 'readiness');
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('an uncertain worker-start never claims pre-dispatch', async () => {
+    const c = custody();
+    const { adapter } = makeAdapter(lane({ 'worker-start': () => failEnv('outcome_unknown', 'lost reply') }));
+    const res = await adapter.launchWorker(launchSpec({ custody: c.hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.workerStartIssued, undefined, 'worker-start may have landed');
+    assert.equal(res.value.terminalCreated, true);
+    assert.deepEqual(c.order, ['intent', 'receipt', 'marker:term_new1'], 'marker journaled before worker-start');
+  });
+
+  it('the dispatch marker runs immediately before worker-start; the receipt promises it only when the hook exists', async () => {
+    const order: string[] = [];
+    const c = custody();
+    const wrapped = {
+      ...c.hooks,
+      beforeWorkerStart: async (m: never) => {
+        order.push('marker');
+        return c.hooks.beforeWorkerStart(m);
+      },
+    };
+    const { adapter, calls } = makeAdapter((args) => {
+      if (args[1] === 'worker-start') order.push('worker-start');
+      return lane()(args);
+    });
+    const res = await adapter.launchWorker(launchSpec({ custody: wrapped }));
+    assert.ok(res.ok && res.value.outcome === 'started');
+    assert.deepEqual(order, ['marker', 'worker-start']);
+    assert.equal(c.receipts[0]?.dispatchMarker, true);
+    assert.ok(calls.some((a) => a[1] === 'worker-start'));
+    // Legacy custody (no marker hook): the receipt makes no marker promise.
+    const legacy = custody();
+    const { beforeWorkerStart: _drop, ...noMarker } = legacy.hooks;
+    void _drop;
+    const { adapter: a2 } = makeAdapter(lane());
+    const r2 = await a2.launchWorker(launchSpec({ custody: noMarker }));
+    assert.ok(r2.ok && r2.value.outcome === 'started');
+    assert.equal(legacy.receipts[0]?.dispatchMarker, undefined);
+  });
+
+  it('a marker journal failure aborts BEFORE worker-start — failed, proven pre-dispatch', async () => {
+    const c = custody();
+    const hooks = { ...c.hooks, beforeWorkerStart: async () => ({ ok: false as const, error: { code: 'io_error' as const, message: 'disk full' } }) };
+    const { adapter, calls } = makeAdapter(lane());
+    const res = await adapter.launchWorker(launchSpec({ custody: hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'failed');
+    assert.equal(res.value.failedStage, 'custody_dispatch_marker');
+    assert.equal(res.value.workerStartIssued, false);
+    assert.equal(res.value.terminalCreated, true);
+    assert.ok(calls.every((a) => a[1] !== 'worker-start'));
+  });
+
+  it('a retained-terminal readiness problem is never reported as a terminal this launch created', async () => {
+    const { adapter } = makeAdapter((args) => {
+      if (args[1] === 'worker-list') return okEnv({ workers: [], page: { hasMore: false } });
+      if (args[1] === 'show') return okTerm(readyTermWith('term_keep', { agentWait: { kind: 'menu' } }));
+      return failEnv('unexpected_command', String(args[1]));
+    });
+    const res = await adapter.launchWorker(launchSpec({ reuseTerminal: 'term_keep', custody: custody().hooks }));
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'unknown');
+    assert.equal(res.value.terminalCreated, undefined);
+  });
+
+  it('closeTerminal: live terminal → exact `terminal close --terminal <h> --json`, reported closed', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'show'
+        ? okTerm(readyTerm('term_x'))
+        : args[1] === 'close'
+          ? okTerm({ close: { handle: 'term_x', tabId: 't1', ptyKilled: true } }, 'rcpt-close-1')
+          : failEnv('unexpected_command', String(args[1])),
+    );
+    const res = await adapter.closeTerminal!({ terminalHandle: 'term_x' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.outcome, 'closed');
+    assert.equal(res.value.detail, 'ptyKilled=true');
+    assert.equal(res.value.requestId, 'rcpt-close-1');
+    assert.deepEqual(calls, [
+      ['terminal', 'show', '--terminal', 'term_x', '--json'],
+      ['terminal', 'close', '--terminal', 'term_x', '--json'],
+    ]);
+  });
+
+  it('closeTerminal: stale handle or an exited record is already gone — nothing is closed', async () => {
+    const stale = makeAdapter(() => failEnv('terminal_handle_stale', 'terminal_handle_stale'));
+    const r1 = await stale.adapter.closeTerminal!({ terminalHandle: 'term_gone' });
+    assert.ok(r1.ok && r1.value.outcome === 'already_gone' && r1.value.code === 'terminal_handle_stale');
+    assert.deepEqual(stale.calls.map((a) => a[1]), ['show']);
+    // Shape verified live 1.4.261 after `terminal close`: orphaned, disconnected, exitCause.
+    const exited = makeAdapter(() =>
+      okTerm({ terminal: { handle: 'term_done', connected: false, orphaned: true, exitCause: { kind: 'operator_close' }, agentIdentity: 'devin' } }),
+    );
+    const r2 = await exited.adapter.closeTerminal!({ terminalHandle: 'term_done' });
+    assert.ok(r2.ok && r2.value.outcome === 'already_gone');
+    assert.match(r2.value.detail ?? '', /operator_close/);
+    assert.deepEqual(exited.calls.map((a) => a[1]), ['show']);
+    const closeStale = makeAdapter((args) => (args[1] === 'show' ? okTerm(readyTerm('term_y')) : failEnv('terminal_handle_stale', 'terminal_handle_stale')));
+    const r3 = await closeStale.adapter.closeTerminal!({ terminalHandle: 'term_y' });
+    assert.ok(r3.ok && r3.value.outcome === 'already_gone');
+  });
+
+  it('closeTerminal: other failures are reported failed with the code, never retried; unsafe handles never spawn', async () => {
+    const { adapter, calls } = makeAdapter((args) => (args[1] === 'show' ? okTerm(readyTerm('term_z')) : failEnv('runtime_unavailable', 'busy')));
+    const r = await adapter.closeTerminal!({ terminalHandle: 'term_z' });
+    assert.ok(r.ok && r.value.outcome === 'failed' && r.value.code === 'runtime_unavailable');
+    assert.equal(calls.filter((a) => a[1] === 'close').length, 1);
+    const bad = makeAdapter(() => okEnv({}));
+    const rb = await bad.adapter.closeTerminal!({ terminalHandle: 'term_1 && taskkill' });
+    assert.equal(rb.ok, false);
+    assert.equal(bad.calls.length, 0);
+  });
+
+  it('releaseWorker echoes the host state so callers can see retained', async () => {
+    const { adapter } = makeAdapter(() =>
+      okMut({ dispatchId: 'ctx_c1', state: 'retained', reason: 'user_requested', processAction: 'none', archive: null }, 'req-rel-1'),
+    );
+    const res = await adapter.releaseWorker({ dispatchId: 'ctx_c1' });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.value.released, false);
+    assert.equal(res.value.state, 'retained');
+  });
+});
+
