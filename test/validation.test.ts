@@ -550,6 +550,28 @@ test('parseJournalEvent accepts a valid event and rejects bad type', () => {
   assert.ok(hasCode(parseJournalEvent({ ...good, type: 'made.up' }), 'bad_enum'));
 });
 
+test('parseJournalEvent accepts the additive submission-check events; legacy events still parse', () => {
+  const at = { seq: 3, ts: '2026-11-21T00:00:00Z', actor: 'engine' };
+  for (const [type, payload] of [
+    ['launch.submit_check', { attemptId: 'att_organiser_organiser_r0_0', terminalHandle: 'term_1', check: 1, state: 'unsubmitted', evidence: 'input_holds_brief_idle' }],
+    ['launch.submit_nudge', { attemptId: 'att_organiser_organiser_r0_0', terminalHandle: 'term_1', stage: 'intent', nudgeId: 'sn_1' }],
+    ['launch.submit_nudge', { scope: 'supervisor', terminalHandle: 'term_1', stage: 'receipt', nudgeId: 'sn_1', outcome: 'sent' }],
+    ['launch.submit_unconfirmed', { scope: 'supervisor', terminalHandle: 'term_1', reason: 'first_check_inconclusive', state: 'inconclusive', evidence: 'screen_unreadable' }],
+  ] as const) {
+    const r = parseJournalEvent({ ...at, type, payload });
+    assert.ok(r.ok, `${type}: ${issues(r)}`);
+    assert.equal(r.value.type, type);
+  }
+  // A pre-change journal (no submission events) parses event by event exactly as before.
+  const legacy = [
+    { seq: 1, ts: '2026-11-19T00:00:00Z', type: 'run.initialized', actor: 'engine', payload: { runId: RUN } },
+    { seq: 2, ts: '2026-11-19T00:00:01Z', type: 'launch.intent', actor: 'engine', payload: { attemptId: 'a', v: 2 } },
+    { seq: 3, ts: '2026-11-19T00:00:02Z', type: 'worker.started', actor: 'engine', payload: { attemptId: 'a', taskId: 't' } },
+    { seq: 4, ts: '2026-11-19T00:00:03Z', type: 'supervisor.retired', actor: 'orchestrator' },
+  ];
+  for (const e of legacy) assert.ok(parseJournalEvent(e).ok, JSON.stringify(e));
+});
+
 test('parseScribeNotesFile and parseReportFile validate structure', () => {
   const notes = { schemaVersion: 1, runId: RUN, participantId: 'scribe0', claimSummaries: [{ claimId: 'c1', summary: 's', possibleDuplicates: [], openQuestions: [] }] };
   assert.ok(parseScribeNotesFile(notes, { runId: RUN, participantId: 'scribe0' }).ok);

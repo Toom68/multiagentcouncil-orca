@@ -3280,3 +3280,244 @@ test('real store init → start-supervisor → supervise --advance never hits in
   // Fake-host note: any later failure here is scenario-shaped, not the bug.
   void log;
 });
+
+// ─── first-turn submission check on the supervisor launch path ──────────────
+
+const SUP_RULE = '─'.repeat(60);
+/** Exact live tail of a stuck first-turn Devin (2026-11-21). */
+const SUP_STUCK = [
+  `${SUP_RULE} (bypass permissions on) ─`,
+  '❭ Please carry out this task from my Orca coordinator by following the brief I pasted below.',
+  '  [Pasted text #1 +297 lines]',
+  SUP_RULE,
+  'SWE-2 Max                                    ctrl+v to paste image in clipboard',
+  'Update v3000.14.30821 available!',
+];
+const SUP_WORKING = [
+  '⣠ Running tools · 12s (esc twice to interrupt)',
+  `${SUP_RULE} (bypass permissions on) ─`,
+  '❭ Guide Devin while it works',
+  SUP_RULE,
+];
+const screenEnv = (tail: string[]) => ({ ok: true, result: { terminal: { handle: 'term_newsup', status: 'running', source: 'screen', tail } } });
+const supShow = (title: string) => ({ ok: true, result: { terminal: { handle: 'term_newsup', title, connected: true, agentIdentity: 'devin', agentWait: null } } });
+/** worker-start receipt exactly as Orca returned it for a Devin supervisor (input_accepted only). */
+const DEVIN_WS_RECEIPT = {
+  ok: true,
+  result: {
+    state: 'ready',
+    dispatchId: 'ctx_newsup',
+    taskId: 'task_sup',
+    stage: 'input_accepted',
+    turnStart: 'unsupported',
+    prompt: { stages: ['input_accepted'], provider: 'unsupported', observation: 'unsupported' },
+  },
+};
+function supervisorScenario(extra: Record<string, unknown[]>): Record<string, unknown[]> {
+  return {
+    'orchestration run-current': [{ ok: true, result: { runId: 'run_caller' } }],
+    'orchestration task-create': [{ ok: true, result: { task: { id: 'task_sup' } } }],
+    'terminal create': [{ ok: true, result: { terminal: { handle: 'term_newsup' } } }],
+    'terminal wait': [{ ok: true, result: {} }],
+    'orchestration worker-start': [DEVIN_WS_RECEIPT],
+    ...extra,
+  };
+}
+const submitJournal = (runDir: string) =>
+  readFileSync(path.join(runDir, 'events.jsonl'), 'utf8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { type: string; payload?: Record<string, unknown> })
+    .filter((e) => e.type.startsWith('launch.submit'));
+
+test('start-supervisor: an unsubmitted first-turn brief gets exactly one bare Enter, then is confirmed started', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-submit');
+  const { env, log } = fakeOrca(
+    dir,
+    supervisorScenario({
+      'terminal show': [supShow('Devin ready'), supShow('Devin ready'), supShow('Devin ready'), supShow('Devin ready'), supShow('⠴ Devin')],
+      'terminal read': [screenEnv(SUP_STUCK), screenEnv(SUP_STUCK), screenEnv(SUP_STUCK), screenEnv(SUP_WORKING)],
+      'terminal send': [{ ok: true, id: 'send-rcpt-1', result: { send: { handle: 'term_newsup', accepted: true, bytesWritten: 1 } } }],
+    }),
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], { ...env, COUNCIL_SUBMIT_PROBE_MS: '3000' });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const sub = r.body.submission as Record<string, unknown>;
+  assert.equal(sub.state, 'started');
+  assert.equal(sub.nudged, true);
+  assert.equal(sub.nudgeOutcome, 'sent');
+  assert.equal(sub.turnStart, 'unsupported');
+  const calls = orcaCalls(log);
+  const sends = calls.filter((a) => a.slice(0, 2).join(' ') === 'terminal send');
+  assert.equal(sends.length, 1, 'exactly one nudge');
+  assert.deepEqual(sends[0], ['terminal', 'send', '--terminal', 'term_newsup', '--text', '\r', '--json']);
+  const wsAt = calls.findIndex((a) => a.slice(0, 2).join(' ') === 'orchestration worker-start');
+  const sendAt = calls.findIndex((a) => a.slice(0, 2).join(' ') === 'terminal send');
+  assert.ok(wsAt >= 0 && sendAt > wsAt, 'the nudge follows the dispatch');
+  // Only documented read commands probe; nothing else is ever typed.
+  for (const a of calls.slice(wsAt + 1)) {
+    const head = a.slice(0, 2).join(' ');
+    assert.ok(['terminal show', 'terminal read', 'orchestration worker-show', 'terminal send'].includes(head), head);
+  }
+  const ev = submitJournal(f.runDir).map((e) => [e.type, e.payload?.stage ?? e.payload?.state, e.payload?.scope]);
+  assert.deepEqual(ev, [
+    ['launch.submit_check', 'unsubmitted', 'supervisor'],
+    ['launch.submit_nudge', 'intent', 'supervisor'],
+    ['launch.submit_nudge', 'receipt', 'supervisor'],
+    ['launch.submit_check', 'started', 'supervisor'],
+  ]);
+  assert.equal(readState(f.runDir).supervisor?.dispatchId, 'ctx_newsup');
+});
+
+test('start-supervisor: an inconclusive check is a visible warning with the manual command — no nudge, launch still succeeds', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-submit-inconclusive');
+  const odd = [`${SUP_RULE} (bypass permissions on) ─`, '❭ something unexpected', SUP_RULE];
+  const { env, log } = fakeOrca(
+    dir,
+    supervisorScenario({
+      'terminal show': [supShow('Devin ready')],
+      'terminal read': Array.from({ length: 20 }, () => screenEnv(odd)),
+    }),
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], { ...env, COUNCIL_SUBMIT_PROBE_MS: '1200' });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.body.outcome, 'launched');
+  const sub = r.body.submission as Record<string, unknown>;
+  assert.equal(sub.state, 'inconclusive');
+  assert.equal(sub.warning, 'first_check_inconclusive');
+  assert.equal(sub.command, "orca terminal send --terminal term_newsup --text $'\\r'");
+  assert.equal(hasCall(log, 'terminal send'), false, 'never nudged on an inconclusive check');
+  const warn = submitJournal(f.runDir).filter((e) => e.type === 'launch.submit_unconfirmed');
+  assert.equal(warn.length, 1);
+  assert.equal(warn[0]!.payload?.terminalHandle, 'term_newsup');
+
+  // council status keeps the warning visible with the exact manual command.
+  const st = await cliJson(['status', '--run', f.runDir, '--json'], { ...env, COUNCIL_SUBMIT_PROBE_MS: '1200' });
+  assert.equal(st.code, 0, st.stdout + st.stderr);
+  const submission = st.body.submission as Record<string, unknown>[];
+  assert.equal(submission.length, 1);
+  assert.equal(submission[0]!.scope, 'supervisor');
+  assert.equal(submission[0]!.reason, 'first_check_inconclusive');
+  const actions = st.body.pendingActions as { kind: string; command?: string }[];
+  const act = actions.find((a) => a.kind === 'submit');
+  assert.ok(act !== undefined, JSON.stringify(actions));
+  assert.equal(act.command, "orca terminal send --terminal term_newsup --text $'\\r'");
+  assert.equal(hasCall(log, 'terminal send'), false, 'status is read-only');
+
+  // A later engine step proves the supervisor advanced the run — the warning retires.
+  const store = createStore({ runDir: f.runDir });
+  assert.ok((await store.appendJournal([{ ts: new Date().toISOString(), type: 'phase.entered', actor: 'engine', payload: { status: 'organising' } }])).ok);
+  const st2 = await cliJson(['status', '--run', f.runDir, '--json'], { ...env, COUNCIL_SUBMIT_PROBE_MS: '1200' });
+  assert.equal((st2.body.submission as unknown[]).length, 0);
+});
+
+test('start-supervisor: a receipt with observed (or absent) turn start skips the check entirely', async () => {
+  const f = await initRun();
+  const dir = tmp('sup-submit-observed');
+  const { env, log } = fakeOrca(
+    dir,
+    supervisorScenario({
+      'terminal show': [supShow('Devin ready')],
+      'orchestration worker-start': [{ ok: true, result: { dispatchId: 'ctx_newsup', turnStart: 'observed' } }],
+    }),
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], env);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal('submission' in r.body, false);
+  assert.equal(hasCall(log, 'terminal read'), false);
+  assert.equal(hasCall(log, 'terminal send'), false);
+  assert.equal(submitJournal(f.runDir).length, 0);
+});
+
+test('status surfaces a crash-orphaned nudge intent (no receipt) for an active attempt, never for settled ones', async () => {
+  const f = await initRun({ perspectives: 10, participants: 2 });
+  const store = createStore({ runDir: f.runDir });
+  const mk = (attemptId: string, status: string, handle: string) => ({
+    attemptId,
+    participantId: attemptId.includes('rev-1') ? 'rev-1' : 'rev-2',
+    phase: 'independent_review',
+    round: null,
+    taskId: 'task_x',
+    dispatchId: 'ctx_x',
+    terminalHandle: handle,
+    launchIntentId: 'li_x',
+    status,
+    createdAt: new Date().toISOString(),
+    artifacts: [],
+  });
+  const w = await store.withLock(async () => {
+    const st = await store.loadState();
+    if (!st.ok) return st;
+    const s = st.value;
+    s.status = 'independent_review';
+    s.orcaRunId = 'run_child';
+    s.participants = (['rev-1', 'rev-2'] as const).map((pid, i) => ({
+      participantId: pid,
+      role: 'reviewer' as const,
+      seatId: `seat-${i + 1}`,
+      perspectiveId: `p${i + 1}`,
+      agent: { agent: 'devin', model: 'swe-2-max', permissionMode: 'bypass' },
+      retainedTerminal: null,
+      status: 'active' as const,
+      attempts: [
+        mk(`att_${pid}_independent_review_r0_0`, pid === 'rev-1' ? 'dispatched' : 'settled_ok', `term_${pid}`),
+      ] as never,
+    }));
+    const saved = await store.saveState(s);
+    if (!saved.ok) return saved;
+    return store.appendJournal(
+      (['rev-1', 'rev-2'] as const).map((pid) => ({
+        ts: new Date().toISOString(),
+        type: 'launch.submit_nudge' as const,
+        actor: 'engine',
+        participantId: pid,
+        phase: 'independent_review' as const,
+        payload: { attemptId: `att_${pid}_independent_review_r0_0`, terminalHandle: `term_${pid}`, stage: 'intent', nudgeId: `sn_${pid}` },
+      })),
+    );
+  });
+  assert.ok(w.ok, JSON.stringify(w));
+  const st = await cliJson(['status', '--run', f.runDir, '--json'], f.env);
+  assert.equal(st.code, 0, st.stdout + st.stderr);
+  const submission = st.body.submission as Record<string, unknown>[];
+  assert.equal(submission.length, 1, JSON.stringify(submission));
+  assert.equal(submission[0]!.attemptId, 'att_rev-1_independent_review_r0_0');
+  assert.equal(submission[0]!.reason, 'nudge_receipt_missing');
+  assert.equal(submission[0]!.command, "orca terminal send --terminal term_rev-1 --text $'\\r'");
+  const actions = st.body.pendingActions as { kind: string; command?: string; detail: string }[];
+  assert.ok(actions.some((a) => a.kind === 'submit' && a.command === submission[0]!.command && a.detail.includes('rev-1')));
+  const human = await cli(['status', '--run', f.runDir], f.env);
+  assert.match(human.stdout, /\[submit\]/);
+  assert.match(human.stdout, /orca terminal send --terminal term_rev-1 --text \$'\\r'/);
+});
+
+test('start-supervisor: a journaled supervisor nudge intent forbids another nudge on that terminal', async () => {
+  const f = await initRun();
+  const store = createStore({ runDir: f.runDir });
+  assert.ok((await store.appendJournal([{
+    ts: new Date().toISOString(),
+    type: 'launch.submit_nudge',
+    actor: 'orchestrator',
+    payload: { scope: 'supervisor', terminalHandle: 'term_newsup', dispatchId: 'ctx_old', stage: 'intent', nudgeId: 'sn_old' },
+  }])).ok);
+  const dir = tmp('sup-submit-guard');
+  const { env, log } = fakeOrca(
+    dir,
+    supervisorScenario({
+      'terminal show': [supShow('Devin ready')],
+      'terminal read': Array.from({ length: 6 }, () => screenEnv(SUP_STUCK)),
+    }),
+    'term_primary',
+  );
+  const r = await cliJson(['start-supervisor', '--run', f.runDir, '--wait-ms', '1000', '--json'], { ...env, COUNCIL_SUBMIT_PROBE_MS: '3000' });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const sub = r.body.submission as Record<string, unknown>;
+  assert.equal(sub.state, 'unsubmitted');
+  assert.equal(sub.warning, 'nudge_already_attempted');
+  assert.equal(hasCall(log, 'terminal send'), false, 'at most one nudge per terminal, even across runs of the command');
+});

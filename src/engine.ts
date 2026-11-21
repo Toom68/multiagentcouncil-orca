@@ -235,6 +235,12 @@ interface StepCtx {
   /** Journaled terminal identities retained per attempt (pre-attach custody). */
   terminalCustody: Map<AttemptId, { handle: string; requestId?: string }>;
   /**
+   * Attempts with a journaled first-turn bare-Enter nudge intent (durable).
+   * At most one nudge per attempt: an intent — receipted or not — forbids
+   * another; an unreceipted one is surfaced, never retried.
+   */
+  submitNudgeIntents: Set<AttemptId>;
+  /**
    * Launch-protocol version per attempt (max `v` on attempt-level
    * launch.intent events). v≥2 intents participate in the stage-marker
    * scheme; absent/lower means the attempt was journaled by a runner without
@@ -1322,6 +1328,88 @@ export function createEngine(deps: EngineDeps): Engine {
   };
 
   /**
+   * Bounded first-turn submission check after a FRESH launch whose
+   * worker-start receipt did not observe turn start (Devin reports only
+   * input_accepted). Only `unsubmitted` earns the single journaled
+   * bare-Enter nudge; anything unresolved becomes a visible
+   * launch.submit_unconfirmed warning — never a block or a failure.
+   */
+  const checkFirstTurnSubmission = async (
+    ctx: StepCtx,
+    p: Participant,
+    attempt: PhaseAttempt,
+    launch: { terminalHandle?: string; dispatchId?: string; turnStart?: string },
+  ): Promise<void> => {
+    const handle = launch.terminalHandle;
+    const probeFn = host.probeSubmission?.bind(host);
+    if (probeFn === undefined || handle === undefined || launch.turnStart === undefined || launch.turnStart === 'observed') {
+      return;
+    }
+    const where = { participantId: p.participantId, phase: attempt.phase };
+    const base = {
+      attemptId: attempt.attemptId,
+      terminalHandle: handle,
+      ...(launch.dispatchId !== undefined ? { dispatchId: launch.dispatchId } : {}),
+    };
+    const probe = async (check: number): Promise<{ state: string; evidence: string }> => {
+      const r = await probeFn({
+        terminalHandle: handle,
+        ...(launch.dispatchId !== undefined ? { dispatchId: launch.dispatchId } : {}),
+      });
+      const v = r.ok
+        ? r.value
+        : { state: 'inconclusive' as const, evidence: `probe_error:${r.error.code}`, samples: 0, elapsedMs: 0 };
+      emit(ctx, 'launch.submit_check', {
+        ...base,
+        check,
+        turnStart: launch.turnStart,
+        state: v.state,
+        evidence: v.evidence,
+        samples: v.samples,
+        elapsedMs: v.elapsedMs,
+        ...(r.ok && r.value.signals !== undefined ? { signals: r.value.signals } : {}),
+      }, where);
+      return v;
+    };
+    const warn = (reason: string, v: { state: string; evidence: string }): void => {
+      emit(ctx, 'launch.submit_unconfirmed', { ...base, reason, state: v.state, evidence: v.evidence }, where);
+    };
+
+    const first = await probe(1);
+    if (first.state === 'started') {
+      await flush(ctx);
+      return;
+    }
+    if (first.state !== 'unsubmitted') warn('first_check_inconclusive', first);
+    else if (ctx.submitNudgeIntents.has(attempt.attemptId)) warn('nudge_already_attempted', first);
+    else if (host.submitPendingInput === undefined) warn('nudge_unsupported', first);
+    else {
+      const nudgeId = `sn_${crypto.randomUUID().slice(0, 12)}`;
+      emit(ctx, 'launch.submit_nudge', { ...base, stage: 'intent', nudgeId }, where);
+      const fi = await flush(ctx);
+      if (!fi.ok) {
+        warn('nudge_intent_unjournaled', first);
+        return;
+      }
+      ctx.submitNudgeIntents.add(attempt.attemptId);
+      const sent = await host.submitPendingInput({ terminalHandle: handle });
+      emit(ctx, 'launch.submit_nudge', {
+        ...base,
+        stage: 'receipt',
+        nudgeId,
+        outcome: sent.ok ? sent.value.outcome : 'error',
+        ...(sent.ok && sent.value.requestId !== undefined ? { requestId: sent.value.requestId } : {}),
+        ...(sent.ok
+          ? sent.value.detail !== undefined ? { detail: sent.value.detail.slice(0, 512) } : {}
+          : { detail: sent.error.message.slice(0, 512) }),
+      }, where);
+      const second = await probe(2);
+      if (second.state !== 'started') warn('still_unconfirmed_after_nudge', second);
+    }
+    await flush(ctx);
+  };
+
+  /**
    * Persist intent → write spec → createTask (resumed when taskId already
    * exists) → launchWorker. Fresh Task per phase; reuseTerminal only when the
    * participant's previous dispatch is proven settled. An 'intent_recorded'
@@ -1614,6 +1702,7 @@ export function createEngine(deps: EngineDeps): Engine {
       }, { participantId: p.participantId, phase: attempt.phase });
       const f2 = await flush(ctx);
       if (!f2.ok) return { kind: 'task_error', error: f2.error };
+      if (reuse === undefined) await checkFirstTurnSubmission(ctx, p, attempt, res);
       return { kind: 'launched' };
     }
     if (res.outcome === 'unknown') {
@@ -3222,17 +3311,16 @@ export function createEngine(deps: EngineDeps): Engine {
     const note = await host.sendNotification(input);
     // Host diagnostics: an uncertain send carries the Orca error code and a
     // bounded message on its 'unknown' receipt; a failure carries them on the error.
-    const diag: { outcome?: string; errorCode?: unknown; error?: unknown } = note.ok
-      ? note.value
-      : { errorCode: note.error.details?.adapterCode ?? note.error.code, error: note.error.message };
+    const errorCode: unknown = note.ok ? note.value.errorCode : note.error.details?.adapterCode ?? note.error.code;
+    const errorText: unknown = note.ok ? note.value.error : note.error.message;
     emit(ctx, 'mail.sent', {
       to: input.to,
       outcome: note.ok ? note.value.outcome : 'error',
       mailIntentId,
       ...(note.ok && note.value.requestId !== undefined ? { requestId: note.value.requestId } : {}),
       ...(note.ok && note.value.messageId !== undefined ? { messageId: note.value.messageId } : {}),
-      ...(typeof diag.errorCode === 'string' ? { errorCode: diag.errorCode.slice(0, 128) } : {}),
-      ...(typeof diag.error === 'string' ? { error: diag.error.slice(0, 512) } : {}),
+      ...(typeof errorCode === 'string' ? { errorCode: errorCode.slice(0, 128) } : {}),
+      ...(typeof errorText === 'string' ? { error: errorText.slice(0, 512) } : {}),
       kind,
     });
     if (note.ok && note.value.outcome === 'sent') ctx.state.consumption.mailSent += 1;
@@ -3520,6 +3608,7 @@ export function createEngine(deps: EngineDeps): Engine {
       workerLaunchStage: new Map(),
       terminalCreateStage: new Map(),
       terminalCustody: new Map(),
+      submitNudgeIntents: new Set(),
       intentProtocol: new Map(),
       integrity: 'legacy',
       receipts: new Map(),
@@ -3722,6 +3811,9 @@ export function createEngine(deps: EngineDeps): Engine {
       }
       if (e.type === 'worker.stop_requested' && typeof e.payload?.attemptId === 'string') {
         ctx.stopRequestedAttempts.add(e.payload.attemptId);
+      }
+      if (e.type === 'launch.submit_nudge' && e.payload?.stage === 'intent' && typeof e.payload?.attemptId === 'string') {
+        ctx.submitNudgeIntents.add(e.payload.attemptId);
       }
       if (e.type === 'worker.released' && typeof e.payload?.dispatchId === 'string') {
         ctx.releaseRequested.add(e.payload.dispatchId);

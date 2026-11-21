@@ -34,6 +34,8 @@ import {
   type SourceSnapshot,
   type StopOutcome,
   type Store,
+  type SubmissionCheck,
+  type SubmitInputResult,
   type TaskListRow,
   type WorkerLaunchSpec,
   type WorkerListRow,
@@ -3116,4 +3118,218 @@ test('clm_0020: rejected organiser output launches the journaled repair attempt,
   // Repair produces a valid proposal → run reaches the approval gate.
   const r2 = await drive(env);
   assert.equal(r2.action, 'needs_approval', JSON.stringify(r2));
+});
+
+// ─── First-turn submission check (Devin: worker-start proves input_accepted only) ──
+
+interface SubmitRig {
+  probes: { terminalHandle: string; dispatchId?: string }[];
+  nudges: string[];
+}
+
+const subCheck = (state: SubmissionCheck['state'], evidence = state === 'unsubmitted' ? 'input_holds_brief_idle' : state === 'started' ? 'title_working' : 'screen_unreadable'): Result<SubmissionCheck> =>
+  ok({ state, evidence, samples: 3, elapsedMs: 10 });
+
+/** Launches report `turnStart` like the live receipts; the host gains the optional check methods. */
+function rigSubmission(
+  env: Env,
+  opts: {
+    turnStart?: string;
+    probe?: (n: number) => Result<SubmissionCheck>;
+    nudge?: () => Promise<Result<SubmitInputResult>>;
+  },
+): SubmitRig {
+  const rig: SubmitRig = { probes: [], nudges: [] };
+  let seq = 0;
+  env.host.launchImpl = (spec) => {
+    seq += 1;
+    return ok({
+      outcome: 'started' as const,
+      dispatchId: `disp_${seq}`,
+      terminalHandle: spec.reuseTerminal ?? `term_${seq}`,
+      requestId: `req_${seq}`,
+      ...(opts.turnStart !== undefined ? { turnStart: opts.turnStart } : {}),
+    });
+  };
+  Object.assign(env.host, {
+    probeSubmission: async (i: { terminalHandle: string; dispatchId?: string }) => {
+      rig.probes.push(i);
+      return opts.probe?.(rig.probes.length) ?? subCheck('started');
+    },
+    submitPendingInput: async (i: { terminalHandle: string }) => {
+      rig.nudges.push(i.terminalHandle);
+      return opts.nudge !== undefined ? opts.nudge() : ok({ outcome: 'sent' as const, requestId: 'send_rcpt_1' });
+    },
+  });
+  return rig;
+}
+
+async function launchOrganiserOnly(env: Env): Promise<void> {
+  for (let i = 0; i < 6 && env.host.launches.length === 0; i++) {
+    const r = await env.engine.advance();
+    assert.ok(r.ok, JSON.stringify(r));
+  }
+  assert.equal(env.host.launches.length, 1, 'organiser launched');
+}
+
+const submitEvents = (env: Env) => env.db.journal.filter((e) => e.type.startsWith('launch.submit'));
+const ORG_ATTEMPT = 'att_organiser_organiser_r0_0';
+
+test('submission check: an observed turn start or a receipt without turnStart never probes', async () => {
+  for (const turnStart of ['observed', undefined]) {
+    const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+    const rig = rigSubmission(env, { turnStart, probe: () => subCheck('unsubmitted') });
+    await launchOrganiserOnly(env);
+    assert.equal(rig.probes.length, 0, `turnStart=${turnStart}`);
+    assert.equal(rig.nudges.length, 0);
+    assert.equal(submitEvents(env).length, 0);
+  }
+});
+
+test('submission check: started → journaled check, no nudge, no warning', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, { turnStart: 'unsupported' });
+  await launchOrganiserOnly(env);
+  assert.deepEqual(rig.probes, [{ terminalHandle: 'term_1', dispatchId: 'disp_1' }]);
+  assert.equal(rig.nudges.length, 0);
+  const ev = submitEvents(env);
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0]!.type, 'launch.submit_check');
+  assert.equal(ev[0]!.payload?.state, 'started');
+  assert.equal(ev[0]!.payload?.turnStart, 'unsupported');
+  assert.equal(ev[0]!.payload?.attemptId, ORG_ATTEMPT);
+});
+
+test('submission check: unsubmitted → exactly one journaled bare-Enter nudge → started', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  let intentBeforeSend = false;
+  const rig = rigSubmission(env, {
+    turnStart: 'unsupported',
+    probe: (n) => (n === 1 ? subCheck('unsubmitted') : subCheck('started', 'tui_working')),
+    nudge: async () => {
+      // Journal-before-mutation: the intent is durable before the Enter goes out.
+      intentBeforeSend = env.db.journal.some((e) => e.type === 'launch.submit_nudge' && e.payload?.stage === 'intent');
+      return ok({ outcome: 'sent' as const, requestId: 'send_rcpt_1' });
+    },
+  });
+  await launchOrganiserOnly(env);
+  assert.equal(rig.nudges.length, 1);
+  assert.deepEqual(rig.nudges, ['term_1']);
+  assert.ok(intentBeforeSend, 'nudge intent journaled before the send');
+  const ev = submitEvents(env).map((e) => [e.type, e.payload?.stage ?? e.payload?.state]);
+  assert.deepEqual(ev, [
+    ['launch.submit_check', 'unsubmitted'],
+    ['launch.submit_nudge', 'intent'],
+    ['launch.submit_nudge', 'receipt'],
+    ['launch.submit_check', 'started'],
+  ]);
+  const receipt = submitEvents(env).find((e) => e.payload?.stage === 'receipt')!;
+  assert.equal(receipt.payload?.outcome, 'sent');
+  assert.equal(receipt.payload?.nudgeId, submitEvents(env).find((e) => e.payload?.stage === 'intent')!.payload?.nudgeId);
+  // Later advances never re-probe or re-nudge the dispatched attempt.
+  for (let i = 0; i < 3; i++) assert.ok((await env.engine.advance()).ok);
+  assert.equal(rig.probes.length, 2);
+  assert.equal(rig.nudges.length, 1);
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  assert.ok(['dispatched', 'working'].includes(org.attempts[0]!.status), org.attempts[0]!.status);
+});
+
+test('submission check: still unsubmitted after the nudge → visible warning, never a second nudge, never a failure', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, { turnStart: 'unsupported', probe: () => subCheck('unsubmitted') });
+  await launchOrganiserOnly(env);
+  assert.equal(rig.nudges.length, 1);
+  assert.equal(rig.probes.length, 2);
+  const warn = submitEvents(env).filter((e) => e.type === 'launch.submit_unconfirmed');
+  assert.equal(warn.length, 1);
+  assert.equal(warn[0]!.payload?.reason, 'still_unconfirmed_after_nudge');
+  assert.equal(warn[0]!.payload?.terminalHandle, 'term_1');
+  assert.equal(warn[0]!.payload?.evidence, 'input_holds_brief_idle');
+  for (let i = 0; i < 3; i++) {
+    const r = await env.engine.advance();
+    assert.ok(r.ok);
+    assert.notEqual(r.value.action, 'blocked');
+  }
+  assert.equal(rig.nudges.length, 1);
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  assert.ok(['dispatched', 'working'].includes(org.attempts[0]!.status), 'the attempt is not failed — it may genuinely be working');
+  // The run still completes normally once the organiser's output lands.
+  await driveToApproval(env);
+});
+
+test('submission check: inconclusive → warning, no nudge', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, { turnStart: 'unsupported', probe: () => subCheck('inconclusive', 'composer_unfamiliar') });
+  await launchOrganiserOnly(env);
+  assert.equal(rig.probes.length, 1);
+  assert.equal(rig.nudges.length, 0);
+  const warn = submitEvents(env).filter((e) => e.type === 'launch.submit_unconfirmed');
+  assert.equal(warn.length, 1);
+  assert.equal(warn[0]!.payload?.reason, 'first_check_inconclusive');
+  assert.equal(warn[0]!.payload?.evidence, 'composer_unfamiliar');
+});
+
+test('submission check: a failing probe is an inconclusive warning, never a block', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, {
+    turnStart: 'unsupported',
+    probe: () => failRes(err('adapter_error', 'orca unreachable')),
+  });
+  await launchOrganiserOnly(env);
+  assert.equal(rig.nudges.length, 0);
+  const warn = submitEvents(env).find((e) => e.type === 'launch.submit_unconfirmed')!;
+  assert.equal(warn.payload?.evidence, 'probe_error:adapter_error');
+});
+
+test('submission check: crash after the nudge intent → the nudge is never repeated', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, {
+    turnStart: 'unsupported',
+    probe: () => subCheck('unsubmitted'),
+    nudge: async () => {
+      throw new Error('simulated crash between nudge intent and receipt');
+    },
+  });
+  for (let i = 0; i < 6 && env.host.launches.length === 0; i++) await env.engine.advance();
+  assert.equal(rig.nudges.length, 1);
+  const intents = submitEvents(env).filter((e) => e.payload?.stage === 'intent');
+  assert.equal(intents.length, 1, 'intent durable');
+  assert.equal(submitEvents(env).filter((e) => e.payload?.stage === 'receipt').length, 0, 'no receipt');
+  // Restart: a fresh engine over the same durable store.
+  const engine2 = createEngine({ store: env.store, host: env.host, prompts: env.prompts, now: () => new Date(env.clock.t) });
+  for (let i = 0; i < 4; i++) assert.ok((await engine2.advance()).ok);
+  assert.equal(rig.nudges.length, 1, 'never a second nudge after the crash');
+  const org = env.db.state.participants.find((p) => p.participantId === 'organiser')!;
+  assert.ok(['dispatched', 'working'].includes(org.attempts[0]!.status), org.attempts[0]!.status);
+});
+
+test('submission check: a journaled nudge intent forbids any further nudge for that attempt', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  env.db.journal.push({
+    seq: env.db.journal.length + 1,
+    ts: new Date(env.clock.t).toISOString(),
+    type: 'launch.submit_nudge',
+    actor: 'engine',
+    payload: { attemptId: ORG_ATTEMPT, terminalHandle: 'term_prev', stage: 'intent', nudgeId: 'sn_prev' },
+  } as JournalEvent);
+  const rig = rigSubmission(env, { turnStart: 'unsupported', probe: () => subCheck('unsubmitted') });
+  await launchOrganiserOnly(env);
+  assert.equal(rig.nudges.length, 0);
+  const warn = submitEvents(env).find((e) => e.type === 'launch.submit_unconfirmed')!;
+  assert.equal(warn.payload?.reason, 'nudge_already_attempted');
+});
+
+test('submission check: only fresh first-turn launches are probed — retained-terminal follow-ups skip it', async () => {
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }));
+  const rig = rigSubmission(env, { turnStart: 'unsupported' });
+  await driveToApproval(env);
+  await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  const r = await drive(env);
+  assert.equal(r.action, 'finished');
+  const fresh = env.host.launches.filter((l) => l.spec.reuseTerminal === undefined);
+  const reused = env.host.launches.filter((l) => l.spec.reuseTerminal !== undefined);
+  assert.ok(reused.length > 0, 'the lifecycle exercised retained-terminal reuse');
+  assert.equal(rig.probes.length, fresh.length);
+  const probed = new Set(rig.probes.map((p) => p.dispatchId));
+  for (const l of reused) assert.ok(!probed.has(l.result.dispatchId), `reused launch ${l.result.dispatchId} was probed`);
 });

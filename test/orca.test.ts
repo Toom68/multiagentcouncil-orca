@@ -26,7 +26,15 @@ import {
   type SpawnPlan,
 } from '../src/host/process.js';
 import {
+  bareEnterArgv,
   buildAgentCommandText,
+  classifySubmission,
+  manualSubmitCommand,
+  ORCA_DISPATCH_OPENING,
+  receiptTurnStart,
+  runSubmissionProbe,
+  submissionProbeOptionsFromWindow,
+  type SubmissionSample,
   isNoEffectRefusal,
   isUncertainFailure,
   mapLiveness,
@@ -2419,3 +2427,257 @@ describe('mapLiveness', () => {
     assert.equal(mapLiveness({}), 'unverifiable');
   });
 });
+
+// ─── first-turn submission check (Devin: turnStart unsupported) ─────────────
+
+const RULE = '─'.repeat(60) + ' (bypass permissions on) ─';
+const RULE_PLAIN = '─'.repeat(60);
+/** Exact live tail of a stuck first-turn Devin (2026-11-21, TUI idle). */
+const STUCK_OPUS = [
+  '❭ Please carry out this task from my Orca coordinator by following the brief I pasted below.',
+  '  [Pasted text #1 +297 lines]',
+  'Claude Opus 5.5 High',
+  'Update v3000.14.30821 available!',
+];
+const STUCK_SWE = [
+  RULE,
+  '❭ Please carry out this task from my Orca coordinator by following the brief I pasted below.',
+  '  [Pasted text #1 +297 lines]',
+  RULE_PLAIN,
+  'SWE-2 Max                                    ctrl+v to paste image in clipboard',
+  'Update v3000.14.30821 available!',
+];
+/** Live scratch reproduction: an all-pasted brief collapses to the placeholder. */
+const STUCK_PLACEHOLDER_ONLY = [RULE, '❭ [Pasted text #1 +13 lines]', RULE_PLAIN, 'SWE-2 Max', 'Update v3000.14.30821 available!'];
+const IDLE_FINISHED = [RULE, '❭ Ask Devin to build features, fix bugs, or work on your code', RULE_PLAIN, 'SWE-2 Max'];
+/** Live: a submitted brief's history echo above the cleared composer. */
+const HISTORY_THEN_CLEARED = [
+  '❭ Please carry out this task from my Orca coordinator by following the brief I pasted below.',
+  '  End of brief.',
+  ' OK',
+  RULE,
+  '❭ Ask Devin to build features, fix bugs, or work on your code',
+  RULE_PLAIN,
+  'SWE-2 Max',
+];
+
+describe('classifySubmission (pure; exact live TUI strings)', () => {
+  it('stuck pasted brief + idle agent → unsubmitted (both live footers)', () => {
+    for (const screen of [STUCK_OPUS, STUCK_SWE, STUCK_PLACEHOLDER_ONLY]) {
+      assert.deepEqual(classifySubmission({ screen, title: 'Devin ready', agentWait: null }), {
+        state: 'unsubmitted',
+        evidence: 'input_holds_brief_idle',
+      });
+    }
+    // The fresh-terminal title a just-launched Devin can still carry.
+    assert.equal(classifySubmission({ screen: STUCK_SWE, title: 'C:\WINDOWS\system32\cmd.exe' }).state, 'unsubmitted');
+  });
+
+  it('working indicators → started (host activity, spinner title, TUI lines)', () => {
+    assert.deepEqual(classifySubmission({ activity: 'working' }), { state: 'started', evidence: 'host_activity_working' });
+    assert.deepEqual(classifySubmission({ title: '⠴ Devin' }), { state: 'started', evidence: 'title_working' });
+    assert.equal(classifySubmission({ title: '⠋ Devin' }).state, 'started');
+    for (const line of ['⣠ Running tools · 12s (esc twice to interrupt)', 'Thinking · 28s']) {
+      assert.deepEqual(classifySubmission({ screen: ['  brief text', line, RULE, '❭ Guide Devin while it works', RULE_PLAIN] }), {
+        state: 'started',
+        evidence: 'tui_working',
+      });
+    }
+    assert.equal(classifySubmission({ screen: [RULE, '❭ Guide Devin while it works', RULE_PLAIN] }).state, 'started');
+  });
+
+  it('input line no longer holds the brief → started (idle finished, history echo above)', () => {
+    assert.deepEqual(classifySubmission({ screen: IDLE_FINISHED, title: 'Devin ready' }), { state: 'started', evidence: 'input_cleared' });
+    assert.deepEqual(classifySubmission({ screen: HISTORY_THEN_CLEARED }), { state: 'started', evidence: 'input_cleared' });
+  });
+
+  it('mixed, unreadable, unfamiliar or prompt-blocked screens → inconclusive', () => {
+    assert.deepEqual(classifySubmission({ screen: STUCK_SWE, title: '⠋ Devin' }), {
+      state: 'inconclusive',
+      evidence: 'mixed_signals:title_working+input_holds_brief',
+    });
+    assert.equal(classifySubmission({ screen: STUCK_SWE, activity: 'working' }).state, 'inconclusive');
+    assert.deepEqual(classifySubmission({ title: 'Devin ready' }), { state: 'inconclusive', evidence: 'screen_unreadable' });
+    assert.deepEqual(classifySubmission({ screen: ['some shell output', 'PS C:\>'] }), { state: 'inconclusive', evidence: 'composer_not_found' });
+    assert.deepEqual(classifySubmission({ screen: [RULE, '❭ hello there', RULE_PLAIN] }), { state: 'inconclusive', evidence: 'composer_unfamiliar' });
+    assert.deepEqual(classifySubmission({ screen: STUCK_SWE, agentWait: { kind: 'permission' } }), {
+      state: 'inconclusive',
+      evidence: 'agent_waiting_on_prompt',
+    });
+  });
+
+  it('a caller-supplied brief opening also identifies the held brief', () => {
+    const screen = [RULE, '❭ # Council reviewer brief — run crun_1', '  more', RULE_PLAIN];
+    assert.equal(classifySubmission({ screen }).state, 'inconclusive');
+    assert.equal(classifySubmission({ screen, promptOpening: '# Council reviewer brief — run crun_1' }).state, 'unsubmitted');
+    assert.ok(ORCA_DISPATCH_OPENING.startsWith('Please carry out this task'));
+  });
+});
+
+describe('receiptTurnStart', () => {
+  it('reads the live Devin receipt as unsupported and Codex-style proof as observed', () => {
+    const devin = {
+      state: 'ready',
+      dispatchId: 'ctx_84025dc31990',
+      stage: 'input_accepted',
+      turnStart: 'unsupported',
+      prompt: { stages: ['input_accepted'], provider: 'unsupported', observation: 'unsupported' },
+    };
+    assert.equal(receiptTurnStart(devin), 'unsupported');
+    assert.equal(receiptTurnStart({ turnStart: 'observed' }), 'observed');
+    assert.equal(receiptTurnStart({ prompt: { stages: ['input_accepted', 'turn_started'] } }), 'observed');
+    assert.equal(receiptTurnStart({ dispatchId: 'ctx_1' }), undefined, 'absent field: older host, no probe');
+    assert.equal(receiptTurnStart(null), undefined);
+  });
+});
+
+describe('runSubmissionProbe (bounded loop)', () => {
+  const opts = { windowMs: 1_000, intervalMs: 100, settleMs: 200 };
+  const scripted = (screens: (readonly string[] | 'gone')[]) => {
+    let i = 0;
+    const sleeps: number[] = [];
+    return {
+      sleeps,
+      sample: async (): Promise<SubmissionSample> => {
+        const s = screens[Math.min(i++, screens.length - 1)]!;
+        return s === 'gone' ? { signals: {}, gone: true, readErrors: [] } : { signals: { screen: s }, readErrors: [] };
+      },
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    };
+  };
+
+  it('strong started evidence returns after one sample', async () => {
+    const s = scripted([['⣠ Running tools · 12s (esc twice to interrupt)']]);
+    const r = await runSubmissionProbe(s.sample, opts, s.sleep);
+    assert.equal(r.state, 'started');
+    assert.equal(r.samples, 1);
+    assert.deepEqual(s.sleeps, [100], 'one interval before the first read lets the paste render');
+  });
+
+  it('unsubmitted must persist for settleMs (3 consecutive samples here)', async () => {
+    const s = scripted([STUCK_SWE]);
+    const r = await runSubmissionProbe(s.sample, opts, s.sleep);
+    assert.equal(r.state, 'unsubmitted');
+    assert.equal(r.samples, 3);
+    assert.ok(Array.isArray((r.signals as { screenTail?: unknown }).screenTail));
+  });
+
+  it('a transient held-brief frame followed by working is started, never a nudge', async () => {
+    const s = scripted([STUCK_SWE, ['Thinking · 2s (esc twice to interrupt)']]);
+    const r = await runSubmissionProbe(s.sample, opts, s.sleep);
+    assert.equal(r.state, 'started');
+  });
+
+  it('bare input_cleared needs two samples; unresolved windows end inconclusive', async () => {
+    const cleared = scripted([IDLE_FINISHED]);
+    const r1 = await runSubmissionProbe(cleared.sample, opts, cleared.sleep);
+    assert.deepEqual([r1.state, r1.samples], ['started', 2]);
+    const odd = scripted([['nothing recognizable']]);
+    const r2 = await runSubmissionProbe(odd.sample, opts, odd.sleep);
+    assert.equal(r2.state, 'inconclusive');
+    assert.equal(r2.evidence, 'window_elapsed:composer_not_found');
+    assert.equal(r2.samples, 10, 'bounded by windowMs / intervalMs');
+    const gone = scripted(['gone']);
+    assert.equal((await runSubmissionProbe(gone.sample, opts, gone.sleep)).evidence, 'terminal_gone');
+  });
+
+  it('derives interval/settle from a window', () => {
+    assert.deepEqual(submissionProbeOptionsFromWindow(24_000), { windowMs: 24_000, intervalMs: 2_000, settleMs: 4_000 });
+    assert.deepEqual(submissionProbeOptionsFromWindow(1_200), { windowMs: 1_200, intervalMs: 100, settleMs: 200 });
+  });
+});
+
+describe('OrcaAdapter submission check + single bare Enter', () => {
+  const fast = { sleepFn: async () => {}, submissionProbe: { windowMs: 1_000, intervalMs: 100, settleMs: 200 } };
+  const stuckHandler = (args: readonly string[]): ProcessResult => {
+    const cmd = args[1];
+    if (cmd === 'worker-show') return okEnv({ dispatchId: 'ctx_s1', state: 'ready', stage: 'input_accepted' });
+    if (cmd === 'show') return okTerm({ terminal: { handle: 'term_s1', title: 'Devin ready', connected: true, agentWait: null } });
+    if (cmd === 'read') return okTerm({ terminal: { handle: 'term_s1', status: 'running', source: 'screen', tail: STUCK_SWE } });
+    return failEnv('unexpected_command', String(cmd));
+  };
+
+  it('probes with documented read commands only — never input', async () => {
+    const { adapter, calls } = makeAdapter(stuckHandler, fast);
+    const r = await adapter.probeSubmission({ terminalHandle: 'term_s1', dispatchId: 'ctx_s1' });
+    assert.ok(r.ok);
+    assert.equal(r.value.state, 'unsubmitted');
+    assert.equal(r.value.samples, 3);
+    assert.equal(calls.length, 9);
+    for (const c of calls) {
+      const head = c.slice(0, 2).join(' ');
+      assert.ok(['orchestration worker-show', 'terminal show', 'terminal read'].includes(head), head);
+      assert.ok(!c.includes('send') && !c.includes('--text'));
+    }
+    assert.ok(calls.some((c) => c[1] === 'read' && c.includes('--screen')));
+  });
+
+  it('a non-screen read (stream fallback) is never classified as a held brief', async () => {
+    const { adapter } = makeAdapter(
+      (args) =>
+        args[1] === 'read'
+          ? okTerm({ terminal: { handle: 'term_s1', source: 'screen-unavailable', tail: STUCK_SWE } })
+          : stuckHandler(args),
+      fast,
+    );
+    const r = await adapter.probeSubmission({ terminalHandle: 'term_s1' });
+    assert.ok(r.ok);
+    assert.equal(r.value.state, 'inconclusive');
+  });
+
+  it('submitPendingInput sends exactly one bare Enter — no text, no --enter', async () => {
+    const { adapter, calls } = makeAdapter((args) =>
+      args[1] === 'send'
+        ? okTerm({ send: { handle: 'term_s1', accepted: true, bytesWritten: 1 } }, 'rcpt-send-1')
+        : failEnv('unexpected'),
+    );
+    const r = await adapter.submitPendingInput({ terminalHandle: 'term_s1' });
+    assert.ok(r.ok);
+    assert.deepEqual(r.value, { outcome: 'sent', requestId: 'rcpt-send-1' });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], ['terminal', 'send', '--terminal', 'term_s1', '--text', '\r', '--json']);
+    assert.deepEqual(bareEnterArgv('term_s1'), calls[0]);
+    assert.ok(!calls[0]!.includes('--enter'));
+    assert.equal(manualSubmitCommand('term_s1'), "orca terminal send --terminal term_s1 --text $'\\r'");
+  });
+
+  it('an unaccepted or failed send is reported unknown, never as sent', async () => {
+    const a1 = makeAdapter(() => okTerm({ send: { handle: 'term_s1' } }));
+    const r1 = await a1.adapter.submitPendingInput({ terminalHandle: 'term_s1' });
+    assert.ok(r1.ok && r1.value.outcome === 'unknown');
+    const a2 = makeAdapter(() => failEnv('weird_failure', 'boom'));
+    const r2 = await a2.adapter.submitPendingInput({ terminalHandle: 'term_s1' });
+    assert.ok(r2.ok && r2.value.outcome === 'unknown' && /weird_failure/.test(r2.value.detail ?? ''));
+    const a3 = makeAdapter(() => okEnv({}));
+    const r3 = await a3.adapter.submitPendingInput({ terminalHandle: 'bad handle; rm' });
+    assert.equal(r3.ok, false, 'unsafe handle refused before any spawn');
+    assert.equal(a3.calls.length, 0);
+  });
+
+  it('launchWorker reports the receipt turnStart and never probes by itself', async () => {
+    const handler = (turn: Record<string, unknown>) => (args: readonly string[]): ProcessResult => {
+      const cmd = args[1];
+      if (cmd === 'create') return okTerm({ terminal: { handle: 'term_new1' } });
+      if (cmd === 'wait') return okEnv({ idle: true });
+      if (cmd === 'show') return okTerm(readyTerm('term_new1'));
+      if (cmd === 'worker-start') return okMut({ dispatchId: 'ctx_d1', terminal: 'term_new1', ...turn }, 'req-ws-1');
+      return failEnv('unexpected_command', String(cmd));
+    };
+    const devin = makeAdapter(
+      handler({ stage: 'input_accepted', turnStart: 'unsupported', prompt: { stages: ['input_accepted'], observation: 'unsupported' } }),
+    );
+    const r1 = await devin.adapter.launchWorker(launchSpec());
+    assert.ok(r1.ok);
+    assert.equal(r1.value.turnStart, 'unsupported');
+    assert.equal(devin.calls.length, 4);
+    const codex = makeAdapter(handler({ turnStart: 'observed' }));
+    const r2 = await codex.adapter.launchWorker(launchSpec());
+    assert.ok(r2.ok && r2.value.turnStart === 'observed');
+    const legacy = makeAdapter(handler({}));
+    const r3 = await legacy.adapter.launchWorker(launchSpec());
+    assert.ok(r3.ok && !('turnStart' in r3.value));
+  });
+});
+

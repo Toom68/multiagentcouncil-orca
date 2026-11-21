@@ -30,6 +30,8 @@ import type {
   OrcaRunId,
   Result,
   StopOutcome,
+  SubmissionCheck,
+  SubmitInputResult,
   TaskId,
   TerminalCreateIntent,
   TerminalCreateReceipt,
@@ -377,6 +379,271 @@ export function isStaleTerminalCode(code: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// First-turn submission check. For Devin, worker-start proves only
+// `input_accepted` (turnStart/prompt.observation `unsupported`); a pasted
+// brief can sit unsubmitted in the input line. The check is a bounded
+// launch-time read (`worker-show`, `terminal show`, `terminal read --screen`);
+// all TUI text matching lives in classifySubmission.
+// ---------------------------------------------------------------------------
+
+export type SubmissionState = 'started' | 'unsubmitted' | 'inconclusive';
+
+export interface SubmissionSignals {
+  /** worker-show activity (host agent status), e.g. 'working'. */
+  activity?: string;
+  /** terminal show title (the agent's own title as relayed by Orca). */
+  title?: string;
+  /** terminal show agentWait; undefined = the host did not report it. */
+  agentWait?: unknown;
+  /** terminal read --screen tail; undefined = no rendered screen available. */
+  screen?: readonly string[];
+  /** Opening line of the dispatched brief, when known. */
+  promptOpening?: string;
+}
+
+export interface SubmissionVerdict {
+  state: SubmissionState;
+  evidence: string;
+}
+
+/** Orca's worker-start preamble — the first line of every dispatched brief. */
+export const ORCA_DISPATCH_OPENING =
+  'Please carry out this task from my Orca coordinator by following the brief I pasted below.';
+const SPINNER_TITLE_RE = /^[\u2800-\u28FF]+\s/;
+const TUI_WORKING_RES: readonly RegExp[] = [
+  /esc twice to interrupt/i,
+  /\b(?:Thinking|Running tools)\b.*·\s*\d+\s*[ms]/,
+  /Guide Devin while it works/,
+];
+const IDLE_COMPOSER_RE = /^Ask Devin to build features/;
+const PASTED_PLACEHOLDER_RE = /\[Pasted text\b/;
+const SCREEN_RULE_RE = /^\s*─{8,}/;
+const COMPOSER_MARK = '❭';
+
+function normalizeLine(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Pure classifier over one observation. `started`: host-reported working
+ * state or working indicators, or the input line no longer holds the brief.
+ * `unsubmitted`: the input line still holds the dispatched brief and nothing
+ * shows the agent working. Everything else — an unreadable or unfamiliar
+ * screen, a pending prompt, mixed signals — is `inconclusive`.
+ */
+export function classifySubmission(s: SubmissionSignals): SubmissionVerdict {
+  if (s.agentWait !== undefined && s.agentWait !== null) {
+    return { state: 'inconclusive', evidence: 'agent_waiting_on_prompt' };
+  }
+  const working: string[] = [];
+  if (s.activity === 'working') working.push('host_activity_working');
+  if (s.title !== undefined && SPINNER_TITLE_RE.test(s.title)) working.push('title_working');
+  const screen = s.screen !== undefined && s.screen.length > 0 ? s.screen : undefined;
+  if (screen !== undefined && screen.some((l) => TUI_WORKING_RES.some((re) => re.test(l)))) {
+    working.push('tui_working');
+  }
+
+  let composer: 'missing' | 'cleared' | 'brief' | 'unfamiliar' = 'missing';
+  if (screen !== undefined) {
+    let at = -1;
+    for (let i = screen.length - 1; i >= 0; i--) {
+      if (screen[i]!.trimStart().startsWith(COMPOSER_MARK)) {
+        at = i;
+        break;
+      }
+    }
+    if (at >= 0) {
+      const region: string[] = [];
+      for (let i = at; i < screen.length && (i === at || !SCREEN_RULE_RE.test(screen[i]!)); i++) {
+        region.push(screen[i]!);
+      }
+      const text = normalizeLine(region.join(' ').trimStart().slice(COMPOSER_MARK.length));
+      const opening = s.promptOpening !== undefined ? normalizeLine(s.promptOpening).slice(0, 80) : '';
+      if (text.length === 0 || IDLE_COMPOSER_RE.test(text)) composer = 'cleared';
+      else if (
+        PASTED_PLACEHOLDER_RE.test(text) ||
+        text.startsWith(normalizeLine(ORCA_DISPATCH_OPENING)) ||
+        (opening.length > 0 && text.startsWith(opening))
+      ) {
+        composer = 'brief';
+      } else composer = 'unfamiliar';
+    }
+  }
+
+  if (composer === 'brief') {
+    return working.length > 0
+      ? { state: 'inconclusive', evidence: `mixed_signals:${working.join('+')}+input_holds_brief` }
+      : { state: 'unsubmitted', evidence: 'input_holds_brief_idle' };
+  }
+  if (working.length > 0) return { state: 'started', evidence: working.join('+') };
+  if (composer === 'cleared') return { state: 'started', evidence: 'input_cleared' };
+  if (screen === undefined) return { state: 'inconclusive', evidence: 'screen_unreadable' };
+  return { state: 'inconclusive', evidence: composer === 'missing' ? 'composer_not_found' : 'composer_unfamiliar' };
+}
+
+/** 'observed' when a worker-start receipt proves turn start; else the host's value. */
+export function receiptTurnStart(receipt: unknown): string | undefined {
+  const r = asRecord(receipt);
+  if (r === undefined) return undefined;
+  const stages = asRecord(r.prompt)?.stages;
+  if (r.turnStart === 'observed' || r.stage === 'turn_started' || (Array.isArray(stages) && stages.includes('turn_started'))) {
+    return 'observed';
+  }
+  return typeof r.turnStart === 'string' ? r.turnStart : undefined;
+}
+
+export interface SubmissionProbeOptions {
+  windowMs: number;
+  intervalMs: number;
+  /** An `unsubmitted` verdict must hold this long across samples. */
+  settleMs: number;
+}
+
+export const DEFAULT_SUBMISSION_PROBE: SubmissionProbeOptions = {
+  windowMs: 24_000,
+  intervalMs: 2_000,
+  settleMs: 4_000,
+};
+
+/** Probe options from a window alone: interval = window/12 (50 ms..2 s), settle = 2 intervals. */
+export function submissionProbeOptionsFromWindow(windowMs: number): SubmissionProbeOptions {
+  const intervalMs = Math.min(2_000, Math.max(50, Math.floor(windowMs / 12)));
+  return { windowMs, intervalMs, settleMs: intervalMs * 2 };
+}
+
+export interface SubmissionSample {
+  signals: SubmissionSignals;
+  /** The terminal is definitively gone (stale handle). */
+  gone?: boolean;
+  readErrors: string[];
+}
+
+export interface SubmissionProbeResult extends SubmissionVerdict {
+  samples: number;
+  elapsedMs: number;
+  signals?: Record<string, unknown>;
+}
+
+/** Bounded copy of signals for receipts/journal. */
+export function compactSignals(s: SubmissionSignals, readErrors: readonly string[] = []): Record<string, unknown> {
+  return {
+    ...(s.activity !== undefined ? { activity: s.activity.slice(0, 64) } : {}),
+    ...(s.title !== undefined ? { title: s.title.slice(0, 120) } : {}),
+    ...(s.agentWait !== undefined ? { agentWait: s.agentWait === null ? null : 'present' } : {}),
+    ...(s.screen !== undefined ? { screenTail: s.screen.slice(-8).map((l) => l.slice(0, 160)) } : {}),
+    ...(readErrors.length > 0 ? { readErrors: readErrors.map((e) => e.slice(0, 200)) } : {}),
+  };
+}
+
+/**
+ * Bounded sampling loop (no daemon, no timers beyond this call). Strong
+ * `started` evidence returns at once; `unsubmitted` must persist for
+ * settleMs and a bare `input_cleared` for two samples. The loop is capped by
+ * sample count and wall clock; anything unresolved ends `inconclusive`.
+ */
+export async function runSubmissionProbe(
+  sample: () => Promise<SubmissionSample>,
+  opts: SubmissionProbeOptions,
+  sleep: (ms: number) => Promise<void>,
+): Promise<SubmissionProbeResult> {
+  const start = Date.now();
+  const intervalMs = Math.max(1, opts.intervalMs);
+  const maxSamples = Math.max(1, Math.floor(opts.windowMs / intervalMs));
+  const needUnsubmitted = Math.max(2, Math.ceil(opts.settleMs / intervalMs) + 1);
+  const hardDeadline = start + opts.windowMs * 2;
+  let streak = 0;
+  let prev: SubmissionVerdict | undefined;
+  let last: SubmissionSample | undefined;
+  let samples = 0;
+  const done = (v: SubmissionVerdict): SubmissionProbeResult => ({
+    ...v,
+    samples,
+    elapsedMs: Date.now() - start,
+    ...(last !== undefined ? { signals: compactSignals(last.signals, last.readErrors) } : {}),
+  });
+  for (let i = 0; i < maxSamples; i++) {
+    await sleep(intervalMs);
+    last = await sample();
+    samples += 1;
+    if (last.gone === true) return done({ state: 'inconclusive', evidence: 'terminal_gone' });
+    const v = classifySubmission(last.signals);
+    streak = prev !== undefined && prev.state === v.state && prev.evidence === v.evidence ? streak + 1 : 1;
+    prev = v;
+    if (v.state === 'started' && (v.evidence !== 'input_cleared' || streak >= 2)) return done(v);
+    if (v.state === 'unsubmitted' && streak >= needUnsubmitted) return done(v);
+    if (Date.now() >= hardDeadline) break;
+  }
+  return done({
+    state: 'inconclusive',
+    evidence: `window_elapsed:${prev?.evidence ?? 'no_sample'}`,
+  });
+}
+
+/** Reader seam shared by OrcaHost and the CLI supervisor path. */
+export type SubmissionReadFn = (
+  args: string[],
+) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string }>;
+
+/** One observation of a dispatched terminal from documented read commands. */
+export async function sampleSubmissionSignals(
+  read: SubmissionReadFn,
+  terminalHandle: string,
+  dispatchId?: string,
+): Promise<SubmissionSample> {
+  const handle = assertSafeValue('terminalHandle', terminalHandle);
+  const signals: SubmissionSignals = {};
+  const readErrors: string[] = [];
+  if (dispatchId !== undefined) {
+    const ws = await read(['orchestration', 'worker-show', '--dispatch', assertSafeValue('dispatchId', dispatchId), '--json']);
+    if (ws.ok) {
+      const rec = asRecord(ws.value);
+      const activity = firstString(
+        rec?.activity,
+        asRecord(asRecord(rec?.projection)?.stage)?.activity,
+        asRecord(rec?.stage)?.activity,
+      );
+      if (activity !== undefined) signals.activity = activity;
+    } else readErrors.push(`worker-show: ${ws.code}`);
+  }
+  const shown = await read(['terminal', 'show', '--terminal', handle, '--json']);
+  if (!shown.ok) {
+    if (STALE_TERMINAL_CODES.has(shown.code)) return { signals, gone: true, readErrors: [`terminal show: ${shown.code}`] };
+    readErrors.push(`terminal show: ${shown.code}`);
+  } else {
+    const t = asRecord(asRecord(shown.value)?.terminal ?? shown.value);
+    if (t !== undefined && firstString(t.handle) === handle) {
+      const title = firstString(t.title);
+      if (title !== undefined) signals.title = title;
+      if ('agentWait' in t) signals.agentWait = t.agentWait;
+    } else readErrors.push('terminal show: unidentifiable record');
+  }
+  const screen = await read(['terminal', 'read', '--terminal', handle, '--screen', '--json']);
+  if (!screen.ok) readErrors.push(`terminal read: ${screen.code}`);
+  else {
+    const t = asRecord(asRecord(screen.value)?.terminal ?? screen.value);
+    const tail = t?.tail;
+    if (t?.source === 'screen' && Array.isArray(tail) && tail.every((l) => typeof l === 'string')) {
+      signals.screen = tail as string[];
+    } else readErrors.push(`terminal read: no rendered screen (source=${String(t?.source ?? 'absent')})`);
+  }
+  return { signals, readErrors };
+}
+
+/**
+ * The single permitted terminal input: one bare Enter, never text. This is
+ * runner-level completion of the host's own dispatch delivery (approved by
+ * the primary orchestrator), not coordinator steering of worker content.
+ */
+export function bareEnterArgv(terminalHandle: string): string[] {
+  return ['terminal', 'send', '--terminal', assertSafeValue('terminalHandle', terminalHandle), '--text', '\r', '--json'];
+}
+
+/** Exact manual command for an operator (bash/Git Bash; PowerShell: --text "`r"). */
+export function manualSubmitCommand(terminalHandle: string): string {
+  return `orca terminal send --terminal ${terminalHandle} --text $'\\r'`;
+}
+
+// ---------------------------------------------------------------------------
 // OrcaHost — bounded operations over the `orca` CLI
 // ---------------------------------------------------------------------------
 
@@ -403,7 +670,13 @@ export interface OrcaHostOptions {
   allowedAgentBinaries?: readonly string[];
   /** Injectable process runner — tests substitute a fake; defaults to runProcess. */
   spawnFn?: (plan: SpawnPlan, opts: RunProcessOptions) => Promise<ProcessResult>;
+  /** First-turn submission check bounds (defaults: DEFAULT_SUBMISSION_PROBE). */
+  submissionProbe?: Partial<SubmissionProbeOptions>;
+  /** Injectable sleep for the bounded submission check (tests). */
+  sleepFn?: (ms: number) => Promise<void>;
 }
+
+const SUBMISSION_READ_TIMEOUT_MS = 15_000;
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_NOTIFICATION_BYTES = 8192;
@@ -451,6 +724,8 @@ export interface PhaseWorkerStart {
   failedStage?: string;
   /** Orca-issued request id of the worker-start mutation (recovery handle). */
   requestId?: string;
+  /** Turn-start evidence from the worker-start receipt (receiptTurnStart). */
+  turnStart?: string;
   error?: OrcaCliErrorShape;
   /** Bounded copy of receipts for evidence; never trusted as proof alone. */
   receipts: Record<string, unknown>;
@@ -1114,6 +1389,7 @@ export class OrcaHost {
     }
 
     const extracted = extractDispatchInfo(started.value);
+    const turnStart = receiptTurnStart(started.value);
     return {
       taskId,
       runId,
@@ -1123,6 +1399,7 @@ export class OrcaHost {
       workerAddress: extracted.workerAddress,
       terminalHandle: terminalHandle ?? extracted.terminalHandle,
       ...(started.requestId === undefined ? {} : { requestId: started.requestId }),
+      ...(turnStart === undefined ? {} : { turnStart }),
       receipts,
     };
     } catch (e) {
@@ -1322,6 +1599,31 @@ export class OrcaHost {
     const binaries = this.opts.allowedAgentBinaries ?? CATALOG_BINARIES;
     assertAllowlisted('agent binary', lane.command[0], binaries);
     return buildAgentCommandText(lane.command);
+  }
+
+  // -- First-turn submission check -------------------------------------------
+
+  /** Bounded read-only submission check of a freshly dispatched terminal. */
+  async probeSubmission(input: {
+    terminalHandle: string;
+    dispatchId?: string;
+  }): Promise<SubmissionProbeResult> {
+    const opts = { ...DEFAULT_SUBMISSION_PROBE, ...this.opts.submissionProbe };
+    const sleep = this.opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const read: SubmissionReadFn = async (args) => {
+      const res = await this.run(args, { timeoutMs: SUBMISSION_READ_TIMEOUT_MS });
+      return res.ok ? { ok: true, value: res.value } : { ok: false, code: res.error.code, message: res.error.message };
+    };
+    return runSubmissionProbe(
+      () => sampleSubmissionSignals(read, input.terminalHandle, input.dispatchId),
+      opts,
+      sleep,
+    );
+  }
+
+  /** Send exactly one bare Enter (see bareEnterArgv). Never carries text. */
+  async sendBareEnter(terminalHandle: string): Promise<OrcaCommandResult<unknown>> {
+    return this.run(bareEnterArgv(terminalHandle), { mayMutate: true, timeoutMs: SUBMISSION_READ_TIMEOUT_MS });
   }
 
   // -- Observation (read-only; never consuming mail) -------------------------
@@ -2520,6 +2822,7 @@ export class OrcaAdapter implements HostAdapter {
 
     base.outcome = 'started';
     base.dispatchId = started.dispatchId;
+    if (started.turnStart !== undefined) base.turnStart = started.turnStart;
 
     // Retention: mark the dispatch so its terminal survives settle. A refused
     // keep-open is recorded in detail, not fatal — reuse will verify settled
@@ -2667,6 +2970,54 @@ export class OrcaAdapter implements HostAdapter {
       };
       if (messageId !== undefined) out.messageId = messageId;
       return { ok: true, value: out };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  async probeSubmission(input: {
+    terminalHandle: TerminalHandle;
+    dispatchId?: DispatchId;
+  }): Promise<Result<SubmissionCheck>> {
+    try {
+      const r = await this.host.probeSubmission(input);
+      return {
+        ok: true,
+        value: {
+          state: r.state,
+          evidence: r.evidence,
+          samples: r.samples,
+          elapsedMs: r.elapsedMs,
+          ...(r.signals !== undefined ? { signals: r.signals } : {}),
+        },
+      };
+    } catch (e) {
+      return failure(tokenErr(e));
+    }
+  }
+
+  async submitPendingInput(input: { terminalHandle: TerminalHandle }): Promise<Result<SubmitInputResult>> {
+    try {
+      const res = await this.host.sendBareEnter(input.terminalHandle);
+      if (res.ok) {
+        const accepted = asRecord(asRecord(res.value)?.send)?.accepted;
+        return {
+          ok: true,
+          value: {
+            outcome: accepted === true ? 'sent' : 'unknown',
+            ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+            ...(accepted === true ? {} : { detail: 'terminal send returned no accepted:true receipt' }),
+          },
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          outcome: res.uncertain ? 'unknown' : 'refused',
+          ...(res.requestId === undefined ? {} : { requestId: res.requestId }),
+          detail: boundedUtf8(`${res.error.code}: ${res.error.message}`, MAIL_ERROR_MAX_BYTES),
+        },
+      };
     } catch (e) {
       return failure(tokenErr(e));
     }

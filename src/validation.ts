@@ -335,6 +335,7 @@ const JOURNAL_EVENT_TYPES = [
   'approval.invalidated', 'artifact.written', 'artifact.admitted',
   'artifact.rejected', 'envelope.built', 'deadline.hit', 'snapshot.drift',
   'claim.updated', 'report.written', 'supervisor.retired', 'error', 'run.finished',
+  'launch.submit_check', 'launch.submit_nudge', 'launch.submit_unconfirmed',
 ] as const;
 
 // Compile-time exhaustiveness: fails to compile if EITHER the enum misses a

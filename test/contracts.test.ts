@@ -20,8 +20,12 @@ import {
   type CouncilReport,
   type DissentRecord,
   type FindingsFile,
+  type HostAdapter,
+  type LaunchResult,
   type ResponseAssignment,
   type RunnerFacts,
+  type SubmissionCheck,
+  type SubmitInputResult,
   type SynthesisFile,
   type TerminalCreateIntent,
   type TerminalCreateReceipt,
@@ -329,4 +333,25 @@ test('TerminalCreateIntent/Receipt round-trip — custody identity never on argv
     detail: 'host call timed out',
   };
   assert.deepEqual(JSON.parse(JSON.stringify(receipt)), receipt);
+});
+
+test('submission-check contracts round-trip; sendNotification diagnostics are optional typed fields', () => {
+  const check: SubmissionCheck = {
+    state: 'unsubmitted',
+    evidence: 'input_holds_brief_idle',
+    samples: 3,
+    elapsedMs: 9574,
+    signals: { title: 'Devin ready', agentWait: null },
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(check)), check);
+  const sent: SubmitInputResult = { outcome: 'sent', requestId: '38d7b99a-5403-418e-b149-2f840192fde1' };
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), sent);
+  const launch: LaunchResult = { outcome: 'started', dispatchId: 'ctx_1', terminalHandle: 'term_1', turnStart: 'unsupported' };
+  assert.deepEqual(JSON.parse(JSON.stringify(launch)), launch);
+  // errorCode/error are part of the HostAdapter contract (no structural cast needed).
+  type NoteValue = Extract<Awaited<ReturnType<HostAdapter['sendNotification']>>, { ok: true }>['value'];
+  const unknownNote: NoteValue = { outcome: 'unknown', requestId: 'r1', errorCode: 'runtime_unavailable', error: 'busy' };
+  const plainNote: NoteValue = { outcome: 'sent', messageId: 'msg_1' };
+  assert.equal(unknownNote.errorCode, 'runtime_unavailable');
+  assert.equal('errorCode' in plainNote, false);
 });

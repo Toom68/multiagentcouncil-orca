@@ -1052,6 +1052,9 @@ export type JournalEventType =
   | 'claim.updated'
   | 'report.written'
   | 'supervisor.retired'
+  | 'launch.submit_check'
+  | 'launch.submit_nudge'
+  | 'launch.submit_unconfirmed'
   | 'error'
   | 'run.finished';
 
@@ -1170,6 +1173,31 @@ export interface LaunchResult {
   /** Retry-request / operation id retained for uncertain-outcome recovery. */
   requestId?: string;
   detail?: string;
+  /**
+   * Turn-start evidence from the worker-start receipt: 'observed' when the
+   * host proved the agent's turn began; otherwise the host's own value
+   * (e.g. 'unsupported'). Absent when the receipt carries no such field.
+   */
+  turnStart?: string;
+}
+
+/** Outcome of the bounded first-turn submission check. */
+export type SubmissionCheckState = 'started' | 'unsubmitted' | 'inconclusive';
+
+export interface SubmissionCheck {
+  state: SubmissionCheckState;
+  /** Short machine-readable evidence class, e.g. 'input_holds_brief_idle'. */
+  evidence: string;
+  samples: number;
+  elapsedMs: number;
+  /** Bounded copy of the last observed signals (never trusted as proof alone). */
+  signals?: Record<string, unknown>;
+}
+
+export interface SubmitInputResult {
+  outcome: 'sent' | 'unknown' | 'refused';
+  requestId?: string;
+  detail?: string;
 }
 
 /**
@@ -1246,7 +1274,17 @@ export interface HostAdapter {
     body: string;
     taskId?: TaskId;
     dispatchId?: DispatchId;
-  }): Promise<Result<{ outcome: 'sent' | 'unknown'; requestId?: string; messageId?: MessageId }>>;
+  }): Promise<
+    Result<{
+      outcome: 'sent' | 'unknown';
+      requestId?: string;
+      messageId?: MessageId;
+      /** Host error code carried on an 'unknown' receipt. */
+      errorCode?: string;
+      /** Bounded host error message carried on an 'unknown' receipt. */
+      error?: string;
+    }>
+  >;
   /** Guarded stop — only for explicit cancellation per the recovery reference. */
   requestStop(input: { dispatchId: DispatchId; reason: string }): Promise<Result<{ outcome: StopOutcome }>>;
   /** Release a settled/reclaimable worker terminal (e.g. end of retained session). */
@@ -1261,6 +1299,19 @@ export interface HostAdapter {
   listTasks?(input: { runId: OrcaRunId }): Promise<Result<{ tasks: TaskListRow[] }>>;
   /** OPTIONAL crash-resume reconciliation: list the host's worker records for a Run. */
   listWorkers?(input: { runId: OrcaRunId }): Promise<Result<{ workers: WorkerListRow[] }>>;
+  /**
+   * OPTIONAL bounded first-turn submission check, read-only: classifies a
+   * freshly dispatched terminal as started / unsubmitted / inconclusive.
+   */
+  probeSubmission?(input: {
+    terminalHandle: TerminalHandle;
+    dispatchId?: DispatchId;
+  }): Promise<Result<SubmissionCheck>>;
+  /**
+   * OPTIONAL: send exactly one bare Enter (no text) to submit a dispatched
+   * prompt the host pasted but never submitted. Never resends content.
+   */
+  submitPendingInput?(input: { terminalHandle: TerminalHandle }): Promise<Result<SubmitInputResult>>;
 }
 
 // ─── Store (implemented by src/store.ts, backed by src/snapshot.ts) ─────────

@@ -49,16 +49,26 @@ import {
 } from './catalog.js';
 import { createEngine } from './engine.js';
 import {
+  bareEnterArgv,
   buildAgentCommandText,
+  DEFAULT_SUBMISSION_PROBE,
   dispatchVerdict,
   extractDispatchInfo,
   extractRequestId,
   createOrcaAdapter,
   isActiveWorkerRow,
   isStaleTerminalCode,
+  manualSubmitCommand,
+  receiptTurnStart,
+  runSubmissionProbe,
+  sampleSubmissionSignals,
+  submissionProbeOptionsFromWindow,
   workerLedgerRows,
   workerRowTerminalIdentities,
   type OrcaEnvelope,
+  type SubmissionProbeOptions,
+  type SubmissionProbeResult,
+  type SubmissionReadFn,
   parseOrcaEnvelope,
 } from './host/orca.js';
 import { resolveExecutable, runProcess } from './host/process.js';
@@ -257,6 +267,7 @@ function lazyHost(): HostAdapter {
         ...(process.env.ORCA_TERMINAL_HANDLE !== undefined
           ? { fromHandle: process.env.ORCA_TERMINAL_HANDLE }
           : {}),
+        submissionProbe: submissionProbeFromEnv(),
       });
       return { ok: true, value: real };
     } catch (e) {
@@ -281,7 +292,30 @@ function lazyHost(): HostAdapter {
     sendNotification: (i) => call((h) => h.sendNotification(i)),
     requestStop: (i) => call((h) => h.requestStop(i)),
     releaseWorker: (i) => call((h) => h.releaseWorker(i)),
+    probeSubmission: (i) =>
+      call((h) =>
+        h.probeSubmission !== undefined
+          ? h.probeSubmission(i)
+          : Promise.resolve({ ok: false, error: err('unsupported', 'host has no submission check') }),
+      ),
+    submitPendingInput: (i) =>
+      call((h) =>
+        h.submitPendingInput !== undefined
+          ? h.submitPendingInput(i)
+          : Promise.resolve({ ok: false, error: err('unsupported', 'host cannot submit pending input') }),
+      ),
   };
+}
+
+/**
+ * First-turn submission check bounds. COUNCIL_SUBMIT_PROBE_MS (100..120000)
+ * sets the window; interval and settle derive from it. Default ~24 s.
+ */
+function submissionProbeFromEnv(): SubmissionProbeOptions {
+  const n = Number(process.env.COUNCIL_SUBMIT_PROBE_MS);
+  return Number.isInteger(n) && n >= 100 && n <= 120_000
+    ? submissionProbeOptionsFromWindow(n)
+    : DEFAULT_SUBMISSION_PROBE;
 }
 
 function makeEngine(runDir: string) {
@@ -1953,6 +1987,14 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
       command: `council supervise --run ${cmdToken(runDir)} --advance --as-supervisor --json`,
     });
   }
+  const submission = submissionWarnings(journal, state);
+  for (const w of submission) {
+    pendingActions.push({
+      kind: 'submit',
+      detail: `${w.scope === 'supervisor' ? 'supervisor' : `${w.participantId}/${w.attemptId}`} first-turn submission unconfirmed (${w.reason}; ${w.evidence}) on ${w.terminalHandle} — inspect \`orca terminal read --terminal ${w.terminalHandle} --screen --json\`; only if the input line still holds the brief, submit it once with a bare Enter (PowerShell: --text "\`r")`,
+      command: w.command,
+    });
+  }
   if (supervisorHealth.probe === 'stale') {
     pendingActions.push({
       kind: 'replace',
@@ -2006,6 +2048,7 @@ async function cmdStatus(argv: readonly string[]): Promise<{ payload: Record<str
       approvalHash: st.approvalHash,
       pendingDecisions: st.pendingDecisions,
       pendingActions,
+      submission,
       activity,
       phase,
       supervisor: state.supervisor,
@@ -2548,6 +2591,159 @@ async function proveTerminalReady(
     code: cls.state === 'not_ready' ? 'agent_not_ready' : 'readiness_unproven',
     detail: cls.detail,
   };
+}
+
+/**
+ * Supervisor first-turn submission check — same protocol as the engine's
+ * phase launches: probe only when worker-start did not observe turn start;
+ * only `unsubmitted` earns one journaled bare Enter (intent → send →
+ * receipt → re-check); anything unresolved is a journaled warning. Never
+ * blocks or fails the launch. Returns null when no check applies.
+ */
+async function supervisorSubmissionCheck(
+  store: Store,
+  terminalHandle: string,
+  dispatchId: string,
+  receipt: unknown,
+): Promise<Record<string, unknown> | null> {
+  const turnStart = receiptTurnStart(receipt);
+  if (turnStart === undefined || turnStart === 'observed') return null;
+  const base = { scope: 'supervisor', terminalHandle, dispatchId };
+  const journal = async (type: JournalEvent['type'], payload: Record<string, unknown>): Promise<boolean> =>
+    (await store.appendJournal([{ ts: new Date().toISOString(), type, actor: 'orchestrator', payload: { ...base, ...payload } }])).ok;
+  const read: SubmissionReadFn = async (args) => {
+    const r = await tryOrcaCli(args, 15_000);
+    return r.ok
+      ? { ok: true, value: r.value }
+      : { ok: false, code: firstStr(asRec(r.error.details)?.adapterCode) ?? r.error.code, message: r.error.message };
+  };
+  const opts = submissionProbeFromEnv();
+  const probe = async (check: number): Promise<SubmissionProbeResult> => {
+    const v = await runSubmissionProbe(
+      () => sampleSubmissionSignals(read, terminalHandle, dispatchId),
+      opts,
+      (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+    );
+    await journal('launch.submit_check', {
+      check,
+      turnStart,
+      state: v.state,
+      evidence: v.evidence,
+      samples: v.samples,
+      elapsedMs: v.elapsedMs,
+      ...(v.signals !== undefined ? { signals: v.signals } : {}),
+    });
+    return v;
+  };
+  const result = (state: string, evidence: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    turnStart,
+    state,
+    evidence,
+    ...extra,
+  });
+  const warn = async (reason: string, v: { state: string; evidence: string }, extra: Record<string, unknown> = {}) => {
+    await journal('launch.submit_unconfirmed', { reason, state: v.state, evidence: v.evidence });
+    return result(v.state, v.evidence, { ...extra, warning: reason, command: manualSubmitCommand(terminalHandle) });
+  };
+
+  const first = await probe(1);
+  if (first.state === 'started') return result(first.state, first.evidence, { nudged: false });
+  if (first.state !== 'unsubmitted') return warn('first_check_inconclusive', first, { nudged: false });
+  const prior = await store.readJournal();
+  const alreadyNudged =
+    !prior.ok ||
+    prior.value.some(
+      (e) =>
+        e.type === 'launch.submit_nudge' &&
+        e.payload?.stage === 'intent' &&
+        e.payload?.scope === 'supervisor' &&
+        e.payload?.terminalHandle === terminalHandle,
+    );
+  if (alreadyNudged) return warn('nudge_already_attempted', first, { nudged: false });
+  const nudgeId = `sn_${crypto.randomUUID().slice(0, 12)}`;
+  if (!(await journal('launch.submit_nudge', { stage: 'intent', nudgeId }))) {
+    return warn('nudge_intent_unjournaled', first, { nudged: false });
+  }
+  const sent = await tryOrcaCli(bareEnterArgv(terminalHandle), 15_000);
+  const accepted = sent.ok && asRec(asRec(sent.value)?.send)?.accepted === true;
+  const outcome = accepted ? 'sent' : sent.ok ? 'unknown' : 'error';
+  await journal('launch.submit_nudge', {
+    stage: 'receipt',
+    nudgeId,
+    outcome,
+    ...(sent.ok ? {} : { detail: sent.error.message.slice(0, 512) }),
+  });
+  const second = await probe(2);
+  if (second.state !== 'started') return warn('still_unconfirmed_after_nudge', second, { nudged: true, nudgeOutcome: outcome });
+  return result(second.state, second.evidence, { nudged: true, nudgeOutcome: outcome });
+}
+
+/** A first-turn submission warning still relevant to the run (status view). */
+interface SubmissionWarning {
+  scope: 'attempt' | 'supervisor';
+  participantId?: string;
+  attemptId?: string;
+  terminalHandle: string;
+  reason: string;
+  evidence: string;
+  command: string;
+}
+
+/**
+ * Journal-derived submission warnings: every launch.submit_unconfirmed, and
+ * every nudge intent without a receipt (a crash between intent and receipt —
+ * never retried). Only warnings for still-active attempts, or the run's
+ * current supervisor while the run is live and no later engine step has
+ * been journaled (proof the supervisor advanced the run), are reported.
+ */
+function submissionWarnings(journal: readonly JournalEvent[], state: CouncilState): SubmissionWarning[] {
+  const attemptStatus = new Map<string, { status: string; participantId: string }>();
+  for (const p of state.participants) {
+    for (const a of p.attempts) attemptStatus.set(a.attemptId, { status: a.status, participantId: p.participantId });
+  }
+  const live = !['reported', 'failed', 'cancelled'].includes(state.status);
+  const receipted = new Set<string>();
+  let lastEngineSeq = -1;
+  for (const e of journal) {
+    if (e.type === 'launch.submit_nudge' && e.payload?.stage === 'receipt' && typeof e.payload.nudgeId === 'string') {
+      receipted.add(e.payload.nudgeId);
+    }
+    if (e.actor === 'engine') lastEngineSeq = Math.max(lastEngineSeq, e.seq);
+  }
+  const out: SubmissionWarning[] = [];
+  const seen = new Set<string>();
+  const add = (e: JournalEvent, reason: string, evidence: string): void => {
+    const handle = firstStr(e.payload?.terminalHandle);
+    if (handle === undefined) return;
+    const attemptId = firstStr(e.payload?.attemptId);
+    if (attemptId !== undefined) {
+      const a = attemptStatus.get(attemptId);
+      if (a === undefined || !['dispatched', 'working', 'unknown', 'timed_out'].includes(a.status)) return;
+      const key = `${attemptId}|${reason}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ scope: 'attempt', participantId: a.participantId, attemptId, terminalHandle: handle, reason, evidence, command: manualSubmitCommand(handle) });
+      return;
+    }
+    if (e.payload?.scope !== 'supervisor' || !live || state.supervisor?.terminalHandle !== handle || lastEngineSeq > e.seq) return;
+    const key = `supervisor|${handle}|${reason}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ scope: 'supervisor', terminalHandle: handle, reason, evidence, command: manualSubmitCommand(handle) });
+  };
+  for (const e of journal) {
+    if (e.type === 'launch.submit_unconfirmed') {
+      add(e, firstStr(e.payload?.reason) ?? 'unconfirmed', `${firstStr(e.payload?.state) ?? '?'}: ${firstStr(e.payload?.evidence) ?? '?'}`);
+    } else if (
+      e.type === 'launch.submit_nudge' &&
+      e.payload?.stage === 'intent' &&
+      typeof e.payload.nudgeId === 'string' &&
+      !receipted.has(e.payload.nudgeId)
+    ) {
+      add(e, 'nudge_receipt_missing', 'a bare-Enter nudge intent was journaled without a receipt — it is never retried');
+    }
+  }
+  return out;
 }
 
 /**
@@ -3639,6 +3835,20 @@ async function startSupervisorUnderLock(
     ]),
   );
 
+  let submission: Record<string, unknown> | null;
+  try {
+    submission = await supervisorSubmissionCheck(store, rec2.terminalHandle!, dispatchId, startReceipt);
+  } catch (e) {
+    const evidence = `check_error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 256);
+    await store.appendJournal([{
+      ts: new Date().toISOString(),
+      type: 'launch.submit_unconfirmed',
+      actor: 'orchestrator',
+      payload: { scope: 'supervisor', terminalHandle: rec2.terminalHandle, dispatchId, reason: 'check_error', state: 'inconclusive', evidence },
+    }]);
+    submission = { state: 'inconclusive', evidence, warning: 'check_error', command: manualSubmitCommand(rec2.terminalHandle!) };
+  }
+
   // The launched supervisor is the run's progress helper host — ensure the
   // bounded helper + report where stage wakes land. Both are best-effort.
   const helper = await ensureProgressHelper(runDir);
@@ -3664,6 +3874,7 @@ async function startSupervisorUnderLock(
       replacedFrom,
       notifyRecipient,
       ...(helper !== null ? { helper } : {}),
+      ...(submission !== null ? { submission } : {}),
       receipts: { taskCreate: taskReceipt, terminalCreate: termReceipt, workerStart: startReceipt },
       note: 'supervisor launched — it will drive `council supervise --advance --as-supervisor` on each wake',
     },
@@ -3673,6 +3884,14 @@ async function startSupervisorUnderLock(
       `  terminal: ${rec2.terminalHandle} (${rec2.supervisor.command})`,
       `  dispatch: ${dispatchId}`,
       `  caller Run: ${rec2.boundRunId ?? 'none — implicit Run created/joined by worker-start'}`,
+      ...(submission !== null
+        ? [
+            `  submit:   ${String(submission.state)} (${String(submission.evidence)})${submission.nudged === true ? ' after one bare Enter' : ''}` +
+              (typeof submission.warning === 'string'
+                ? ` — UNCONFIRMED (${submission.warning}); inspect the terminal and, only if the brief still sits in its input line: ${String(submission.command)}`
+                : ''),
+          ]
+        : []),
     ].join('\n'),
   };
 }
