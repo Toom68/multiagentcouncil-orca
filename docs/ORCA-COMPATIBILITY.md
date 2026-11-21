@@ -127,9 +127,12 @@ Verified facts:
 - `claude --model/--effort/--permission-mode` and Devin
   `--permission-mode` are **help-verified** on this host; `codex
   --model/--profile/--sandbox/--ask-for-approval` is **live-verified** as a
-  bounded supervisor launch (bring-up, model pin, spec intake, one
-  `supervise --advance`, clean cancel) — no full council seat run yet. Only
-  the Devin `swe-2-max` lane has run a live council.
+  bounded supervisor launch and as a reviewer seat in a completed
+  mixed-provider council. Devin lanes (`swe-2-max`, Devin-hosted
+  `claude-opus-5-5-high`) have run live councils. For Devin, `worker-start`
+  reports only `input_accepted` (`turnStart: unsupported`); a pasted brief
+  can sit unsubmitted, which the council does not yet detect (see
+  VERIFICATION.md, 2026-11-21).
 
 The launch policy is the shipped catalog (`src/catalog.ts`,
 `resolveAgentLaunch`): each AgentChoice `{agent, model, permissionMode,

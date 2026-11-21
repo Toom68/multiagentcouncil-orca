@@ -146,6 +146,7 @@ export const AGENT_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.free
       'Effort tokens verified in help: low, medium, high, max.',
       '--settings is a file path, not a named provider profile — profile requests are refused.',
       '--fallback-model is never emitted: the council has no model fallback.',
+      'A live seat launch on a host where Claude Code was not logged in stopped at first-run setup; the readiness gate blocked it as launch-unknown and never relaunched. Check `claude auth status` before selecting this lane.',
     ]),
   }),
   codex: Object.freeze({
@@ -166,7 +167,8 @@ export const AGENT_CATALOG: Readonly<Record<string, CatalogEntry>> = Object.free
     verification: 'live-verified',
     summary: 'Codex CLI — documented --model/--profile/--sandbox argv lane',
     notes: Object.freeze([
-      'Live-verified as a supervisor on a bounded run (launch, model pin, spec intake, one advance, clean cancel); no full council seat run yet.',
+      'Live-verified as a supervisor (bounded launch + cancel) and as a reviewer seat in a completed mixed-provider council (independent review + challenge round admitted).',
+      'Provider UX can intervene: after a turn, a rate-limit dialog offered switching to a different model with "switch" preselected — the approved model was kept by selecting "Keep current model". The catalog cannot prevent CLI-side prompts.',
       'Posture maps to a fixed --sandbox + --ask-for-approval pair; there is no single permission flag.',
       'No verified effort selector — an effort request is refused explicitly, not ignored.',
       '--profile <name> is the documented named-profile selector; without it the ambient sign-in applies and is not asserted.',

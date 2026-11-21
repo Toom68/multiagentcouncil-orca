@@ -23,9 +23,9 @@ completion — plus bounded progress notices during long stages.
   ([docs/ORCA-COMPATIBILITY.md](docs/ORCA-COMPATIBILITY.md)).
 - **Agent CLIs** for the staff and seat lanes you choose. The shipped catalog
   (`council catalog --json`) documents `devin`, `claude`, and `codex` argv
-  lanes; `devin` + `swe-2-max` has run full live councils and `codex` is
-  live-verified as a bounded supervisor launch — `claude` remains
-  help-verified only (evidence in
+  lanes; `devin` has run full live councils (including Devin-hosted Claude
+  Opus seats) and `codex` has completed a reviewer seat in a mixed-provider
+  live council — the `claude` CLI lane remains help-verified only (evidence in
   [docs/VERIFICATION.md](docs/VERIFICATION.md)). There is no default
   provider: fresh runs require an explicit staff and per-seat choices, each
   validated against the catalog and bound by the roster approval.

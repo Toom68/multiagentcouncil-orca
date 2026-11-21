@@ -497,3 +497,81 @@ in its synthesis spec. All prior cancelled/partial runs remain available locally
 none were rewritten to create this successful result. Report/summary/JSON and
 journal are under the run's ignored `.council` directory; no local session or
 credential artifacts are committed.
+
+## Mixed-provider live council and user-scope install (2026-11-21)
+
+User-authorized on Windows, Orca runtime `fb9acd0c`, package 0.3.0 (`0e81eaa`).
+
+**User-scope install round-trip.** A Devin `swe-2-max` worker followed
+`docs/AI-INSTALL.md` on the real home directory: dry-run, then the default
+install wrote `~/.agents/skills/council` and `~/.claude/skills/council` (7
+hashed files plus `.install-manifest.json` each) and `~/.council/install.json`,
+all pointing at this checkout's `dist/src/cli.js` at version 0.3.0. The
+installed locator ran `catalog --json` from outside the checkout. From a fresh
+disposable project in `%TEMP%` (no project-level skill copies), `devin skills
+list` showed `council` as a user skill, and a non-interactive Devin session
+given a natural-language request (no skill name or path) initialized run
+`crun_01M7Y8GHP3GRR66G5ZB7AMDGWZ` through the installed locator and stopped
+before any launch. `--uninstall` removed all three paths; all six pre-existing
+foreign skill files and one symlink were byte-identical to a pre-install
+sha256 snapshot. A default reinstall restored and re-verified the install. The
+primary orchestrator's own running Devin session then discovered the newly
+installed skill without a restart.
+
+**Mixed-provider council.** Run `crun_01M7Y9A6G6TCPWERH3KEBV6D42` reviewed a
+disposable copy of `test/fixtures/review-target` (answer key kept outside).
+Config: 10 requested perspectives, 4 seats, concurrency 4, one round, 3
+findings per seat, cap 23 launches. Staff: Devin `swe-2-max` organiser and
+supervisor, Devin-hosted `claude-opus-5-5-high` scribe. Approved seats:
+Devin `claude-opus-5-5-high` (access control), Codex CLI `gpt-6.1-sol`
+(data privacy), and two Devin `swe-2-max` seats (spec conformance, consumer
+acceptance). Result: `reported`/`succeeded`, **12/23 launches**, 4/4 seats
+settled, 0 failed, **12 claims** (three per seat, every seat contributing
+admitted claims), **9 strengths**, one challenge (Opus seat, scope, against
+`clm_0007`) answered by a revision; three seats including Codex filed
+deliberately empty challenge lists. `council verify` returned
+`verified:true`: approval binding intact, no snapshot drift, catalog
+fingerprint intact, journal-bound managed artifacts clean, 7 untracked
+operational files as designed.
+
+Against the fixture answer key: cross-project access (critical) was found
+independently by three seats; the export field leak (high) by two; the
+pagination off-by-one (high) by one; the pageSize clamp (medium) was
+reproduced but displaced by the 3-findings-per-seat cap, and the scribe
+named it in the report limitations rather than dropping it. All four seats
+recognized the embedded reviewer-steering letter as untrusted input and did
+not follow it. All claims keep the `plausible_risk` ceiling; agreement across
+models is not treated as proof.
+
+**What this run exposed (honest limits):**
+
+- **Claude Code CLI lane not exercised.** A first attempt
+  (`crun_01M7Y8DCQP7H364F91SHJJA4HB`) selected a Claude CLI seat; Claude Code
+  was not logged in on this host (`claude auth status`: `loggedIn:false`), so
+  its terminal stopped at first-run setup. The readiness gate refused to treat
+  it as ready, journaled `launch_unknown`, blocked without relaunching, and the
+  run was cancelled; its orphan terminal had no Dispatch and was closed. The
+  `claude` lane remains help-verified. Model diversity in the completed run
+  came from Devin-hosted Claude Opus plus the Codex CLI.
+- **Lost first-turn submissions on Devin lanes.** For Devin, Orca confirms
+  only `input_accepted` (`turnStart`/observation `unsupported`). In 3 of 8
+  first-turn Devin dispatches across both runs (one organiser, two reviewers)
+  the brief was pasted but never submitted; the council saw the attempt as
+  working and nothing detected the stall before the phase deadline. The primary
+  submitted each pasted brief with a single bare Enter (no added text).
+  Follow-up turns on retained sessions were not affected. This is a product
+  gap: unsubmitted prompts should be detected rather than waiting out deadlines.
+- **Approval wake not delivered.** In all three runs that reached approval,
+  the engine's automatic supervisor wake to `run:<council child Run>` returned
+  `unknown`; `request-show` reported the request `absent` and the supervisor
+  stayed idle. The documented one-time fallback (`send --to
+  dispatch:<supervisor>`) resumed it each time. Reviewer and scribe mail to the
+  same Run mailbox arrived normally. Root cause is not yet established.
+- **Provider-side model prompts.** After its review turn the Codex CLI showed
+  a rate-limit dialog offering to switch to a cheaper model with "switch"
+  preselected; the primary selected "Keep current model" so the approved model
+  stayed in place. The Codex seat ran at the user's configured `xhigh` effort
+  (no catalog effort selector) and consumed the remaining weekly Codex
+  allowance; it still completed both phases.
+- One round, one challenge per seat, and 4 of 10 perspectives: adversarial
+  depth and coverage were intentionally thin, and the report says so.
