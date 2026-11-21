@@ -575,3 +575,50 @@ models is not treated as proof.
   allowance; it still completed both phases.
 - One round, one challenge per seat, and 4 of 10 perspectives: adversarial
   depth and coverage were intentionally thin, and the report says so.
+
+## Lifecycle fixes verified live (2026-11-21)
+
+The four limits recorded above were fixed in `0dab333` (approval wake),
+`47aafaf` (first-turn submission probe), `c6cd488` and `aefe005` (terminal
+release-then-close, `council cleanup`, cancel notice, single pre-dispatch
+relaunch, report seat outcome). Full suite at `aefe005`: **807 tests, 804
+pass, 0 fail, 3 skipped** (Windows file-symlink privilege); CI green on
+Linux and Windows, Node 22.x/24.x.
+
+**Approval-wake root cause.** A worker reproduced it in a scratch Run: the
+supervisor's Dispatch lives in the caller's Run, so `send --to run:<council
+child Run> --dispatch-id <supervisor>` is refused `dispatch_run_mismatch`
+before Orca records a receipt, and `request-show` then reads `absent`.
+`send --to dispatch:<id>` is accepted and routed to the mailbox the
+supervisor terminal reads.
+
+**Live council `crun_01M7YN01BK0B1D5287HQC4VK6E`** (Devin `swe-2-max`
+throughout, 2 seats, run from the reinstalled user-scope skill on a host
+already loaded by other agents): `reported`/`succeeded` in 14m32s, 7/17
+launches, 2/2 seats completed, 4 claims, 4 strengths, `verify` true with
+intact approval, no drift, catalog intact and journal-bound artifacts.
+With no operator intervention:
+
+- **Approval wake:** `supervisorWake` `sent` → `dispatch:ctx_6c8f877eaa1b`;
+  the supervisor resumed and launched both reviewers by itself.
+- **Submission probe:** supervisor, organiser and scribe classified
+  `started` in about 4 s with no nudge. Both reviewer briefs were pasted but
+  not submitted (the original bug, 2 of 2 this run); each was classified
+  `unsubmitted` after ~12 s, received one journaled bare Enter, and
+  re-checked `started` ~4 s later.
+- **Terminal lifecycle:** `worker-release` returned `retained` for the
+  organiser as expected; the engine closed its terminal right after roster
+  admission (`organiser_roster_admitted`), and closed both reviewer
+  terminals and the scribe's when the run was reported (`run_reported`),
+  each with journaled intent and receipt. After the supervisor's
+  `worker_done`, `council cleanup` closed the supervisor terminal and
+  skipped the four already closed by journaled receipt. No council
+  terminal from this run remained open.
+
+Earlier the same day, `council cleanup` on cancelled run
+`crun_01M7YDY8JGZSXHMS1GN09FT7TF` closed its idle supervisor after
+`worker-stop` had answered `stop_unknown` for that external terminal.
+
+Still fixture-tested only: the single pre-dispatch relaunch (no terminal
+failed before dispatch in the live run) and the cancel notice to a live
+supervisor. The probe's screen classifier is verified on Devin lanes only.

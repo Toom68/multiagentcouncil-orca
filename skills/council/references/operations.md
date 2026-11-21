@@ -120,8 +120,9 @@ still unsubmitted after the nudge, unsupported host) is journaled as a
 `submission` field; the launch is never failed or blocked by the probe.
 `council status` surfaces a still-live warning as a `submit` pending action
 with the exact manual command — see Step 5 / recovery for when to use it.
-Verified live against a scratch Devin terminal; the in-council path is
-fixture-tested so far.
+Verified live in a council (`crun_01M7YN01BK0B1D5287HQC4VK6E`): both Devin
+reviewer briefs sat unsubmitted, each got exactly one Enter and re-checked
+`started`; supervisor, organiser and scribe launches needed no nudge.
 
 **Check the JSON outcome — `ok:true` exit 0 is not "started".** Two
 top-level fields decide:
@@ -580,10 +581,11 @@ relaying each notice to the user.
 - Launch/cleanup lifecycle (newest commits): `terminal close`/`show`, the
   submission probe + single bare Enter, the `dispatch:<id>` send shape, and
   `council cleanup` closing a cancelled run's idle supervisor were each
-  exercised live against Orca 1.4.261 on this host. The complete
-  in-council paths — engine closes, pre-dispatch relaunch, the submit
-  nudge inside `advance`/`start-supervisor`, and the approval wake inside
-  `council approve` — are fixture-tested, not yet observed in a live
-  council.
+  exercised live against Orca 1.4.261 on this host. A live council then
+  exercised the in-council paths end to end: the approval wake resumed the
+  supervisor on its own, the submit nudge recovered two unsubmitted
+  reviewer briefs, the engine closed the organiser, reviewer and scribe
+  terminals, and `council cleanup` closed the supervisor. The pre-dispatch
+  relaunch and the cancel notice remain fixture-tested only.
 - `council` commands are the implemented CLI; `COUNCIL help` prints the
   authoritative command list for the installed version.

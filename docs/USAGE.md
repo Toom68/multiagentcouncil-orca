@@ -778,14 +778,14 @@ outcome recovery.
   `claude auth status` first.
 - Does not guarantee first-turn submission recovery end-to-end: the probe
   classifies terminal TUI text — inherently brittle, and verified live only
-  on a scratch Devin lane. It warns rather than fails, so an unresolved
+  on Devin lanes (a scratch terminal and one council). It warns rather than
+  fails, so an unresolved
   `submit` warning still relies on the manual command it names.
-- Does not claim the launch/cleanup lifecycle is live-proven end-to-end:
-  `terminal close`/`show`, the submission probe + bare Enter, the
-  `dispatch:` send shape, and `council cleanup` on a cancelled run's idle
-  supervisor were each verified live against Orca 1.4.261; the full
-  in-council paths (engine closes, pre-dispatch relaunch, the approve
-  wake) are fixture-tested and await a live council.
+- Does not claim every lifecycle path is live-proven: a live council
+  verified the approval wake, the first-turn submit nudge, engine terminal
+  closes and `council cleanup` end to end (see VERIFICATION.md,
+  "Lifecycle fixes verified live"); the pre-dispatch relaunch and the
+  cancel notice to a supervisor are fixture-tested only.
 - Does not produce automatic fixes or rerun-diff reports in this release.
 
 ## Validation status — honest ledger

@@ -141,8 +141,9 @@ Verified facts:
   (§2 `terminal send`); anything unresolved surfaces as a
   `launch.submit_unconfirmed` warning shown by `council status` — never a
   silent stall or a failed attempt. Probe and nudge were exercised live on
-  a scratch Devin terminal; the gap's original evidence is in
-  VERIFICATION.md (2026-11-21).
+  a scratch Devin terminal and then in a live council, where both reviewer
+  briefs sat unsubmitted and each was recovered by one Enter (see
+  VERIFICATION.md, 2026-11-21).
 
 The launch policy is the shipped catalog (`src/catalog.ts`,
 `resolveAgentLaunch`): each AgentChoice `{agent, model, permissionMode,
@@ -314,4 +315,4 @@ are evidence-only and are never retry-requested.
     (live-string fixtures); other lanes' screens and future TUI changes are
     unverified — they read as `inconclusive`, not `unsubmitted`, so they
     warn instead of nudging. The probe + single bare Enter ran live on a
-    scratch Devin terminal only; inside a real council it is fixture-tested.
+    scratch Devin terminal and inside a live council on Devin lanes only.
