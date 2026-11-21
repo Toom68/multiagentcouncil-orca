@@ -57,7 +57,7 @@ Workers:
 - `orchestration worker-show --dispatch <ctx_...> --json` → dispatch record incl. `dispatchId`, `taskId`, `from`/`to` handles, `requestId`, `state`, timestamps (**verified**).
 - `orchestration worker-list --run <run_id> [--terminal-state <s>] --json` → `{result:{workers:[{dispatchId, taskId, state, outcome, liveness, agent, terminal, terminalState, workspace, host}]}}` (**verified row shape**).
 - `orchestration worker-read --dispatch <ctx_...> [--limit n] [--cursor <c>] [--source auto|transcript|terminal] --json` (**verified help**). Output includes agent name and model as seen by the host (e.g. "SWE-2 Max").
-- `orchestration worker-stop --dispatch <ctx>` — fences + stops supervised processes; `stop_unknown` possible (**verified help/behavior docs**).
+- `orchestration worker-stop --dispatch <ctx>` — fences + stops supervised processes; `stop_unknown` possible (**verified help/behavior docs**; observed live on an external argv-lane terminal — a cancelled run's supervisor answered `state:"stop_unknown", liveness:"unverifiable", terminalState:"retained"`, which is why `council cancel` notifies the supervisor and `council cleanup` closes such terminals by terminal custody instead).
 - `orchestration worker-abandon --dispatch <ctx>` — fence without claiming process termination.
 - `orchestration worker-release --dispatch <ctx>` — guarded release of a reclaimable settled worker; may return `ok:true` with `state:retained` and perform no process action (verified live; see §7).
 - `orchestration worker-keep-open --dispatch <ctx>` — cancels auto-release so a terminal can receive a later-phase Task.
@@ -80,7 +80,10 @@ Terminals:
 
 - `terminal create [--worktree <sel>] [--title <t>] [--command <text>] --json` → result containing the terminal handle (`result.terminal.handle`/`result.handle`; adapter extracts tolerantly).
 - `terminal wait --terminal <handle> --for tui-idle [--timeout-ms n] --json` — readiness probe.
-- `terminal show / list` — handle/state inspection.
+- `terminal show / list` — handle/state inspection. The record fields the adapter relies on (**verified live**): `connected`, `agentIdentity`, `agentWait` (non-null ⇒ a prompt/menu is up — never auto-answered), `title` (host-relayed program title, e.g. a Devin spinner glyph or `Devin ready`), `orphaned`, `exitCause`.
+- `terminal read --terminal <handle> --screen --json` → `{terminal:{source:"screen", tail:[…]}}` — the rendered screen; used by the first-turn submission probe (**verified live** on a Devin lane; only `source:"screen"` output is accepted, stream fallbacks read as unreadable).
+- `terminal close --terminal <handle> --json` — closes one exact terminal (**verified live** on 1.4.261 via a local dev-only close probe): success returns `{close:{handle,tabId,ptyKilled:true}}`; a repeat close on the same handle returns the same ok envelope — the reliable "already gone" signal is a later `terminal show` record of `connected:false` + `orphaned:true`/`exitCause:{kind:…}` (e.g. `operator_close`); an unknown handle fails `terminal_handle_stale`.
+- `terminal send --terminal <handle> --text <s>` — the one input the runner uses: a single real CR byte submits a pasted-but-unsubmitted Devin prompt (**verified live**; the adapter's `bareEnterArgv` passes `'\r'` as an argv token). A literal backslash-r is typed as text and does NOT submit; the manual form is `orca terminal send --terminal <h> --text $'\r'` (PowerShell: `--text "`r"`).
 - **`orca terminal` is a different command class than `orca orchestration`:**
   `create`/`wait` have **no `--full`** (verified live —
   `invalid_argument: Unknown flag --full for command: terminal create`
@@ -130,9 +133,16 @@ Verified facts:
   bounded supervisor launch and as a reviewer seat in a completed
   mixed-provider council. Devin lanes (`swe-2-max`, Devin-hosted
   `claude-opus-5-5-high`) have run live councils. For Devin, `worker-start`
-  reports only `input_accepted` (`turnStart: unsupported`); a pasted brief
-  can sit unsubmitted, which the council does not yet detect (see
-  VERIFICATION.md, 2026-11-21).
+  reports only `input_accepted` (`turnStart: unsupported`) — a pasted brief
+  can sit unsubmitted. The runner now detects that with a bounded read-only
+  probe (`worker-show` activity + `terminal show` title/`agentWait` +
+  `terminal read --screen`, ~24 s window, `COUNCIL_SUBMIT_PROBE_MS`) and,
+  only on a settled `unsubmitted` verdict, sends one journaled bare Enter
+  (§2 `terminal send`); anything unresolved surfaces as a
+  `launch.submit_unconfirmed` warning shown by `council status` — never a
+  silent stall or a failed attempt. Probe and nudge were exercised live on
+  a scratch Devin terminal; the gap's original evidence is in
+  VERIFICATION.md (2026-11-21).
 
 The launch policy is the shipped catalog (`src/catalog.ts`,
 `resolveAgentLaunch`): each AgentChoice `{agent, model, permissionMode,
@@ -173,7 +183,12 @@ are evidence-only and are never retry-requested.
 - Retained terminals: a settled worker's terminal may receive a new phase
   Task, but the adapter first proves no active dispatch owns it
   (`worker-list --run` filtered by terminal + unsettled outcome/state).
-  Overlapping active work on one terminal is refused.
+  Overlapping active work on one terminal is refused. These argv-lane
+  terminals are never auto-released — `worker-release` on them returns
+  `state:'retained'` (verified live, §7.10) — so the engine releases then
+  closes each terminal it journaled creating once every attempt on it has
+  settled (organiser after roster admission, the rest at terminal
+  state/cancel; `council cleanup` re-runs the pass on a finished run).
 
 ## 5. Mutation recovery and uncertainty semantics — VERIFIED 1.4.261
 
@@ -218,6 +233,18 @@ are evidence-only and are never retry-requested.
 - `worker-start` failed-with-stage receipts may carry `failedStage`
   (e.g. `agent_readiness`); retry uses `worker-start --retry-of <dispatch>`
   on the **same** Task — the engine owns the 3-strike circuit-breaker.
+- **`dispatch_run_mismatch` on `orchestration send`** (root cause proven by a
+  scratch-Run reproduction, recorded in an uncommitted dev report): a `send
+  --to run:<X>` whose `--dispatch-id` names a Dispatch belonging to a
+  different Run is refused *before any receipt is recorded* — the printed
+  request id then reads `state:"absent"` on `request-show`, indistinguishable
+  from "never sent". Orca also attaches a dispatched sender's own Dispatch
+  automatically, so the refusal can fire with no explicit flag. The working
+  shape is `send --to dispatch:<id>` with no `--dispatch-id`: Orca redirects
+  it to the mailbox that terminal reads (verified — delivered `msg_…`,
+  warning `recipient_run_bound_redirect`, request `completed`). This is why
+  the approval wake targets `dispatch:<supervisor>` — the supervisor's
+  Dispatch lives in the caller's Run, not the council child Run.
 
 ## 6. Enforcement reality
 
@@ -275,3 +302,16 @@ are evidence-only and are never retry-requested.
     this correction documented separately, not rewritten. Stop confirmation
     is likewise distinct from command acceptance. The boolean release
     contract cannot distinguish pending from refused; both remain unconfirmed.
+    The same `retained` result is expected on every council argv-lane
+    terminal (`worker-release --help` documents that reused/pre-existing
+    terminals are never closed by release) — the engine's release-then-close
+    lifecycle relies on it, treating `released:false` as "still ours to
+    close", never as release proof.
+11. **First-turn submission probe limits.** `worker-show`'s `activity` for an
+    unsubmitted-but-dispatched Devin could not be observed live, so mixed
+    signals classify `inconclusive` — a visible warning, never a false
+    `started`. The screen classifier matches current Devin TUI text
+    (live-string fixtures); other lanes' screens and future TUI changes are
+    unverified — they read as `inconclusive`, not `unsubmitted`, so they
+    warn instead of nudging. The probe + single bare Enter ran live on a
+    scratch Devin terminal only; inside a real council it is fixture-tested.

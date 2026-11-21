@@ -87,6 +87,14 @@ posture remains materially uncertain. Genuine user-local preferences are valid;
 they are not package defaults. Honor already-given authorization — do not
 re-ask. See `references/selection.md` for choice shapes and per-lane notes.
 
+Lane preconditions are part of the choice: the `claude` lane needs a
+**logged-in Claude Code** on the host (`claude auth status` — a logged-out
+terminal stalls at first-run setup and fails readiness: a seat then fails
+after its one relaunch; a supervisor launch pauses for manual resolution),
+and provider TUIs can raise their own dialogs (e.g. a Codex rate-limit
+model-switch prompt) the runner never answers — a human resolves them in
+that terminal.
+
 `references/templates/` ships fill-in files: `council.config.template.json`
 (all keys + `staff` placeholders), `council.config.smoke.template.json` (a
 bounded 2-seat rehearsal), and `roster.approved.template.json` (the approved
@@ -120,6 +128,9 @@ validation instead of silently defaulting.
   death, released terminals, and quiet sessions never prove logical task
   completion; `retained`/`stop_unknown`/`release_unknown` stay visible.
   Re-running `advance` is always safe — the journal is source of truth.
+  The one automatic exception: a fresh terminal proven to have failed BEFORE
+  worker-start is a pre-dispatch failure — the engine closes the orphan and
+  mints exactly one relaunch; a second failure fails the seat.
 
 ## Run the council (details in references/operations.md)
 
@@ -132,10 +143,14 @@ node "<SKILL_DIR>/scripts/council.mjs" start-supervisor --run <runDir> --json
 # …wait for council mail (relay each to the user), read roster.proposed.json,
 # write roster.approved.json with your seat/agent choices…
 node "<SKILL_DIR>/scripts/council.mjs" approve --run <runDir> --roster <runDir>/roster.approved.json
-# engine already attempted the supervisor wake — check supervisorWake; the
-# printed wakeCommand is only the fallback if it has not resumed.
+# engine already attempted the supervisor wake to dispatch:<supervisor> —
+# check supervisorWake (incl. any errorCode/error); the printed wakeCommand
+# is only the fallback if the active supervisor has not resumed.
+# while it runs, `status` pendingActions name exact operator fixes — e.g. a
+# `submit` action for an unsubmitted first turn, `cleanup` for leftovers.
 # on finished, read <runDir>/report.md then report.json
 node "<SKILL_DIR>/scripts/council.mjs" verify --run <runDir> --json         # drift/approval/artifact integrity
+node "<SKILL_DIR>/scripts/council.mjs" cleanup --run <runDir> --json        # finished/cancelled only: release+close council terminals
 ```
 
 **`start-supervisor` outcome check (exit 0 ≠ started).** A trust/permission
@@ -145,11 +160,26 @@ screen or custody ambiguity pauses setup — the command still exits 0 with
 terminal per `recovery`, then rerun the same command (it reuses recorded
 resources). Never wait for `needs_approval` mail a paused launch cannot send.
 
+**First-turn submission check.** On lanes where Orca cannot observe the
+first turn (Devin: `turnStart: unsupported`), a fresh launch gets a bounded
+read-only probe classifying it `started` / `unsubmitted` / `inconclusive`.
+Only a settled `unsubmitted` earns one journaled bare Enter — never twice,
+even across a crash. Anything unresolved becomes a
+`launch.submit_unconfirmed` warning shown by `council status` as a `submit`
+pending action with the exact manual command; the probe never fails or
+blocks an attempt.
+
 **First run? Rehearse bounded.** Defaults are 15 seats, a 48-launch floor,
 and hours of deadlines. Exercise the protocol cheaply first: `doctor`, then
 init with a bounded config —
 `references/templates/council.config.smoke.template.json` (10 perspectives,
 2 seats, 1 round, tighter deadlines). Afterwards `verify` the run.
+Seat count is also a memory commitment: reviewer sessions stay open (idle)
+between phases until the run's terminal cleanup closes them — each idle
+Devin session plus helpers held ~0.4 GB RAM and ~2.8 GB committed memory on
+the Windows validation host, and leftover sessions across runs exhausted the
+commit limit once. Fit `participants`/
+`concurrency` to available memory.
 
 ## Relay wakes to the user — mandatory
 

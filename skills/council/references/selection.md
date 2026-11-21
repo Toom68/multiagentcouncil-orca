@@ -63,11 +63,24 @@ behavior — old saved states and approval hashes are preserved exactly.
   Model and permission tokens are allowlisted; worker-start `--model` is not a
   reliable Devin selector. Without an explicit profile the lane uses its
   existing account/environment — report that as *ambient*, not a guaranteed
-  supplier identity.
+  supplier identity. Orca cannot observe a Devin turn start
+  (`turnStart: unsupported`), so the runner probes each fresh first turn and,
+  only on a proven `unsubmitted`, sends one bare Enter itself — a `submit`
+  pending action in `council status` means the manual submit is yours.
 - **Claude Code**: agent lane; model/effort selectors per catalog. No
-  `--settings` file is a named profile.
+  `--settings` file is a named profile. **Precondition: a logged-in Claude
+  Code on the host** — check `claude auth status` before approving a Claude
+  lane. A logged-out terminal stalls at first-run setup and fails
+  readiness — that stall was observed live. In a seat it is now a proven
+  pre-dispatch failure: one relaunch onto the same stall, then the seat
+  fails. As supervisor it instead pauses `start-supervisor` for manual
+  resolution. The lane stays help-verified until a real seat completes.
 - **Codex**: agent lane; supports a named `--profile` per the catalog. Do not
-  assume a profile name — validate it.
+  assume a profile name — validate it. Provider-side dialogs can surface in
+  its TUI (observed live: a rate-limit prompt offering a cheaper model with
+  `switch` preselected) — the runner never answers provider dialogs; a human
+  resolves them in that terminal, keeping the approved model unless you
+  decide otherwise.
 - The council never calls Orca account selection and never edits global
   provider settings. Staff and seat choices are bound to the run via
   `--config` and the approval — switching happens there, nowhere else.

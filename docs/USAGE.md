@@ -91,6 +91,9 @@ snapshot.json           # {snapshotId, gitHead, headHash, files: path→sha256} 
 meta.json               # tool/node/platform versions + launchBudgetFloor — for reproducibility
 prompts/supervisor.md   # the generated supervisor spec (written by init)
 specs/<attemptId>.md    # the exact spec file each worker attempt received
+supervisor/startup.json # supervisor startup custody record (ids, issued markers,
+                        #  pause reasons) — also the cleanup custody source;
+                        #  retired records archive under supervisor/retired/
 
 organiser/roster.proposed.json   # the organiser worker's raw output
 roster.proposed.json    # the validated, persisted proposal (what you review)
@@ -215,6 +218,11 @@ allowlisted tokens — nothing user-supplied ever becomes shell syntax.
 The idle wait is followed by a `terminal show` check of the exact terminal,
 connection, expected agent identity and explicit absence of an agent prompt.
 A trust or permission screen pauses setup; it is never accepted automatically.
+After `worker.started` is journaled it runs the same first-turn submission
+check described under `supervise --advance` (lanes where Orca cannot observe
+turn start, e.g. Devin) and reports a `submission` field — a
+`launch.submit_unconfirmed` warning means `council status` will show a
+`submit` pending action.
 JSON callers must check `outcome`/`supervisorStarted`: a command exiting 0
 with `ok:true` can still report `outcome:"paused"`,
 `supervisorStarted:false`, `needsAttention:true` — it has not launched a
@@ -288,6 +296,25 @@ reconciles before acting. There is no daemon: deadlines are evaluated inside
 right now; the calling agent must keep advancing until a non-`progress` action,
 because no external event will arrive to wake a purely local transition.
 `--advance` is required; bare `supervise` is a usage error.
+
+**First-turn submission check.** A fresh launch whose `worker-start`
+receipt cannot prove the agent's turn started (Devin reports
+`input_accepted` with `turnStart: unsupported`) is probed before the launch
+returns: a bounded, read-only loop samples `worker-show` activity, the
+relayed terminal title, and the rendered screen (`terminal show` /
+`terminal read --screen`), classifying the launch `started`, `unsubmitted`,
+or `inconclusive`. Only a settled `unsubmitted` verdict earns one bare
+Enter — journaled as a `launch.submit_nudge` intent before the send and a
+receipt after, so an attempt is never nudged twice even across a crash —
+followed by a re-probe. Anything unresolved becomes a journaled
+`launch.submit_unconfirmed` warning; the probe never fails or blocks an
+attempt. Retained-terminal follow-up turns and receipts with no
+`turnStart` field are not probed. The window defaults to ~24 s and is set
+by `COUNCIL_SUBMIT_PROBE_MS` (integer, 100–120 000 ms; the sample interval
+is window/12 clamped to 50 ms–2 s, and an `unsubmitted` verdict must hold
+for two intervals). `council status` shows still-relevant warnings as
+`submit` pending actions with the exact manual command — see the recovery
+playbooks for when to use it.
 
 **`--as-supervisor` — the dedicated supervisor's mode.** The generated
 `advanceCommand` in `prompts/supervisor.md` includes it. In this mode the CLI
@@ -376,11 +403,17 @@ to change seats).
 
 **Waking the supervisor.** `Engine.approve` already attempts the bounded
 approval-wake itself — a `mail.sent` event (`kind: "approval-wake"`)
-addressed to the bound council child Run (`run:<id>`, or the recorded
-supervisor terminal when no run is bound). `council approve` reads that
-journal back and reports it as `supervisorWake` (`outcome`: `sent`,
-`skipped`, `budget_refused`, `error`, a delivery outcome like
-`unknown`/`refused`, or `none` when nothing is journaled).
+addressed to the recorded supervisor **Dispatch** (`dispatch:<id>`) when
+one exists, else the bound council child Run (`run:<id>`), else the
+recorded supervisor terminal. The Dispatch lives in the caller's Run — the
+supervisor starts under it and later coordinates the council child Run —
+so a `run:<child>` send naming the supervisor's `--dispatch-id` is refused
+`dispatch_run_mismatch` before any receipt; the wake addresses the Dispatch
+itself and Orca routes it to the mailbox the supervisor terminal reads.
+`council approve` reads that journal back and reports it as
+`supervisorWake` (`outcome`: `sent`, `skipped`, `budget_refused`, `error`,
+a delivery outcome like `unknown`/`refused`, or `none` when nothing is
+journaled) plus any journaled host `errorCode`/`error`.
 A file write alone is never an Orca wake — but this send was attempted
 before the command returns, so **do not blindly duplicate it**: the printed
 `wakeCommand` is the manual fallback for the case where the recorded
@@ -403,7 +436,12 @@ position (reviewers with admitted independent findings vs
 `ceil(quorumRatio × seats)` — a coverage diagnostic, not a gate), and
 `pendingDecisions`/`pendingActions` (e.g. re-approve after invalidation,
 reconcile an `intent_recorded` no-task attempt — never relaunch; an
-`unknown` attempt gets observation guidance, never the reconcile command).
+`unknown` attempt gets observation guidance, never the reconcile command;
+a `submit` action names the manual submit command for a first-turn
+submission the probe left unconfirmed; a `replace` action on a provably
+stale supervisor; a `cleanup` action when a terminal run still has
+unclosed recorded terminals). The `submission` array lists the
+journal-derived first-turn warnings behind any `submit` actions.
 Additive diagnostics: `activity` (`lastEventAt`, `ageMs`, event count — a
 stalled run reads as stale, not as "working"), `phase` timing (`enteredAt`,
 `deadlineMs`, `graceMs`, `overDeadline`), `supervisorHealth` (`recorded`
@@ -476,15 +514,60 @@ council cancel --run <runDir> [--reason "<text>"] --json
 ```
 
 Guarded `requestStop` per live attempt (including `timed_out` ones — a deadline
-mark is not proof of death), requests release of settled retained terminals, marks the run
+mark is not proof of death), releases-then-closes the council-created
+terminals whose attempts are settled, marks the run
 `cancelled`, and reports `confirmedStopped` vs `unverifiable` attempts. A
 worker that never reported is inspected, never assumed dead.
+
+Once cancelled, the engine sends the recorded supervisor Dispatch ONE
+bounded, journaled notice (`mail.sent`, `kind:'cancel-notice'`) telling it
+to run `advance` once — which reports finished/cancelled — and send
+`worker_done`. It is sent only while `worker-show` observes the dispatch
+`idle`, `working`, or `waiting_human`: a settled dispatch would reopen as
+new work, and an unverifiable or unrecorded one is skipped with a journaled
+reason. Orca's `worker-stop` cannot stop the supervisor's external
+argv-lane terminal (`stop_unknown`), so this notice plus `council cleanup`
+(below) is what retires it.
 
 Orca may keep user-retained or unreclaimable sessions open. Cleanup respects
 that decision: `released:false` means release was not confirmed; it does not
 prove process exit. Only an explicit stopped result confirms cancellation.
 Inspect the journal and host receipt for unresolved resources; never force-close
 them to make a run appear clean.
+
+### `council cleanup` — close leftover council terminals on a finished run
+
+```text
+council cleanup --run <runDir> --json
+```
+
+Terminal runs only (`reported` / `failed` / `cancelled`) — it refuses
+`invalid_transition` before any host call on a live run, whose terminals
+may still be in use. Orca never auto-releases the argv-lane terminals the
+council creates, so the engine already releases then closes each terminal
+it journaled creating once every attempt on it has settled — the
+organiser's right after its roster is admitted; reviewers' and scribes'
+when the run reaches a terminal state or is cancelled (retained terminals
+reused by later phases stay open until then). `cleanup` runs the same
+release-then-close pass again over every terminal the run journaled
+creating — participant terminals plus the supervisor's, proven by
+`supervisor/startup.json` — and may additionally *observe* an unsettled
+dispatch (`worker-show`, read-only): a host `finished` verdict counts as
+settled, and on a terminal-state run an attached supervisor still observed
+`idle` may be closed even without `worker_done` (the exact reason is
+journaled). Anything `working`, `waiting_human`, `unverifiable`, or
+unobservable stays `skipped` with its reason journaled.
+
+Each terminal reports `closed` / `already_gone` / `skipped` / `failed` plus
+a summary; a journaled `closed`/`already_gone` receipt is never re-closed,
+a failed close is retried only here (never by the engine), and a
+receipt-less close intent is retried and flagged `retriedIntent`. Custody
+is strict: only terminals this run created and journaled are considered —
+nothing else is ever touched — and the calling terminal
+(`ORCA_TERMINAL_HANDLE`) is never closed, so run `cleanup` from a terminal
+other than the supervisor's. `council status` surfaces it as a `cleanup`
+pending action while unclosed recorded terminals remain, and the
+`finished` next-hint of `supervise --advance` names it.
 
 ## Progress wakes — the run mails the initiating orchestrator
 
@@ -549,6 +632,25 @@ action, and report paths on finish — never worker-liveness claims.
   automatic stale reclaim after `COUNCIL_LOCK_STALE_MS` (60 s; waits
   `COUNCIL_LOCK_WAIT_MS` 10 s). NEVER delete a lock its live pid still
   owns — that races a real writer.
+- **Fresh terminal failed before dispatch**: a readiness-wait failure or
+  refusal on a terminal the attempt itself created (e.g. a provider CLI
+  stalled at a login screen) is a proven pre-dispatch failure — the engine
+  closes the orphan and mints exactly one relaunch for that
+  seat/phase/round; a second pre-dispatch failure fails the seat under the
+  quorum rules. Anything less proven — a possibly-issued `worker-start` —
+  still blocks `launch_unknown`, keeps its terminal, and is never
+  relaunched.
+- **Unsubmitted first-turn prompt** (`submit` pending action in `status`):
+  read the screen (`orca terminal read --terminal <h> --screen --json`);
+  only if the input line still holds the brief, submit once with a bare
+  Enter — `orca terminal send --terminal <h> --text $'\r'` (PowerShell:
+  `--text "`r"`; a literal `\r` types text, it does not submit). Never
+  re-type the prompt; the runner already spent or skipped its one
+  automatic nudge.
+- **Leftover council terminals on a finished run**: `council cleanup --run
+  <runDir>` (see above) releases-then-closes them — including an idle
+  supervisor on a cancelled run, whose external terminal answers
+  `worker-stop` with `stop_unknown`.
 
 ## Configuration
 
@@ -595,6 +697,17 @@ catalog cannot launch is refused — no fallback, no substitution.
 `scribeNotesMs` 1 h, `challengeMs` 2 h, `responseMs` 2 h, `synthesisMs` 2 h,
 `runMs` 24 h (whole run), `graceMs` 30 min. Each accepts 1 000 ms – 7 days.
 
+Seat count is also a memory commitment: each seat's agent session stays
+open (idle) between its phases until the run's terminal cleanup closes it,
+and on the Windows validation host each idle Devin session plus its MCP
+helper processes held roughly 0.4 GB of RAM and about 2.8 GB of committed
+memory (closing 15 idle sessions freed ~6 GB RAM and ~42.6 GB commit).
+Before the release-then-close lifecycle existed, leftover sessions across
+runs exhausted the host's commit limit (0.3 GB free) — a new reviewer's
+shell failed to start and a running reviewer crashed. Fit `participants`/
+`concurrency` to available memory, and run `council cleanup` after every
+finished or cancelled run.
+
 With `participants=15` and `rounds=1` the launch floor is `15 + 30 + 3 = 48`,
 so the default `maxLaunches` is 56; with `rounds=3` the floor is
 `15 + 90 + 3 = 108`. Set `participants`/`rounds` lower to shrink the floor —
@@ -620,16 +733,17 @@ and deadlines for a cheap end-to-end rehearsal.
 2. Wait for the supervisor's `needs_approval` mail (council stage mail also
    arrives — relay each notice's stage/counts/next action to the user);
    review `roster.proposed.json`; write `roster.approved.json` (wrapper:
-   `schemaVersion`, `runId`, `seats[]`); run `approve`; then
-   send the printed `send --to dispatch:<id>` nudge so the supervisor's next
-   `advance` sees the approval (the engine also emits a journaled
-   approval-wake notification — the explicit nudge is the reliable wake).
+   `schemaVersion`, `runId`, `seats[]`); run `approve` — its
+   `supervisorWake` reports the journaled approval-wake to the supervisor
+   Dispatch; the printed `send --to dispatch:<id>` nudge is the manual
+   fallback, used only if the recorded active supervisor has not resumed.
 3. Wait; `status` and `tail` are read-only and safe any time. Stage mail and
    bounded heartbeats keep arriving — relay each to the user concisely;
    silence until the final report is not acceptable.
 4. Read `report.md` / `report.json` when the supervisor reports `finished`,
-   then `verify` the run. Partial results are visibly marked partial; a
-   wholly failed run emits no successful-looking report.
+   then `verify` the run, then `cleanup --run <runDir>` to close leftover
+   council terminals (also after a `cancel`). Partial results are visibly
+   marked partial; a wholly failed run emits no successful-looking report.
 
 `skills/council/SKILL.md` carries the same recipe in agent-loadable form with
 full Orca command syntax, mail-consumption rules, cancellation, and uncertain-
@@ -662,6 +776,16 @@ outcome recovery.
   Claude Opus) and `codex` have run live council seats; the `claude` CLI
   lane is help-verified — treat its first real launch as unproven, and check
   `claude auth status` first.
+- Does not guarantee first-turn submission recovery end-to-end: the probe
+  classifies terminal TUI text — inherently brittle, and verified live only
+  on a scratch Devin lane. It warns rather than fails, so an unresolved
+  `submit` warning still relies on the manual command it names.
+- Does not claim the launch/cleanup lifecycle is live-proven end-to-end:
+  `terminal close`/`show`, the submission probe + bare Enter, the
+  `dispatch:` send shape, and `council cleanup` on a cancelled run's idle
+  supervisor were each verified live against Orca 1.4.261; the full
+  in-council paths (engine closes, pre-dispatch relaunch, the approve
+  wake) are fixture-tested and await a live council.
 - Does not produce automatic fixes or rerun-diff reports in this release.
 
 ## Validation status — honest ledger
