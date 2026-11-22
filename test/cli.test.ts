@@ -445,7 +445,61 @@ test('doctor returns structured per-check results and never fails hard', async (
   assert.equal(orca.status === 'verified', names.includes('orca.status'));
   const node = checks.find((c) => c.name === 'node')!;
   assert.equal(node.status, 'verified'); // the suite itself runs on >=22
-  for (const c of checks) assert.ok(['verified', 'missing', 'failed'].includes(c.status));
+  for (const c of checks) assert.ok(['verified', 'missing', 'failed', 'unverified'].includes(c.status));
+  // Host memory is informational and always present: a session-fit estimate
+  // with its documented per-session footprint, never a readiness gate.
+  const memory = checks.find((c) => c.name === 'memory')!;
+  assert.equal(memory.required, false);
+  assert.ok(['verified', 'unverified'].includes(memory.status));
+  const mem = r.body.memory as {
+    ramFreeMb: number;
+    ramTotalMb: number;
+    additionalSessionsEstimated: number;
+    perSessionEstimate: { commitMb: number; ramMb: number };
+    peakSessionsRequired?: number;
+  };
+  assert.equal(typeof mem.ramFreeMb, 'number');
+  assert.equal(typeof mem.ramTotalMb, 'number');
+  assert.equal(typeof mem.additionalSessionsEstimated, 'number');
+  assert.ok(mem.perSessionEstimate.commitMb > 0 && mem.perSessionEstimate.ramMb > 0);
+  assert.equal(mem.peakSessionsRequired, undefined); // no --config: no council sizing
+});
+
+test('doctor memory item warns when the council cannot fit — never a hard gate', async () => {
+  const dir = tmp('doctor-mem');
+  const cfg = path.join(dir, 'mem.json');
+  writeFileSync(cfg, JSON.stringify({ participants: 15, staff: STAFF }));
+
+  // An absurd per-session footprint forces the estimate to zero: the council
+  // peak (15 seats + scribe + supervisor) can never fit — warning, not failure.
+  const noFit = await cliJson(['doctor', '--config', cfg, '--json'], {
+    COUNCIL_SESSION_COMMIT_MB: '999999999',
+    COUNCIL_SESSION_RAM_MB: '999999999',
+  });
+  assert.equal(noFit.code, 0);
+  const memNo = noFit.body.memory as {
+    additionalSessionsEstimated: number;
+    peakSessionsRequired: number;
+    fits: boolean;
+    warning?: string;
+  };
+  assert.equal(memNo.peakSessionsRequired, 17);
+  assert.equal(memNo.fits, false);
+  assert.match(memNo.warning ?? '', /15 seats.*scribe.*supervisor/);
+  const memCheck = (noFit.body.checks as { name: string; required: boolean; status: string }[]).find(
+    (c) => c.name === 'memory',
+  )!;
+  assert.equal(memCheck.required, false); // informational — `ready` never flips on it
+
+  // A tiny footprint always fits: no warning, fits true.
+  const fits = await cliJson(['doctor', '--config', cfg, '--json'], {
+    COUNCIL_SESSION_COMMIT_MB: '1',
+    COUNCIL_SESSION_RAM_MB: '1',
+  });
+  assert.equal(fits.code, 0);
+  const memYes = fits.body.memory as { fits: boolean; warning?: string };
+  assert.equal(memYes.fits, true);
+  assert.equal(memYes.warning, undefined);
 });
 
 test('doctor --config gates only the SELECTED staff, not every catalog CLI', async () => {

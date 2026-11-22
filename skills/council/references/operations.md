@@ -410,12 +410,31 @@ names it as a `cleanup` pending action while unclosed recorded terminals
 remain, and the `finished` next-hint prints it.
 
 **Memory.** A seat's session lives until the run closes it — idle reviewers
-persist through discussion, and on the Windows validation host each idle
-Devin session plus its MCP helpers held ~0.4 GB of RAM and ~2.8 GB of
-committed memory. Before this lifecycle existed, leftover sessions across
-runs exhausted the commit limit once: a new reviewer's shell failed to
-start and a running reviewer crashed. Size
-`participants`/`concurrency` to available memory, and always finish with
+persist through discussion. Measured on the Windows validation host, one
+Devin worker plus its MCP helper processes held ~3.4 GB of committed
+memory (CLI ~2.4 GB, MCP ~1.0 GB) and ~0.4 GB of RAM; a long-running
+session grows further. Before this lifecycle existed, leftover sessions
+across runs exhausted the commit limit once: a new reviewer's shell failed
+to start and a running reviewer crashed.
+
+Before choosing the seat count, run `COUNCIL doctor --config <file>
+--json` and read the `memory` item — `doctor`'s preflight is cheap and
+read-only. It reports `ramFreeMb`/`ramTotalMb`, free commit where the
+platform can measure it (`windows-cim` from `Win32_OperatingSystem`
+FreeVirtualMemory/TotalVirtualMemorySize via an argv-spawned PowerShell
+query; `linux-proc` from `/proc/meminfo` CommitLimit−Committed_AS plus
+MemAvailable; other platforms RAM only, and a probe failure surfaces as
+`commitUnverifiedReason`), and `additionalSessionsEstimated` — how many
+more agent sessions fit at the per-session footprint (~3.4 GB commit +
+~0.4 GB RAM; `COUNCIL_SESSION_COMMIT_MB`/`COUNCIL_SESSION_RAM_MB`
+override). With a config it also reports `peakSessionsRequired`
+(`participants` seats + scribe + supervisor — the organiser closes before
+reviewers launch; `concurrency` bounds active work, not idle sessions)
+and warns (`fits:false`) when the estimate says it will not fit. The item
+is informational — it never gates `ready`. If it warns, tell the user and
+suggest closing idle agent sessions they do not need, or reduce
+`participants`; NEVER close terminals the council did not create —
+closing other sessions is the user's decision. Always finish with
 `cleanup` on terminal runs.
 
 ## Recovery from uncertain outcomes

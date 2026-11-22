@@ -72,6 +72,12 @@ import {
   parseOrcaEnvelope,
 } from './host/orca.js';
 import { resolveExecutable, runProcess } from './host/process.js';
+import {
+  estimateAdditionalSessions,
+  peakCouncilSessions,
+  probeHostMemory,
+  sessionFootprintFromEnv,
+} from './hostmem.js';
 import { createPromptBuilder } from './prompts.js';
 import * as artifacts from './artifacts.js';
 import * as progress from './progress.js';
@@ -861,7 +867,8 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
 interface DoctorCheck {
   name: string;
   required: boolean;
-  status: 'verified' | 'missing' | 'failed';
+  /** 'unverified' = the probe could not measure — informational, never gates. */
+  status: 'verified' | 'missing' | 'failed' | 'unverified';
   version?: string;
   detail?: string;
 }
@@ -902,6 +909,9 @@ async function cmdDoctor(argv: readonly string[]): Promise<{ payload: Record<str
     run: { type: 'string' },
   });
   const checks: DoctorCheck[] = [];
+  // The memory probe spawns powershell on Windows (~1 s); it runs
+  // concurrently with the orca status probe below so doctor stays fast.
+  const memProbe = probeHostMemory();
 
   const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
   checks.push({
@@ -1036,22 +1046,95 @@ async function cmdDoctor(argv: readonly string[]): Promise<{ payload: Record<str
     }
   }
 
+  // Host memory — informational only, never gates `ready`. Reports free RAM
+  // (os.freemem) and free commit where the platform can measure it (Windows
+  // CIM Win32_OperatingSystem; Linux /proc/meminfo), then estimates how many
+  // additional agent sessions fit at a documented per-session footprint.
+  // With a selection, it compares against the council's peak retained
+  // sessions (participants + scribe + supervisor — the organiser's terminal
+  // closes before reviewers launch, and concurrency bounds active work, not
+  // idle retained sessions) and warns when the estimate says it will not fit.
+  const mem = await memProbe;
+  const footprint = sessionFootprintFromEnv();
+  const estimate = estimateAdditionalSessions(mem, footprint);
+  const fmtMb = (mb: number): string => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
+  const memDetailParts = [
+    `RAM ${fmtMb(mem.ramFreeMb)} free of ${fmtMb(mem.ramTotalMb)}` +
+      (mem.memAvailableMb !== undefined ? ` (${fmtMb(mem.memAvailableMb)} available)` : ''),
+    mem.commitFreeMb !== undefined
+      ? `commit ${fmtMb(mem.commitFreeMb)} free of ${fmtMb(mem.commitTotalMb ?? 0)} (${mem.commitSource ?? 'probe'})`
+      : `commit unverified: ${mem.commitUnverifiedReason ?? 'no probe'}`,
+    `~${estimate.additionalSessions} more agent sessions fit at ~${fmtMb(footprint.commitMb)} commit + ` +
+      `~${fmtMb(footprint.ramMb)} RAM each — per-session footprint measured for Devin workers on one Windows host ` +
+      `(COUNCIL_SESSION_COMMIT_MB/COUNCIL_SESSION_RAM_MB override)`,
+  ];
+  const memory: Record<string, unknown> = {
+    ramFreeMb: mem.ramFreeMb,
+    ramTotalMb: mem.ramTotalMb,
+    ...(mem.memAvailableMb !== undefined ? { memAvailableMb: mem.memAvailableMb } : {}),
+    ...(mem.commitFreeMb !== undefined
+      ? {
+          commitFreeMb: mem.commitFreeMb,
+          commitTotalMb: mem.commitTotalMb,
+          commitSource: mem.commitSource,
+        }
+      : { commitUnverifiedReason: mem.commitUnverifiedReason }),
+    perSessionEstimate: {
+      commitMb: footprint.commitMb,
+      ramMb: footprint.ramMb,
+      basis:
+        'one idle Devin worker plus MCP helper processes measured on a single Windows host; ' +
+        'override with COUNCIL_SESSION_COMMIT_MB / COUNCIL_SESSION_RAM_MB',
+    },
+    additionalSessionsEstimated: estimate.additionalSessions,
+    limitedBy: estimate.limitedBy,
+  };
+  let memWarning: string | undefined;
+  if (selectedConfig !== undefined) {
+    const peakSessions = peakCouncilSessions(selectedConfig);
+    const fits = estimate.additionalSessions >= peakSessions;
+    memory.peakSessionsRequired = peakSessions;
+    memory.fits = fits;
+    if (!fits) {
+      memWarning =
+        `estimated ${estimate.additionalSessions} additional sessions fit but this council peaks at ` +
+        `~${peakSessions} retained sessions (${selectedConfig.participants} seats + scribe + supervisor) — ` +
+        'close idle agent sessions you do not need, or reduce participants before launching';
+      memory.warning = memWarning;
+      memDetailParts.push(`WARNING: ${memWarning}`);
+    } else {
+      memDetailParts.push(
+        `council peak ~${peakSessions} retained sessions (${selectedConfig.participants} seats + scribe + supervisor) fits`,
+      );
+    }
+  }
+  checks.push({
+    name: 'memory',
+    required: false,
+    // 'unverified' only when this platform's commit probe ran and failed;
+    // RAM-only platforms legitimately lack a commit measurement.
+    status: mem.commitProbed && mem.commitFreeMb === undefined ? 'unverified' : 'verified',
+    detail: memDetailParts.join('; '),
+  });
+
   const ready = checks.every((c) => !c.required || c.status === 'verified');
   return {
     payload: {
       ready,
       catalog: { catalogVersion: CATALOG_VERSION, policyHash: LAUNCH_POLICY_HASH },
       checks,
+      memory,
       note:
         'host checks (node, orca) are always required; catalog.* lanes are informational ' +
         'presence only — not authentication, approval, free or unlimited usage. ' +
-        'With --config/--run, staff.* checks gate only the SELECTED seats',
+        'With --config/--run, staff.* checks gate only the SELECTED seats. ' +
+        'memory is informational: its session-fit figure is an estimate, never a gate',
     },
     human: [
       `environment: ${ready ? 'READY' : 'NOT READY'}`,
       ...checks.map(
         (c) =>
-          `  ${c.status.padEnd(8)} ${c.name}${c.required ? ' (required)' : ''}${c.version ? ` — ${c.version}` : ''}${c.detail ? ` — ${c.detail}` : ''}`,
+          `  ${c.status.padEnd(10)} ${c.name}${c.required ? ' (required)' : ''}${c.version ? ` — ${c.version}` : ''}${c.detail ? ` — ${c.detail}` : ''}`,
       ),
     ].join('\n'),
   };
@@ -4085,8 +4168,10 @@ commands:
                                     is settled/fenced/never issued; reports
                                     closed / already gone / skipped / failed
   doctor    [--config <file> | --run <runDir>]
-            host check (node/orca) + informational catalog-lane presence;
-            with a selection, only the chosen staff's binaries gate readiness
+            host check (node/orca) + informational catalog-lane presence and
+            host-memory headroom estimate; with a selection, only the chosen
+            staff's binaries gate readiness and the memory item warns when
+            the council's peak retained sessions may not fit
 
 all commands accept --json for machine-readable output.
 

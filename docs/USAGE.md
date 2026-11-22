@@ -188,13 +188,33 @@ unlimited. The command launches nothing and inspects no credentials.
 council doctor [--config <file> | --run <runDir>] --json
 ```
 
-Reports each check as `verified` / `missing` / `failed`: Node ≥ 22, the `orca`
-executable (`ORCA_CLI_COMMAND` or `orca` on PATH) plus a live `orca status
---json` call — the always-required host checks. Every catalog lane also
-appears as an *informational* presence check. With `--config` or `--run`,
-each staff role's AgentChoice is validated against the catalog and only the
-**selected** agents' binaries gate readiness; a legacy staff-less config is
-reported as such. `ready` is true when every required check verifies.
+Reports each check as `verified` / `missing` / `failed` / `unverified`:
+Node ≥ 22, the `orca` executable (`ORCA_CLI_COMMAND` or `orca` on PATH)
+plus a live `orca status --json` call — the always-required host checks.
+Every catalog lane also appears as an *informational* presence check. With
+`--config` or `--run`, each staff role's AgentChoice is validated against
+the catalog and only the **selected** agents' binaries gate readiness; a
+legacy staff-less config is reported as such. `ready` is true when every
+required check verifies.
+
+The `memory` item is informational (`verified` when measured, `unverified`
+when the platform's commit probe ran and failed — never a readiness gate):
+`ramFreeMb`/`ramTotalMb` from `os.freemem()`/`os.totalmem()`, and free
+commit where measurable — Windows via `Win32_OperatingSystem`
+`FreeVirtualMemory`/`TotalVirtualMemorySize` through a fixed argv-spawned
+PowerShell CIM query (`windows-cim`), Linux via `/proc/meminfo`
+`CommitLimit`−`Committed_AS` plus `MemAvailable` (`linux-proc`), other
+platforms RAM only. `additionalSessionsEstimated` counts how many more
+agent sessions fit at the per-session footprint in `perSessionEstimate`
+(~3.4 GB commit + ~0.4 GB RAM — one idle Devin worker plus MCP helpers
+measured on a single Windows host; `COUNCIL_SESSION_COMMIT_MB` /
+`COUNCIL_SESSION_RAM_MB` override). With `--config`/`--run` it also reports
+`peakSessionsRequired` (`participants` seats + scribe + supervisor — the
+organiser's terminal closes before reviewers launch; `concurrency` bounds
+active work, not idle sessions) and warns (`fits:false` + `warning`) when
+the estimate says it will not fit. If it warns, tell the user and suggest
+closing idle agent sessions they do not need, or reduce `participants`;
+never close terminals the council did not create.
 
 ### `council start-supervisor` — launch the dedicated supervisor worker
 
@@ -698,15 +718,20 @@ catalog cannot launch is refused — no fallback, no substitution.
 `runMs` 24 h (whole run), `graceMs` 30 min. Each accepts 1 000 ms – 7 days.
 
 Seat count is also a memory commitment: each seat's agent session stays
-open (idle) between its phases until the run's terminal cleanup closes it,
-and on the Windows validation host each idle Devin session plus its MCP
-helper processes held roughly 0.4 GB of RAM and about 2.8 GB of committed
-memory (closing 15 idle sessions freed ~6 GB RAM and ~42.6 GB commit).
-Before the release-then-close lifecycle existed, leftover sessions across
-runs exhausted the host's commit limit (0.3 GB free) — a new reviewer's
-shell failed to start and a running reviewer crashed. Fit `participants`/
-`concurrency` to available memory, and run `council cleanup` after every
-finished or cancelled run.
+open (idle) between its phases until the run's terminal cleanup closes it.
+Measured on the Windows validation host, one Devin worker plus its MCP
+helper processes held ~3.4 GB of committed memory (CLI ~2.4 GB, MCP ~1.0
+GB) and ~0.4 GB of RAM; a long-running session grows further. Before the
+release-then-close lifecycle existed, leftover sessions across runs
+exhausted the host's commit limit (0.3 GB free) — a new reviewer's shell
+failed to start and a running reviewer crashed. Before choosing the seat
+count, run `council doctor --config <file>` and read the `memory` item: it
+estimates how many additional agent sessions fit and warns when the
+council's peak retained sessions (participants + scribe + supervisor) will
+not. If it warns, tell the user and suggest closing idle agent sessions
+they do not need, or reduce `participants` — never close terminals the
+council did not create. Run `council cleanup` after every finished or
+cancelled run.
 
 With `participants=15` and `rounds=1` the launch floor is `15 + 30 + 3 = 48`,
 so the default `maxLaunches` is 56; with `rounds=3` the floor is
@@ -720,7 +745,8 @@ and deadlines for a cheap end-to-end rehearsal.
 ## Flow recap for the calling agent
 
 0. `doctor --config <file> --json` — preflight Node/Orca plus the selected
-   staff's binaries before committing launches.
+   staff's binaries, and read the `memory` item for seat-count headroom
+   before committing launches.
 1. `init` (with an explicit `staff` in `--config` — see the templates under
    `skills/council/references/templates/`) → `start-supervisor`
    (which resolves the run's `staff.supervisor` catalog lane and records the
