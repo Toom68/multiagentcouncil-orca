@@ -622,3 +622,35 @@ Earlier the same day, `council cleanup` on cancelled run
 Still fixture-tested only: the single pre-dispatch relaunch (no terminal
 failed before dispatch in the live run) and the cancel notice to a live
 supervisor. The probe's screen classifier is verified on Devin lanes only.
+
+## Memory headroom and lean Devin workers (2026-11-22)
+
+**Host measurements** (this Windows host, per-session process trees):
+an idle short-lived Devin worker is ~1.47 GB committed / 34 processes of
+which ~1.0 GB and ~32 processes are MCP helper servers; a long-lived
+session's Devin processes grow further (observed 2.4–5.7 GB commit per
+session family including helpers). Skill and doctor estimates use
+~3.4 GB commit / ~0.4 GB RAM per seat as a conservative development
+default, overridable with `COUNCIL_SESSION_COMMIT_MB` /
+`COUNCIL_SESSION_RAM_MB`.
+
+**`doctor` memory item** (`aac67b0`): unit-tested parsers (Windows CIM
+output, `/proc/meminfo`, probe failure → `unverified`) and a live
+`doctor --json` run on this host reporting free RAM, free commit
+(`windows-cim` source) and an estimated additional-session count; a
+15-seat config reported `fits:false` with a warning while `ready` stayed
+`true`. The check never gates readiness.
+
+**Lean Devin workers** (`ddb0b59`, opt-in `config.leanMcp`): mechanism
+investigated and verified on Devin CLI v3000.11.92 — a generated
+`.devin/mcp_config.local.json` of names-only `{"disabled": true}` stubs
+overrides same-named user-scope servers (live `devin mcp list` in a
+scratch dir: 13 enabled → 0 enabled, ~1.47 → ~0.37 GB committed, 34 → 2
+processes), and `.devin/config.local.json` `read_config_from` all-false
+suppresses runtime imports. Auth is `credentials.toml`-based and
+unaffected. Implementation adds journal-first generation once per run
+start, exact-byte backup/merge/restore of pre-existing user files, and
+`.git/info/exclude` cleanliness. 856 tests, 853 pass, 3 Windows symlink
+skips. **Live-unverified:** the run-integrated generation/restore path
+has not yet been exercised by a real council; the scratch-dir file
+generation and `mcp list` before/after are verified.
