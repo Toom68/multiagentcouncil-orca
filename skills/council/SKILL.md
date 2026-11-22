@@ -180,8 +180,12 @@ sessions across runs once exhausted the host's commit limit. Before
 choosing the seat count, run `doctor --config <file>` and read the `memory`
 item — it reports free RAM/commit and estimates how many more agent
 sessions fit (~3.4 GB commit + ~0.4 GB RAM per Devin session, measured on
-one Windows host). If it warns the council will not fit, tell the user and
-suggest closing idle agent sessions they do not need, or reduce
+one Windows host). The opt-in `leanMcp` config field cuts the Devin share
+(~1.1 GB commit + ~32 processes saved per idle seat, same host) by writing
+worktree-root `.devin` stubs before the first Devin launch — it is
+best-effort, journaled, restored at cleanup, and live-unverified in a real
+council; see docs/USAGE.md. If it warns the council will not fit, tell the
+user and suggest closing idle agent sessions they do not need, or reduce
 `participants`. NEVER close terminals the council did not create — closing
 other sessions is the user's decision.
 

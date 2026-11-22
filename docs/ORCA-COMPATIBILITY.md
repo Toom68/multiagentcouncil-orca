@@ -124,6 +124,17 @@ Verified facts:
 - `devin` CLI v3000.11.92 accepts `--model <id>` (env `DEVIN_MODEL`); the
   account catalog lists `swe-2-max` as **Free** (lightning variants are paid —
   never substitute).
+- Devin MCP config discovery walks UP from a session's cwd and merges user
+  scope with `.devin/mcp_config*.json` / `.devin/config*.json`, where
+  `*.local.json` overrides same-named user-scope entries by name alone. The
+  opt-in `config.leanMcp` run writes `.devin/mcp_config.local.json` disabled
+  stubs plus an all-false `read_config_from` `.devin/config.local.json` at
+  the worker worktree root (the terminal's `worktreePath`, resolved via
+  `terminal show --json`; Orca worker terminals open at the worktree root).
+  `devin mcp list` enumerates enabled server names — its `Command:`/`URL:`
+  lines carry credentials and are never persisted. Verified host effect:
+  ~1.1 GB commit and ~32 helper processes saved per idle Devin seat
+  (Windows-only measurement; run-integrated path is live-unverified).
 - `worker-start --model <m>` is honored for Claude/Codex-class agents but is
   **not** a reliable Devin selector — so the catalog's Devin lane emits the
   model on `terminal create --command` argv instead.

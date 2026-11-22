@@ -43,6 +43,9 @@ import {
   type FindingsFile,
   type JournalEvent,
   type JournalEventType,
+  type LeanEnvCleanupReport,
+  type LeanEnvFileRecord,
+  type LeanEnvRecord,
   type Participant,
   type ParticipantId,
   type Perspective,
@@ -96,6 +99,13 @@ import {
   type ReceiptCategory,
 } from './artifacts.js';
 import { createProgressNotifier, type ProgressEvent } from './progress.js';
+import {
+  applyLeanPlan,
+  ensureGitExclude,
+  LEAN_BACKUP_DIR,
+  planLeanWrites,
+  restoreLeanFiles,
+} from './host/devin-lean.js';
 import {
   applyChallengesToLedger,
   applyResponsesToLedger,
@@ -313,6 +323,18 @@ interface StepCtx {
    * their ORIGINAL dedupe identity, never guessed state.
    */
   lifecycleJournal: JournalEvent[];
+  /**
+   * Durable lean-env record (journal-derived, last lean.env generate/restore
+   * receipt wins). 'active' files are in place; 'skipped' means generation
+   * was declined once and is never retried this run.
+   */
+  leanEnv?: LeanEnvRecord;
+  /**
+   * Journaled lean.env generation intent without a receipt (crash between
+   * them): its names bound which stubs a partial write could have left, so
+   * regeneration can tell our own output from a user file.
+   */
+  leanEnvIntent?: { worktreeRoot?: string; names: string[] };
 }
 
 /**
@@ -1590,6 +1612,12 @@ export function createEngine(deps: EngineDeps): Engine {
     ) {
       return { kind: 'concurrency' };
     }
+    // Opt-in lean-MCP env: the worktree .devin stubs must exist before the
+    // FIRST Devin-lane host mutation of the run (a resumed intent's worker
+    // may also still be starting — generation leads every launch). Journaled
+    // once; a journaled record (generated or skipped) makes this a no-op.
+    const lean = await ensureLeanEnv(ctx, p);
+    if (!lean.ok) return { kind: 'task_error', error: lean.error };
     // Resume of a persisted intent: the host mutation may have landed after
     // the intent flush but before its receipt — resolve by OBSERVATION first.
     if (attempt.status === 'intent_recorded') {
@@ -3685,6 +3713,193 @@ export function createEngine(deps: EngineDeps): Engine {
     return closeTerminalWithCustody(ctx, { ...t, reason: 'supervisor_after_run' }, 'cleanup');
   };
 
+  // ── Opt-in lean-MCP environment (config.leanMcp) ──────────────────────────
+  //
+  // `.devin` project-local stubs at the worker worktree root suppress the
+  // user-scope MCP helpers a Devin session would otherwise spawn (verified
+  // mechanism — .council-dev/reports/lean-devin.md). Generated ONCE per run
+  // before the first Devin-lane launch (the user's server list drifts between
+  // runs, so this is never an init-time artifact); the journaled record is
+  // what terminal cleanup restores from. Everything is best-effort:
+  // generation or restore problems are journaled warnings, never launch or
+  // run failures. Server NAMES are the only thing enumerated — command/URL
+  // lines carry credentials and never enter the journal, state, or artifacts.
+
+  /**
+   * Generate the lean env before a Devin-lane launch, once per run. The
+   * journal leads every write: probe → plan (reads only) → journaled intent →
+   * back up + write → journaled receipt → smoke check. A `skipped` receipt is
+   * the durable "declined" marker — deterministic, never retried this run.
+   */
+  const ensureLeanEnv = async (ctx: StepCtx, p: Participant): Promise<Result<void>> => {
+    if (ctx.state.config.leanMcp !== true) return ok(undefined);
+    if (ctx.leanEnv !== undefined) return ok(undefined); // journaled already
+    if (p.agent.agent !== 'devin') return ok(undefined); // only Devin lanes read .devin
+    const skip = async (reason: string, extra?: Record<string, unknown>): Promise<Result<void>> => {
+      ctx.leanEnv = { status: 'skipped', reason };
+      emit(ctx, 'lean.env', { stage: 'receipt', op: 'generate', outcome: 'skipped', reason, ...extra });
+      return await flush(ctx);
+    };
+    const probe = deps.leanEnv;
+    if (probe === undefined) {
+      return skip('no lean-env probe configured — this runner cannot enumerate the worktree/MCP state');
+    }
+    const root = await probe.worktreeRoot();
+    if (!root.ok) {
+      return skip(`worktree root unresolved: ${root.error.message}`);
+    }
+    const worktreeRoot = root.value;
+    const listed = await probe.listEnabledMcpNames({ worktreeRoot });
+    if (!listed.ok) {
+      return skip(`cannot enumerate enabled MCP names: ${listed.error.message}`, { worktreeRoot });
+    }
+    const names = listed.value;
+    const planR = await planLeanWrites({
+      worktreeRoot,
+      names,
+      ...(ctx.leanEnvIntent !== undefined ? { oursNames: ctx.leanEnvIntent.names } : {}),
+    });
+    if (!planR.ok) return skip(`plan failed: ${planR.error.message}`, { worktreeRoot });
+    const plan = planR.value;
+    // Journal the exact plan BEFORE any write — a crash mid-generation
+    // leaves the intent durable so regeneration can identify our files.
+    emit(ctx, 'lean.env', {
+      stage: 'intent',
+      op: 'generate',
+      worktreeRoot,
+      names,
+      files: plan.files.map((f) => ({ path: f.rel, action: f.action })),
+      ...(plan.warnings.length > 0 ? { planWarnings: plan.warnings.slice(0, 8) } : {}),
+    });
+    const fi = await flush(ctx);
+    if (!fi.ok) return fi;
+    const applied = await applyLeanPlan({
+      plan,
+      backupExists: async (backupRel) => {
+        const e = await store.artifactExists(backupRel);
+        return e.ok === true && e.value === true;
+      },
+      writeBackup: async (backupRel, bytes) => await store.writeArtifact(backupRel, bytes),
+    });
+    const gitExclude = await ensureGitExclude(worktreeRoot);
+    const warnings = applied.warnings.slice(0, 16);
+    ctx.leanEnv = {
+      status: 'active',
+      worktreeRoot,
+      names,
+      files: applied.files,
+      generatedAt: ctx.now.toISOString(),
+    };
+    emit(ctx, 'lean.env', {
+      stage: 'receipt',
+      op: 'generate',
+      outcome: 'generated',
+      worktreeRoot,
+      names,
+      files: applied.files,
+      generatedAt: ctx.now.toISOString(),
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(applied.failures.length > 0 ? { failures: applied.failures.slice(0, 8) } : {}),
+      gitExclude: {
+        applied: gitExclude.applied,
+        ...(gitExclude.excludePath !== undefined ? { path: gitExclude.excludePath } : {}),
+        ...(gitExclude.added !== undefined ? { added: gitExclude.added } : {}),
+        ...(gitExclude.warning !== undefined ? { warning: gitExclude.warning } : {}),
+      },
+    });
+    const fr = await flush(ctx);
+    if (!fr.ok) return fr;
+    // Launch-gate smoke check: enabled names we expected to stub but which
+    // still enumerate = lean silently degraded. Journaled, never blocking.
+    if (applied.files.length > 0) {
+      const smoke = await probe.listEnabledMcpNames({ worktreeRoot });
+      if (!smoke.ok) {
+        emit(ctx, 'lean.env', {
+          stage: 'warning',
+          op: 'smoke',
+          worktreeRoot,
+          reason: `smoke check could not re-enumerate MCP names: ${smoke.error.message}`,
+        });
+      } else {
+        const residual = smoke.value.filter((n) => names.includes(n));
+        if (residual.length > 0) {
+          emit(ctx, 'lean.env', {
+            stage: 'warning',
+            op: 'smoke',
+            worktreeRoot,
+            residual,
+            reason: `${residual.length} enabled MCP name(s) survived stubbing — lean env is degraded for these servers`,
+          });
+        }
+      }
+      if (ctx.events.length > 0) {
+        const fw = await flush(ctx);
+        if (!fw.ok) return fw;
+      }
+    }
+    return ok(undefined);
+  };
+
+  /**
+   * Restore the worktree at terminal-run cleanup. 'merged' files get their
+   * backed-up bytes restored exactly; 'created' files are deleted (or kept
+   * minus our keys when outside content appeared). Idempotent, journaled,
+   * and NEVER fails the run or the cleanup pass — every failure is a
+   * journaled warning in the report.
+   */
+  const restoreLeanEnv = async (
+    ctx: StepCtx,
+    source: 'engine' | 'cleanup',
+  ): Promise<LeanEnvCleanupReport | undefined> => {
+    const rec = ctx.leanEnv;
+    if (rec === undefined || rec.status !== 'active' || rec.files === undefined || rec.files.length === 0) {
+      return undefined;
+    }
+    const worktreeRoot = rec.worktreeRoot;
+    if (worktreeRoot === undefined) {
+      emit(ctx, 'lean.env', {
+        stage: 'warning', op: 'restore', source,
+        reason: 'lean env record has no worktreeRoot — cannot restore; inspect the worktree manually',
+      });
+      return { status: 'skipped', files: [], warnings: ['lean env record missing worktreeRoot'] };
+    }
+    emit(ctx, 'lean.env', { stage: 'intent', op: 'restore', source, worktreeRoot });
+    const fi = await flush(ctx);
+    if (!fi.ok) {
+      // Restore must not be attempted without its journaled intent — but a
+      // cleanup pass must still report, never fail the run's outcome.
+      emit(ctx, 'error', {
+        op: 'lean-restore',
+        detail: `restore intent could not be journaled (${fi.error.message}); files left in place — retry council cleanup`,
+      });
+      return { status: 'failed', files: [], warnings: [`restore intent unjournaled: ${fi.error.message}`] };
+    }
+    const result = await restoreLeanFiles({
+      worktreeRoot,
+      files: rec.files,
+      readBackup: async (backupRel) => await store.readArtifact(backupRel),
+    });
+    const outcome: LeanEnvCleanupReport['status'] = result.allClean ? 'restored' : 'failed';
+    ctx.leanEnv = { ...rec, status: 'restored', restoredAt: ctx.now.toISOString() };
+    emit(ctx, 'lean.env', {
+      stage: 'receipt',
+      op: 'restore',
+      outcome,
+      source,
+      worktreeRoot,
+      files: result.entries,
+      restoredAt: ctx.now.toISOString(),
+      ...(result.warnings.length > 0 ? { warnings: result.warnings.slice(0, 16) } : {}),
+    });
+    // Best-effort flush — cleanup reporting must never crash on it.
+    await flush(ctx);
+    return {
+      status: outcome,
+      files: result.entries,
+      warnings: result.warnings,
+    };
+  };
+
   /**
    * Runner-originated mail with the advertised per-recipient budget actually
    * enforced (clm_0003): every recipient target may receive at most
@@ -4245,6 +4460,54 @@ export function createEngine(deps: EngineDeps): Engine {
           ctx.terminalCloseSkips.add(`${h}|${e.payload.reason}`);
         }
       }
+      // Lean-env durable record — the journal IS the run record for which
+      // worktree files were created vs merged, so a crash mid-generation or
+      // mid-restore is reconciled from here, never guessed.
+      if (e.type === 'lean.env') {
+        const p = e.payload ?? {};
+        const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+        const strArr = (v: unknown): string[] =>
+          Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+        if (p.stage === 'intent' && p.op === 'generate') {
+          ctx.leanEnvIntent = {
+            ...(str(p.worktreeRoot) !== undefined ? { worktreeRoot: p.worktreeRoot as string } : {}),
+            names: strArr(p.names),
+          };
+        } else if (p.stage === 'receipt' && p.op === 'generate') {
+          ctx.leanEnvIntent = undefined;
+          const files: LeanEnvFileRecord[] = [];
+          if (Array.isArray(p.files)) {
+            for (const f of p.files) {
+              if (typeof f !== 'object' || f === null || Array.isArray(f) || typeof f.path !== 'string') continue;
+              const rec: LeanEnvFileRecord = {
+                path: f.path,
+                action: f.action === 'merged' ? 'merged' : 'created',
+                ...(str(f.backup) !== undefined ? { backup: f.backup as string } : {}),
+                ...(str(f.backupSha256) !== undefined ? { backupSha256: f.backupSha256 as string } : {}),
+              };
+              const sn = strArr(f.stubbedNames);
+              if (sn.length > 0) rec.stubbedNames = sn;
+              const ck = strArr(f.configKeys);
+              if (ck.length > 0) rec.configKeys = ck;
+              files.push(rec);
+            }
+          }
+          ctx.leanEnv = {
+            status: p.outcome === 'skipped' ? 'skipped' : 'active',
+            ...(str(p.worktreeRoot) !== undefined ? { worktreeRoot: p.worktreeRoot as string } : {}),
+            names: strArr(p.names),
+            ...(files.length > 0 ? { files } : {}),
+            ...(str(p.reason) !== undefined ? { reason: p.reason as string } : {}),
+            ...(str(p.generatedAt) !== undefined ? { generatedAt: p.generatedAt as string } : {}),
+          };
+        } else if (p.stage === 'receipt' && p.op === 'restore' && ctx.leanEnv !== undefined) {
+          ctx.leanEnv = {
+            ...ctx.leanEnv,
+            status: 'restored',
+            ...(str(p.restoredAt) !== undefined ? { restoredAt: p.restoredAt as string } : {}),
+          };
+        }
+      }
       // RA-006: an error carrying `uncertain:true` is an issued mutation
       // whose receipt was lost — reconcile by observation, never a proven
       // no-effect refusal. Only definitive errors close the stage.
@@ -4602,7 +4865,11 @@ export function createEngine(deps: EngineDeps): Engine {
         // Terminal run: release-then-close every engine-created participant
         // terminal (idempotent; also completes a crash-interrupted pass on
         // a later advance). Never changes the run's terminal state.
-        if (TERMINAL_STATUS.has(ctx.state.status)) await finalizeRunTerminals(ctx, 'engine');
+        if (TERMINAL_STATUS.has(ctx.state.status)) {
+          await finalizeRunTerminals(ctx, 'engine');
+          // Lean env outlives retained terminals exactly as long as they do.
+          await restoreLeanEnv(ctx, 'engine');
+        }
         // Durable first: the blocked reason is journaled before the flush so
         // P-D4 catch-up can replay it; the wake plan is computed in-lock
         // from persisted records and DRAINED after the lock releases.
@@ -4690,6 +4957,22 @@ export function createEngine(deps: EngineDeps): Engine {
             err('roster_invalid', 're-approval must reproduce the exact launched seats/agents; start a new run to change the roster'),
           );
         }
+        // leanMcp with no devin lane anywhere is almost certainly a config
+        // mistake — warn (never refuse); the flag is already approval-bound
+        // via state.config so the warning is an operator hint, not a gate.
+        const warnings: string[] = [];
+        if (state.config.leanMcp === true) {
+          const staff = state.config.staff;
+          const devinBound =
+            roster.seats.some((s) => s.agent.agent === 'devin') ||
+            (staff !== undefined &&
+              [staff.organiser, staff.scribe, staff.supervisor].some((a) => a.agent === 'devin'));
+          if (!devinBound) {
+            warnings.push(
+              'leanMcp is enabled but the approved roster+staff contain no devin-lane worker — no .devin stubs will be generated and the flag has no effect',
+            );
+          }
+        }
         const snapR = await store.readSnapshot();
         if (!snapR.ok) return failRes(snapR.error);
         const binding = buildApprovalBinding(state, roster, proposedR.value, snapR.value);
@@ -4710,6 +4993,9 @@ export function createEngine(deps: EngineDeps): Engine {
         if (!wa.ok) return wa;
         state.approvalHash = hash;
         emit(ctx, 'approval.granted', { hash, approvalId: record.approvalId, approver: input.approver, seats: roster.seats.length, reApproval: reapproval });
+        for (const w of warnings) {
+          emit(ctx, 'lean.env', { stage: 'warning', op: 'approve', reason: w });
+        }
         if (fresh) {
           for (const seat of roster.seats) {
             // Idempotent (clm_0007): a retried approve after append-ok/
@@ -4755,7 +5041,7 @@ export function createEngine(deps: EngineDeps): Engine {
         const wakes: WakeEvent[] = [{ kind: 'approval', approver: input.approver, approvalHash: hash }];
         if (fresh) wakes.push({ kind: 'stage', status: 'independent_review' });
         plan = planWakes(ctx, wakes, false);
-        return ok({ approvalId: record.approvalId, hash });
+        return ok({ approvalId: record.approvalId, hash, ...(warnings.length > 0 ? { warnings } : {}) });
       });
       if (plan !== null) await drainWakes(plan);
       return inner;
@@ -4923,6 +5209,7 @@ export function createEngine(deps: EngineDeps): Engine {
         state.status = 'cancelled';
         emit(ctx, 'run.finished', { outcome: 'cancelled', reason: input.reason });
         await finalizeRunTerminals(ctx, 'engine');
+        await restoreLeanEnv(ctx, 'engine');
         await noticeSupervisorCancelled(ctx, input.reason);
         const f = await flush(ctx);
         if (!f.ok) return f;
@@ -5003,9 +5290,12 @@ export function createEngine(deps: EngineDeps): Engine {
         if (input.supervisor !== undefined && !terminals.some((t) => t.terminalHandle === input.supervisor!.terminalHandle)) {
           terminals.push(await cleanupSupervisorTerminal(ctx, input.supervisor, input.callerHandle));
         }
+        // Lean restore finishes whatever a crash left mid-restore; failures
+        // are journaled warnings in the report, never cleanup errors.
+        const lean = await restoreLeanEnv(ctx, 'cleanup');
         const f = await flush(ctx);
         if (!f.ok) return f;
-        return ok({ status: ctx.state.status, terminals });
+        return ok({ status: ctx.state.status, terminals, ...(lean !== undefined ? { lean } : {}) });
       });
     } catch (e) {
       return failRes(err('io_error', `cleanup crashed: ${e instanceof Error ? e.message : String(e)}`));

@@ -704,6 +704,7 @@ only cap and validate outputs afterwards.
 | `deadlines` | object below | per-phase wall-clock limits in ms, checked inside `advance` (never real-time) |
 | `staff` | required on fresh runs | `{organiser, scribe, supervisor}` — each a complete AgentChoice `{agent, model, permissionMode, effort?, profile?}` from the shipped catalog; a partial staff object is invalid |
 | `execution` | captured by `init` | `{catalogVersion, policyHash}` — the shipped catalog fingerprint; a supplied fingerprint must match or init refuses |
+| `leanMcp` | absent = off | opt-in `true`/`false`: slim Devin-lane worker sessions by writing `.devin` project-local stubs at the worker worktree root — see below; it is approval-bound (flipping it invalidates the approval like every other config field) and never changes launch argv or the policy hash |
 
 `AgentChoice` axes: `agent` is the CLI lane (`devin`/`claude`/`codex`);
 `model` is an explicit model id validated as data; `permissionMode` is a
@@ -732,6 +733,53 @@ not. If it warns, tell the user and suggest closing idle agent sessions
 they do not need, or reduce `participants` — never close terminals the
 council did not create. Run `council cleanup` after every finished or
 cancelled run.
+
+`leanMcp` is the opt-in way to shrink that per-seat cost for Devin lanes.
+When `config.leanMcp === true`, once per run — before the first Devin-lane
+worker launch — the engine resolves the actual worker worktree root from
+the terminal's Orca metadata (`terminal show` → `worktreePath`), enumerates
+the enabled MCP server NAMES via one `devin mcp list` (command/URL/args are
+never read into the journal — they carry credentials), and writes:
+
+- `.devin/mcp_config.local.json` — `{"mcpServers": {"<name>": {"disabled": true}}}`
+  stubs for every enabled name (project-local stubs override same-named
+  user-scope servers by name alone — nothing else is copied), and
+- `.devin/config.local.json` — `{"read_config_from": {<all documented keys>: false}}`,
+  suppressing runtime imports of foreign-agent and cloud config.
+
+Measured on the Windows validation host this cut an idle Devin seat by
+~1.1 GB committed memory and ~32 helper processes (~1.47 → 0.37 GB, 34 → 2
+processes). The mechanism itself is verified; the run-integrated path is
+**live-unverified** until a real council run exercises it — treat it as a
+resource optimisation, not a behavior change. Caveats and guarantees:
+
+- It is strictly opt-in: absent or `false` changes nothing, and launch argv
+  / `LAUNCH_POLICY_HASH` are untouched. It IS inside `state.config`, so
+  flipping it invalidates a granted approval like any config change.
+- **Worktree-root side effect**: every Devin session started in that
+  worktree while the files exist starts lean — not just council workers.
+- User files are never clobbered: existing `.devin/*.local.json` files are
+  backed up byte-exact into the run dir (`lean/*.bak`, sha256 journaled)
+  and merged minimally — only our stub keys are added; a same-named user
+  MCP entry is left untouched with a journaled warning. Unparseable files
+  are backed up and replaced.
+- Failures degrade, never block: worktree resolution, enumeration, or
+  write problems are journaled `lean.env` warnings and the launch proceeds
+  with a normal (non-lean) session; a post-generation `devin mcp list`
+  smoke check journals residual enabled names.
+- Files persist for the run's duration (retained terminals reuse them
+  across phases). At terminal cleanup — the engine's release/close pass or
+  a later `council cleanup --run` — merged files are restored from their
+  exact-byte backups and created files are deleted; a file that gained
+  outside content is kept minus our keys. Both paths are journaled and
+  idempotent, and a crash mid-restore leaves enough journal state for
+  `council cleanup` to finish it.
+- The generated paths are appended to `.git/info/exclude` (handling
+  linked-worktree gitfiles) so they never dirty `git status`; exclude
+  entries are left behind harmlessly on cleanup.
+- With `leanMcp` set but no devin lane anywhere in the approved roster +
+  staff, `approve` returns (and journals) a warning — the flag has no
+  effect, it is not an error.
 
 With `participants=15` and `rounds=1` the launch floor is `15 + 30 + 3 = 48`,
 so the default `maxLaunches` is 56; with `rounds=3` the floor is

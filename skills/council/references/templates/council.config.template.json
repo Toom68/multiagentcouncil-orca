@@ -24,5 +24,6 @@
     "organiser":    { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" },
     "scribe":       { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" },
     "supervisor":   { "agent": "<agent lane>", "model": "<model id>", "permissionMode": "<posture token>" }
-  }
+  },
+  "leanMcp": false
 }

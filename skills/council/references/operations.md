@@ -417,6 +417,14 @@ session grows further. Before this lifecycle existed, leftover sessions
 across runs exhausted the commit limit once: a new reviewer's shell failed
 to start and a running reviewer crashed.
 
+The opt-in `leanMcp` config field cuts the Devin share of that footprint:
+with `leanMcp: true` the engine writes worktree-root `.devin` stubs that
+suppress MCP helper processes before the first Devin-lane launch —
+measured ~1.1 GB commit and ~32 processes saved per idle seat on the same
+Windows host (live-unverified in a real council run; it is best-effort and
+never changes launch policy). See docs/USAGE.md for semantics and the
+cleanup/restore contract.
+
 Before choosing the seat count, run `COUNCIL doctor --config <file>
 --json` and read the `memory` item — `doctor`'s preflight is cheap and
 read-only. It reports `ramFreeMb`/`ramTotalMb`, free commit where the

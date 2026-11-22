@@ -336,7 +336,7 @@ const JOURNAL_EVENT_TYPES = [
   'artifact.rejected', 'envelope.built', 'deadline.hit', 'snapshot.drift',
   'claim.updated', 'report.written', 'supervisor.retired', 'error', 'run.finished',
   'launch.submit_check', 'launch.submit_nudge', 'launch.submit_unconfirmed',
-  'terminal.close',
+  'terminal.close', 'lean.env',
 ] as const;
 
 // Compile-time exhaustiveness: fails to compile if EITHER the enum misses a
@@ -509,6 +509,19 @@ export function resolveConfig(raw: unknown): ParseResult<CouncilConfig> {
     }
   }
 
+  // Opt-in lean-MCP env for Devin-lane workers. Boolean only when present —
+  // absent stays absent so legacy configs keep their canonical hash; an
+  // explicit false is preserved as a binding-visible choice.
+  const leanMcpRaw = (r as Record<string, unknown>).leanMcp;
+  let leanMcp: boolean | undefined;
+  if (leanMcpRaw !== undefined) {
+    if (!isBool(leanMcpRaw)) {
+      issues.push(fail('config.leanMcp', 'type', 'expected boolean'));
+    } else {
+      leanMcp = leanMcpRaw;
+    }
+  }
+
   const schemaVersion = (r as Record<string, unknown>).schemaVersion;
   if (schemaVersion !== undefined && !reqVersion(schemaVersion, 'config.schemaVersion', issues)) {
     // issue already recorded
@@ -532,6 +545,7 @@ export function resolveConfig(raw: unknown): ParseResult<CouncilConfig> {
     deadlines,
     ...(staff !== undefined ? { staff } : {}),
     ...(execution !== undefined ? { execution } : {}),
+    ...(leanMcp !== undefined ? { leanMcp } : {}),
   });
 }
 

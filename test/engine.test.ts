@@ -26,6 +26,7 @@ import {
   type HostAdapter,
   type JournalEvent,
   type LaunchResult,
+  type LeanEnvProbe,
   type Perspective,
   type ProposedRoster,
   type PromptBuilder,
@@ -390,7 +391,7 @@ interface Env {
 
 function makeEnv(
   config: CouncilConfig,
-  opts: { liveSource?: Record<string, string>; execution?: ExecutionPolicy } = {},
+  opts: { liveSource?: Record<string, string>; execution?: ExecutionPolicy; leanEnv?: LeanEnvProbe } = {},
 ): Env {
   const targetRoot = mkdtempSync(join(tmpdir(), 'council-target-'));
   const liveSource = opts.liveSource ?? {};
@@ -458,6 +459,7 @@ function makeEnv(
     prompts,
     now: () => new Date(clock.t),
     ...(opts.execution !== undefined ? { execution: opts.execution } : {}),
+    ...(opts.leanEnv !== undefined ? { leanEnv: opts.leanEnv } : {}),
   });
   return { engine, store, host, prompts, db, clock };
 }
@@ -3865,4 +3867,178 @@ test('superseded markers: a stale retained terminal falls back fresh, and the re
   const report = JSON.parse(env.db.artifacts.get('report.json')!) as CouncilReport;
   const seat = report.coverage.seats.find((s) => s.participantId === 'rev_1')!;
   assert.equal(seat.outcome, 'completed', JSON.stringify(seat));
+});
+
+// ─── Opt-in leanMcp environment (config.leanMcp) ─────────────────────────────
+// Real filesystem worktrees + injected probes; FakeStore keeps the durable
+// record in-memory. Module-level file mechanics live in devin-lean.test.ts.
+
+const leanEvents = (env: Env) => env.db.journal.filter((e) => e.type === 'lean.env');
+
+function mkLeanProbe(
+  worktreeRoot: string,
+  listResults: (string[] | 'fail')[],
+  opts: { rootFails?: boolean } = {},
+): LeanEnvProbe & { calls: { root: number; list: number } } {
+  const calls = { root: 0, list: 0 };
+  return {
+    calls,
+    worktreeRoot: async () => {
+      calls.root += 1;
+      return opts.rootFails === true ? failRes(err('adapter_error', 'no terminal identity')) : ok(worktreeRoot);
+    },
+    listEnabledMcpNames: async () => {
+      calls.list += 1;
+      const r = listResults[Math.min(calls.list - 1, listResults.length - 1)]!;
+      return r === 'fail' ? failRes(err('adapter_error', 'mcp list failed')) : ok(r);
+    },
+  };
+}
+
+test('leanMcp: .devin stubs generate before the first devin launch and are restored at terminal cleanup', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  // list returns enabled names once, then [] for the smoke check (stubs landed).
+  const probe = mkLeanProbe(worktree, [['alpha', 'beta'], []]);
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, leanMcp: true }), { leanEnv: probe });
+  await driveToApproval(env);
+  // The organiser is devin-lane — generation led its launch, exactly once.
+  assert.equal(probe.calls.list, 2, 'one enumeration + one smoke check');
+  const mcpPath = join(worktree, '.devin', 'mcp_config.local.json');
+  const cfgPath = join(worktree, '.devin', 'config.local.json');
+  assert.ok(existsSync(mcpPath));
+  assert.deepEqual(JSON.parse(readFileSync(mcpPath, 'utf8')).mcpServers, {
+    alpha: { disabled: true },
+    beta: { disabled: true },
+  });
+  assert.ok(existsSync(cfgPath));
+  const ev = leanEvents(env);
+  assert.ok(ev.some((e) => e.payload?.stage === 'intent' && e.payload?.op === 'generate'), 'intent journaled before write');
+  assert.ok(ev.some((e) => e.payload?.stage === 'receipt' && e.payload?.outcome === 'generated'));
+  // Intent precedes receipt in the journal (crash evidence ordering).
+  const iSeq = ev.find((e) => e.payload?.stage === 'intent')!.seq;
+  const rSeq = ev.find((e) => e.payload?.stage === 'receipt')!.seq;
+  assert.ok(iSeq < rSeq);
+
+  await approveTwo(env);
+  const r = await drive(env);
+  assert.equal(r.action, 'finished', JSON.stringify(r));
+  // Terminal cleanup deleted the run-created files.
+  assert.equal(existsSync(mcpPath), false);
+  assert.equal(existsSync(cfgPath), false);
+  const restores = leanEvents(env).filter((e) => e.payload?.op === 'restore');
+  assert.ok(restores.some((e) => e.payload?.stage === 'intent'));
+  assert.ok(restores.some((e) => e.payload?.stage === 'receipt' && e.payload?.outcome === 'restored'));
+});
+
+test('leanMcp absent: probe is never consulted and no lean.env events are journaled', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  const probe = mkLeanProbe(worktree, [['alpha']]);
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10 }), { leanEnv: probe });
+  await driveToApproval(env);
+  assert.equal(probe.calls.root, 0);
+  assert.equal(probe.calls.list, 0);
+  assert.equal(leanEvents(env).length, 0);
+  assert.equal(existsSync(join(worktree, '.devin')), false);
+});
+
+test('leanMcp: probe failure skips generation and never blocks the launch', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  const probe = mkLeanProbe(worktree, [['alpha']], { rootFails: true });
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, leanMcp: true }), { leanEnv: probe });
+  const r = await drive(env); // drive to awaiting_approval — organiser still launched
+  assert.equal(r.action, 'needs_approval', JSON.stringify(r));
+  assert.equal(env.host.launches.length, 1, 'organiser launch proceeded');
+  const skipped = leanEvents(env).find((e) => e.payload?.outcome === 'skipped');
+  assert.ok(skipped !== undefined, 'decline is journaled as a skipped receipt');
+  // A journaled skip is durable — a second launch attempt never retries.
+  const genIntents = leanEvents(env).filter((e) => e.payload?.op === 'generate' && e.payload?.stage === 'intent');
+  assert.equal(genIntents.length, 0, 'skip receipt carries no write intent');
+});
+
+test('leanMcp: council cleanup restores the worktree when the engine pass never ran (crash recovery)', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  const probe = mkLeanProbe(worktree, [['alpha'], []]);
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, leanMcp: true }), { leanEnv: probe });
+  await driveToApproval(env);
+  const mcpPath = join(worktree, '.devin', 'mcp_config.local.json');
+  assert.ok(existsSync(mcpPath));
+  // Simulate a crash AFTER generation: run is terminal in state, but the
+  // journal's lean record is still 'active' — cleanup must finish the restore.
+  env.db.state.status = 'cancelled';
+  assert.ok(env.engine.cleanup !== undefined);
+  const r = await env.engine.cleanup({});
+  assert.ok(r.ok, JSON.stringify(r.ok ? '' : r.error));
+  assert.equal(existsSync(mcpPath), false, 'cleanup deleted the created stubs');
+  assert.ok(r.value.lean !== undefined, 'cleanup reports the lean restore');
+  assert.equal(r.value.lean!.status, 'restored');
+  const mcpEntry = r.value.lean!.files.find((f) => f.path === '.devin/mcp_config.local.json');
+  assert.equal(mcpEntry?.outcome, 'deleted');
+  // Idempotent: a second cleanup has no active record and does not fail.
+  const engine2 = restartEngine(env);
+  assert.ok(engine2.cleanup !== undefined);
+  const r2 = await engine2.cleanup({});
+  assert.ok(r2.ok);
+  assert.equal(r2.value.lean, undefined);
+});
+
+test('leanMcp: crash between intent and receipt — regen recognizes the partial write as ours', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  const probe = mkLeanProbe(worktree, [['alpha', 'beta'], []]);
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, leanMcp: true }), { leanEnv: probe });
+  // Simulate the crash: the journal holds an intent for the SAME names and a
+  // partial write of only our stubs exists at the worktree — no user file was
+  // ever backed up, so the regen must not treat the file as user-owned.
+  env.db.journal.push({
+    seq: 2,
+    ts: new Date(env.clock.t).toISOString(),
+    type: 'lean.env',
+    actor: 'engine',
+    payload: { stage: 'intent', op: 'generate', worktreeRoot: worktree, names: ['alpha', 'beta'] },
+  });
+  mkdirSync(join(worktree, '.devin'), { recursive: true });
+  writeFileSync(
+    join(worktree, '.devin', 'mcp_config.local.json'),
+    JSON.stringify({ mcpServers: { alpha: { disabled: true }, beta: { disabled: true } } }),
+  );
+  await driveToApproval(env);
+  const receipt = leanEvents(env).find((e) => e.payload?.outcome === 'generated');
+  assert.ok(receipt !== undefined);
+  const files = (receipt.payload?.files ?? []) as { path: string; action: string; backup?: string }[];
+  const mcp = files.find((f) => f.path === '.devin/mcp_config.local.json')!;
+  assert.equal(mcp.action, 'created', 'partial ours-like write is ours — never backed up as a user file');
+  assert.equal(mcp.backup, undefined);
+});
+
+test('leanMcp: approval warns when no devin lane is bound (seats + staff all non-devin)', async () => {
+  const CODEX: AgentChoice = { agent: 'codex', model: 'gpt-5', permissionMode: 'default' };
+  const env = makeEnv(configWith({
+    participants: 2,
+    requestedPerspectives: 10,
+    leanMcp: true,
+    staff: { organiser: CODEX, scribe: CODEX, supervisor: CODEX },
+  }));
+  await driveToApproval(env);
+  const roster: ApprovedRoster = {
+    schemaVersion: SCHEMA_VERSION,
+    runId: RUN,
+    seats: [
+      { seatId: 'seat_1', perspectiveId: 'persp_1', participantId: 'rev_1', agent: { ...CODEX } },
+      { seatId: 'seat_2', perspectiveId: 'persp_2', participantId: 'rev_2', agent: { ...CODEX } },
+    ],
+  };
+  const ap = await env.engine.approve({ roster, approver: 'o' });
+  assert.ok(ap.ok);
+  assert.ok(ap.value.warnings !== undefined && ap.value.warnings.some((w) => w.includes('no devin-lane')));
+  const warning = leanEvents(env).find((e) => e.payload?.stage === 'warning' && e.payload?.op === 'approve');
+  assert.ok(warning !== undefined, 'the warning is journaled');
+});
+
+test('leanMcp: a devin seat satisfies the binding — approval emits no warning', async () => {
+  const worktree = mkdtempSync(join(tmpdir(), 'lean-wt-'));
+  const probe = mkLeanProbe(worktree, [['alpha'], []]);
+  const env = makeEnv(configWith({ participants: 2, requestedPerspectives: 10, leanMcp: true }), { leanEnv: probe });
+  await driveToApproval(env);
+  const ap = await env.engine.approve({ roster: mkApprovedRoster(env, ['persp_1', 'persp_2']), approver: 'o' });
+  assert.ok(ap.ok);
+  assert.equal(ap.value.warnings, undefined);
 });

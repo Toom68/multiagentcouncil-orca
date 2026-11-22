@@ -72,6 +72,7 @@ import {
   parseOrcaEnvelope,
 } from './host/orca.js';
 import { resolveExecutable, runProcess } from './host/process.js';
+import { parseMcpListEnabledNames } from './host/devin-lean.js';
 import {
   estimateAdditionalSessions,
   peakCouncilSessions,
@@ -337,8 +338,78 @@ function makeEngine(runDir: string) {
     host: lazyHost(),
     prompts: createPromptBuilder(),
     execution: CATALOG_EXECUTION_POLICY,
+    leanEnv: {
+      worktreeRoot: leanWorktreeRoot,
+      listEnabledMcpNames: leanListEnabledMcpNames,
+    },
   });
   return { store, engine };
+}
+
+// ── Lean-env probe (config.leanMcp) ──────────────────────────────────────────
+// Both probes are READ-ONLY host queries the engine cannot make itself (the
+// engine stays protocol-pure). `devin mcp list` output is parsed for names
+// and enabled/disabled status ONLY — the Command:/URL: detail lines carry
+// credentials and are never logged, persisted, or returned.
+
+/** The worker worktree root, resolved from the live Orca terminal identity. */
+async function leanWorktreeRoot(): Promise<Result<string>> {
+  const args = ['terminal', 'show'];
+  const handle = process.env.ORCA_TERMINAL_HANDLE;
+  if (handle !== undefined) args.push('--terminal', handle);
+  args.push('--json');
+  const shown = await tryOrcaCli(args);
+  if (!shown.ok) {
+    return {
+      ok: false,
+      error: err(
+        'adapter_error',
+        `terminal show failed — cannot resolve the worker worktree root: ${shown.error.message}`,
+      ),
+    };
+  }
+  const t = asRec(asRec(shown.value)?.terminal ?? shown.value);
+  const root = firstStr(t?.worktreePath);
+  if (root === undefined) {
+    return {
+      ok: false,
+      error: err(
+        'adapter_error',
+        'terminal show reported no worktreePath — cannot resolve the worker worktree root',
+      ),
+    };
+  }
+  return { ok: true, value: root };
+}
+
+/** Enabled MCP server names at the worktree root — names + status only. */
+async function leanListEnabledMcpNames(input: { worktreeRoot: string }): Promise<Result<string[]>> {
+  let file: string;
+  try {
+    file = resolveExecutable('devin');
+  } catch (e) {
+    return {
+      ok: false,
+      error: err(
+        'adapter_error',
+        `devin executable not resolvable: ${e instanceof Error ? e.message : String(e)}`,
+      ),
+    };
+  }
+  const proc = await runProcess(
+    { file, args: ['mcp', 'list'] },
+    { cwd: input.worktreeRoot, timeoutMs: 30_000 },
+  );
+  if (proc.reason !== 'exited' || proc.exitCode !== 0) {
+    return {
+      ok: false,
+      error: err(
+        'adapter_error',
+        `devin mcp list failed at the worktree root (${proc.reason}${proc.exitCode !== null && proc.exitCode !== undefined ? `, exit ${proc.exitCode}` : ''})`,
+      ),
+    };
+  }
+  return { ok: true, value: parseMcpListEnabledNames(proc.stdout) };
 }
 
 async function loadRun(store: Store) {
@@ -855,6 +926,7 @@ async function cmdInit(argv: readonly string[]): Promise<{ payload: Record<strin
       `  snapshot:  ${snapshot.snapshotId} (${Object.keys(snapshot.files).length} files)`,
       `  seats:     ${config.participants} reviewers from ${config.requestedPerspectives} perspectives`,
       `  budget:    maxLaunches ${config.maxLaunches} (floor ${meta.launchBudgetFloor})`,
+      `  leanMcp:   ${config.leanMcp === true ? 'on — .devin stubs will be generated in the worker worktree before the first Devin launch and restored at cleanup' : 'off (opt-in: set "leanMcp": true in the config to slim Devin-lane worker sessions)'}`,
       `  wake recipient: ${notifyRecipient.recipient ?? `none captured${notifyRecipient.reason !== undefined ? ` (${notifyRecipient.reason})` : ''}`}`,
       `  supervisor spec written to prompts/supervisor.md`,
       `next: council start-supervisor --run <runDir>  (or launch it manually per skills/council/SKILL.md)`,
@@ -1857,6 +1929,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
       supervisor: state.supervisor,
       supervisorWake,
       ...(approvalWake !== null ? { approvalWake } : {}),
+      ...(res.warnings !== undefined && res.warnings.length > 0 ? { warnings: res.warnings } : {}),
       wakeCommand,
       note:
         'the engine already attempted the supervisor wake (see supervisorWake — the journaled outcome of ' +
@@ -1874,6 +1947,7 @@ async function cmdApprove(argv: readonly string[]): Promise<{ payload: Record<st
       wakeCommand !== null
         ? `  fallback (only if the active supervisor has not resumed): ${wakeCommand}`
         : `  no supervisor dispatch recorded — your next \`council supervise --advance\` is the wake`,
+      ...(res.warnings ?? []).map((w) => `  warning: ${w}`),
     ].join('\n'),
   };
 }
@@ -2267,12 +2341,14 @@ async function cmdCleanup(argv: readonly string[]): Promise<{ payload: Record<st
     skipped: count('skipped'),
     failed: count('failed'),
   };
+  const lean = report.lean;
   return {
     payload: {
       runId: state.runId,
       status: report.status,
       terminals: report.terminals,
       summary,
+      ...(lean !== undefined ? { lean } : {}),
       note: 'only terminals this run created and journaled are considered; nothing else is ever closed',
     },
     human: [
@@ -2280,6 +2356,13 @@ async function cmdCleanup(argv: readonly string[]): Promise<{ payload: Record<st
       ...report.terminals.map(
         (t) => `  ${t.outcome.padEnd(12)} ${t.terminalHandle} (${t.owner}${t.participantId !== undefined ? ` ${t.participantId}` : ''})${t.reason !== undefined ? ` — ${t.reason}` : ''}${t.code !== undefined ? ` [${t.code}]` : ''}${t.retriedIntent === true ? ' (retried an unreceipted close intent)' : ''}`,
       ),
+      ...(lean !== undefined
+        ? [
+            `  lean env: ${lean.status}`,
+            ...lean.files.map((f) => `    ${f.outcome.padEnd(9)} ${f.path}${f.reason !== undefined ? ` — ${f.reason}` : ''}`),
+            ...lean.warnings.map((w) => `    warning: ${w}`),
+          ]
+        : []),
     ].join('\n'),
   };
 }

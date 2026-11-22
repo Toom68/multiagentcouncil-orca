@@ -137,6 +137,18 @@ export interface CouncilConfig {
    * approval hash through `config`.
    */
   execution?: ExecutionConfig;
+  /**
+   * Opt-in lean-MCP environment for Devin-lane workers. When true, the
+   * engine writes `.devin/mcp_config.local.json` (disabled stubs for every
+   * enabled MCP server name) and `.devin/config.local.json`
+   * (read_config_from all-false) at the worker worktree root before the
+   * first Devin worker launch, and restores/ removes them at terminal-run
+   * cleanup. Approval-bound through `config`; absent or false = off.
+   * Best-effort: generation/restore problems are journaled warnings, never
+   * launch or run failures. Measured saving ≈1.1 GB commit + ~32 helper
+   * processes per idle Devin seat (Windows-verified; see docs/USAGE.md).
+   */
+  leanMcp?: boolean;
 }
 
 /** Explicit staff choices — organiser, scribe and supervisor roles. */
@@ -1063,6 +1075,7 @@ export type JournalEventType =
   | 'launch.submit_nudge'
   | 'launch.submit_unconfirmed'
   | 'terminal.close'
+  | 'lean.env'
   | 'error'
   | 'run.finished';
 
@@ -1241,9 +1254,92 @@ export interface TerminalCleanupEntry {
   retriedIntent?: boolean;
 }
 
+// ─── Opt-in lean-MCP environment (config.leanMcp) ────────────────────────────
+
+/**
+ * Per-file record for one generated lean-env file at the worktree root.
+ * Journal-derived (lean.env events) — the durable record cleanup restores from.
+ */
+export interface LeanEnvFileRecord {
+  /** Path relative to the worktree root, posix separators. */
+  path: string;
+  /**
+   * 'created' = the file did not exist; we wrote it whole (cleanup deletes
+   * it). 'merged' = a user file existed; its exact bytes were backed up
+   * first and our keys merged in (cleanup restores the backup).
+   */
+  action: 'created' | 'merged';
+  /** Run-dir-relative path of the exact-byte backup (merged files only). */
+  backup?: string;
+  /** sha256 of the backed-up bytes — tamper evidence for restore. */
+  backupSha256?: string;
+  /** MCP server names we added `{"disabled": true}` stubs for (mcp_config). */
+  stubbedNames?: string[];
+  /** read_config_from keys we set to false (config file). */
+  configKeys?: string[];
+}
+
+/** The run's durable lean-env record, rebuilt from lean.env journal events. */
+export interface LeanEnvRecord {
+  /**
+   * 'active' = files generated and currently in place; 'restored' = cleanup
+   * ran; 'skipped' = generation was declined (probe failure, empty
+   * enumeration, no probe configured) — journaled once, never retried.
+   */
+  status: 'active' | 'restored' | 'skipped';
+  /** Absolute worktree root the files were written under. */
+  worktreeRoot?: string;
+  /** Enabled MCP server names enumerated at generation time (names only). */
+  names?: string[];
+  files?: LeanEnvFileRecord[];
+  /** Reason for 'skipped' / notable warnings (bounded, journaled). */
+  reason?: string;
+  generatedAt?: string;
+  restoredAt?: string;
+}
+
+/** Per-file outcome reported by a lean-env restore pass. */
+export interface LeanEnvRestoreEntry {
+  path: string;
+  outcome: 'restored' | 'deleted' | 'kept' | 'failed' | 'skipped';
+  reason?: string;
+}
+
+/** Lean-env outcome attached to a cleanup report (undefined when no record). */
+export interface LeanEnvCleanupReport {
+  status: 'restored' | 'skipped' | 'failed';
+  files: LeanEnvRestoreEntry[];
+  warnings: string[];
+}
+
 export interface TerminalCleanupReport {
   status: RunStatus;
   terminals: TerminalCleanupEntry[];
+  /** Present when the run carried a lean.env record this pass acted on. */
+  lean?: LeanEnvCleanupReport;
+}
+
+/**
+ * Host/agent probes the engine needs for opt-in lean-MCP generation
+ * (config.leanMcp). Implemented in the CLI layer over documented host reads;
+ * injected so the engine stays protocol-pure. Both must be read-only.
+ */
+export interface LeanEnvProbe {
+  /**
+   * Absolute path of the worktree root the run's worker terminals open in,
+   * resolved from the actual terminal/workspace via documented host reads
+   * (e.g. `terminal show` → worktreePath) — never process.cwd() assumptions.
+   * Fails when no terminal/workspace identity is available; the caller
+   * treats a failure as "cannot determine" and skips generation.
+   */
+  worktreeRoot(): Promise<Result<string>>;
+  /**
+   * Enabled MCP server NAMES for the devin CLI evaluated at the worktree
+   * root (`devin mcp list` names+status only). The Command/URL/args lines
+   * carry credentials — an implementation must never log, persist or
+   * return them. Failure means "cannot enumerate" — callers warn and skip.
+   */
+  listEnabledMcpNames(input: { worktreeRoot: string }): Promise<Result<string[]>>;
 }
 
 /** Supervisor custody proven by the CLI's startup record (start-supervisor). */
@@ -1654,7 +1750,7 @@ export interface Engine {
   approve(input: {
     roster: ApprovedRoster;
     approver: string;
-  }): Promise<Result<{ approvalId: ApprovalId; hash: string }>>;
+  }): Promise<Result<{ approvalId: ApprovalId; hash: string; warnings?: string[] }>>;
   status(): Promise<Result<EngineStatus>>;
   /** Explicit cancellation: guarded stop of live workers, then mark cancelled. */
   cancel(input: { reason: string }): Promise<Result<void>>;
@@ -1692,6 +1788,11 @@ export interface EngineDeps {
   now?: () => Date;
   /** Optional execution policy; required by runs whose config.execution exists. */
   execution?: ExecutionPolicy;
+  /**
+   * Optional lean-MCP probes (config.leanMcp). When absent and a run opts
+   * in, generation is skipped with a journaled warning — never an error.
+   */
+  leanEnv?: LeanEnvProbe;
 }
 
 /**
